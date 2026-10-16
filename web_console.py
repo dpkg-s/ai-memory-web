@@ -5,19 +5,35 @@
 ----
 给「人」用的管理界面，两件事：
 
-1. **调试台** —— 像 API 调试一样直接调用 24 个 MCP 工具（查询/检索/看图）。
+1. **调试台** —— 像 API 调试一样直接调用 25 个 MCP 工具（查询/检索/看图）。
 2. **配置面** —— FNS 同步配置 + 运行时阈值（``memory.toml``），不再靠手改文件。
 
 本模块**不是** MCP 服务端，而是 MCP 的**外部客户端**：它通过 Streamable HTTP
 连到 ai-memory 端点（默认 ``127.0.0.1:8700/mcp``）。因此它天然满足 v3 的两条判死项
 ——不直连 vault、不进程内 import 直调 —— 所有对记忆库的读写都走完整 MCP 协议。
 
+🔴 本模块**不 import 核心仓的任何模块**（2026-10-16 收敛）
+--------------------------------------------------------
+曾经这里有一个 ``core_path.ensure_core_on_path()``：运行时定位 ``ai-memory-template``
+目录并注入 ``sys.path``，好让本仓 ``import memory_config`` / ``import transport_http``。
+那是**第二条腿** —— 除了「连 MCP」，Web 还要跨仓 import 核心模块。代价是两侧各持一份
+「memory.toml 怎么读、怎么写、怎么校验」的知识，任一侧改动都可能让两边对不上；定位
+逻辑本身还要维护一套上溯/回落规则。
+
+现在这条腿已彻底拆掉：
+
+* 阈值读写 ⇒ MCP 工具 ``memory_config``（唯一实现：核心仓 ``memory_config.py``）；
+* MCP 端点默认地址 ⇒ 本文件里的字面常量（它本来就只是个默认值）。
+
+⇒ 本仓对核心仓的关系**只剩「连接」一种**。副作用是分层守卫更强了：本仓导入后
+``sys.modules`` 里有 ``mcp`` / ``starlette``，但**不会有任何核心仓模块**。
+
 🔴 为什么必须「同源页面 + 后端代理」，而不是浏览器直连 MCP
 ----------------------------------------------------------
 三条路都真起服务端实测过（`_v3_web_browser_probe.py` / `_v3_web_proxy_probe.py`）：
 
 * **后端代理**（本模块采用）：后端用 SDK 客户端连 MCP（服务端→服务端，**不发
-  ``Origin`` 头**）⇒ 实测 initialize / 24 工具 / memory_stats 全通，**MCP 端零配置
+  ``Origin`` 头**）⇒ 实测 initialize / 25 工具 / memory_stats 全通，**MCP 端零配置
   改动**。
 * **浏览器直连**（不可行）：``TransportSecuritySettings.allowed_origins`` 默认是空
   列表 ⇒ 任何带 ``Origin`` 头的请求一律 **403 Invalid Origin header**（这是刻意
@@ -44,10 +60,10 @@
 ----------
 * **FNS 凭据/配置**写进 **vault 之外**的 JSON（``AI_MEMORY_WEB_CONFIG``）——
   写进 vault 会被 fns-sync 同步出去（v3 红线 1）。
-* **运行时阈值**写 vault 根的 ``memory.toml`` —— 它是**配置文件不是笔记**（不进
-  索引、无 frontmatter、不被 MCP 工具管理），且写入前先经 ``memory_config.parse_toml``
-  校验、写时原子替换、写前备份到 vault 之外。可用
-  ``AI_MEMORY_WEB_CONFIG_WRITE=0`` 关闭为只读。
+* **运行时阈值**读写一律经 MCP 工具 ``memory_config``（2026-10-16 起）：本模块
+  **不解析、不渲染、不写盘** ``memory.toml`` —— 那三件事的唯一实现在核心仓
+  ``memory_config.py``。整状态写（缺键即拒）、写前备份、原子替换都在服务端完成。
+  ``AI_MEMORY_WEB_CONFIG_WRITE=0`` 仍在**本侧**关成只读（本台自己的策略开关）。
 * **绝不触碰 ``*.md``**。
 
 更新面（2026-10-15）
@@ -75,8 +91,8 @@
 ``AI_MEMORY_WEB_CONFIG``                  ``~/.ai-memory-web/config.json``  配置面存储
 ``AI_MEMORY_WEB_CONFIG_WRITE``            ``1``                  0=阈值只读
 ``AI_MEMORY_WEB_STATIC``                  ``<本文件同级>/web``    前端静态资源目录
-``AI_MEMORY_CORE_DIR``                    （空）                 核心模块目录；默认自动上溯定位
-``AI_MEMORY_DIR``                         （空）                 vault 位置（阈值写入需要）
+``AI_MEMORY_CORE_DIR``                    （空）                 核心仓目录；**仅** ``--with-mcp`` 拉起 MCP 端点时需要（不再用于 import）
+``AI_MEMORY_DIR``                         （空）                 vault 位置（仅用于界面显示；阈值走服务端自己的 vault）
 ``AI_MEMORY_RESTARTER``                   （空）                 重启助手路径；默认探测桌面 launcher
 ========================================  =====================  ========================
 """
@@ -108,29 +124,17 @@ from starlette.staticfiles import StaticFiles
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
-_HERE = Path(__file__).resolve().parent
-if str(_HERE) not in sys.path:
-    sys.path.insert(0, str(_HERE))
-
-import core_path  # noqa: E402  （本仓模块：定位核心目录并注入 sys.path）
-
-# 核心模块（memory_config / transport_http）的唯一事实源在 MCP 仓
-# ai-memory-template，本仓不复制 ⇒ 必须先定位核心目录、注入 sys.path，
-# 下面两个 import 才成立。定位失败会抛 CoreNotFound，且提示可照抄的修复命令。
-core_path.ensure_core_on_path()
-
-import memory_config  # noqa: E402
-import transport_http  # noqa: E402
-
 logger = logging.getLogger("ai-memory.web")
 
-WEB_VERSION = "1.0.0"
+WEB_VERSION = "1.1.0"
 DEFAULT_WEB_HOST = "127.0.0.1"
 # ⚠️ 本机实测（2026-10-13，Windows）：8800/8801/8802 均被系统保留（bind 报
 # WinError 10013），故默认改用 8811 段。可选：8811-8820。
 DEFAULT_WEB_PORT = 8811
-DEFAULT_MCP_URL = (f"http://{transport_http.DEFAULT_HOST}:"
-                   f"{transport_http.DEFAULT_PORT}{transport_http.DEFAULT_PATH}")
+# 上游 MCP 端点默认值。**刻意写成字面常量**而不是从核心仓 ``transport_http``
+# 取（2026-10-16）：本仓不再 import 核心模块，而这里本来就只是个可被
+# ``AI_MEMORY_WEB_MCP`` 覆盖的默认值 —— 为它维持一条跨仓 import 通道不划算。
+DEFAULT_MCP_URL = "http://127.0.0.1:8700/mcp"
 DEFAULT_CONFIG_PATH = Path.home() / ".ai-memory-web" / "config.json"
 DEFAULT_CONFIG_WRITE = True
 MAX_BODY_BYTES = 2 * 1024 * 1024          # 请求体上限 2 MiB（拒绝无脑大包）
@@ -328,124 +332,60 @@ def resolve_vault() -> Path | None:
 
 # ---------------------------------------------------------------------------
 # 配置面：运行时阈值（vault 根的 memory.toml）
+#
+# 2026-10-16 起**全部经 MCP 工具 memory_config**：本模块不再 import memory_config、
+# 不再自己解析/渲染/写盘。那三件事的唯一实现在核心仓 memory_config.py（server.py 的
+# memory_config 工具走的也是它），故两侧不存在"对不上"的可能。
+# 本模块只剩两件属于自己的事：① 转成前端契约的 JSON；② 施加本台的只读开关。
 # ---------------------------------------------------------------------------
-def _toml_scalar(key: str, value: Any) -> str:
-    want = type(memory_config.DEFAULTS[key])
-    if isinstance(value, bool):
-        raise WebConfigError(f"配置 {key} 不接受布尔值。")
-    if want is int:
-        if not isinstance(value, int):
-            raise WebConfigError(f"配置 {key} 期望整数，得到 {value!r}。")
-        return str(value)
-    if not isinstance(value, (int, float)):
-        raise WebConfigError(f"配置 {key} 期望数值，得到 {value!r}。")
-    return repr(float(value))
+async def _mcp_json(cfg: dict, tool: str, arguments: dict) -> dict:
+    """调一个 MCP 工具，把它返回的 JSON 文本解析成 dict。
+
+    ``clip=False``：给**服务端自己**消费的包不能被 ``_THUMB`` 截断 —— 截断后的
+    JSON 必然解析失败，而那会伪装成「上游返回格式不对」，把排查引向错误方向。
+
+    上游工具沿本仓约定用「``错误：…``」**文本**表达业务错误（不使用 isError），
+    故两种形态都要识别，并把消息**原样**上抛给调用方转 400。
+    """
+    endpoint = resolve_mcp(cfg)
+    results = await mcp_session_calls(endpoint, [(tool, arguments)], clip=False)
+    res = results[0]
+    text = str(res.get("text") or "")
+    if res.get("isError"):
+        raise WebConfigError(text.strip() or "上游 MCP 返回错误。")
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        if text.strip().startswith("错误"):
+            raise WebConfigError(text.strip()) from None
+        raise WebConfigError(f"{tool} 返回的不是合法 JSON：{text[:120]!r}") from None
+    if not isinstance(payload, dict):
+        raise WebConfigError(f"{tool} 返回的不是 JSON 对象。")
+    return payload
 
 
-def render_toml(values: dict[str, Any]) -> str:
-    """把 8 个阈值渲染成 memory.toml 文本（``[thresholds]`` 区，LF 行尾）。"""
-    unknown = sorted(set(values) - set(memory_config.DEFAULTS))
-    if unknown:
-        raise WebConfigError(f"未知配置键：{', '.join(unknown)}")
-    missing = sorted(set(memory_config.DEFAULTS) - set(values))
-    if missing:
-        raise WebConfigError(f"缺少配置键：{', '.join(missing)}")
-    stamp = datetime.now().astimezone().isoformat(timespec="seconds")
-    lines = [
-        "# ai-memory 运行时阈值（memory.toml）",
-        f"# 由 ai-memory Web 控制台写入：{stamp}",
-        f"# 取值优先级：环境变量 {memory_config.ENV_PREFIX}<KEY> > "
-        "[thresholds] 区 > 顶层同名键 > 内置默认",
-        f"# 改动约 {memory_config.CACHE_TTL:g} 秒内生效，无需重启服务。",
-        "",
-        "[thresholds]",
-    ]
-    for k in memory_config.DEFAULTS:
-        lines.append(f"{k} = {_toml_scalar(k, values[k])}")
-    lines.append("")
-    return "\n".join(lines)
-
-
-def _threshold_source(key: str, file_values: dict[str, Any]) -> str:
-    if _env_str(memory_config.ENV_PREFIX + key.upper()):
-        return "env"
-    if f"thresholds.{key}" in file_values or key in file_values:
-        return "file"
-    return "default"
-
-
-def thresholds_state(cfg: dict | None = None) -> dict:
-    """当前生效值 + 每个键的来源 + 可否写入。"""
+async def thresholds_state(cfg: dict | None = None) -> dict:
+    """当前生效值 + 每键来源 + 可否写入（数据源 = MCP 工具 ``memory_config``）。"""
     cfg = cfg or config()
-    vault = resolve_vault()
-    memory_config.set_vault(vault)
-    memory_config.reload()
-
-    path = memory_config.config_path()
-    file_values: dict[str, Any] = {}
-    parse_error: str | None = None
-    if path is not None and path.is_file():
-        try:
-            file_values = memory_config.parse_toml(path.read_text(encoding="utf-8-sig"))
-        except Exception as e:                                    # noqa: BLE001
-            parse_error = str(e)
-
-    keys: dict[str, dict] = {}
-    for k, dflt in memory_config.DEFAULTS.items():
-        # 文案随值一起下发（唯一来源 = memory_config.META）：前端因此不必硬编码
-        # 任何阈值含义，新增阈值时界面自动跟着长出来。
-        info = memory_config.meta(k)
-        keys[k] = {
-            "value": memory_config.get(k),
-            "default": dflt,
-            "type": "int" if isinstance(dflt, int) else "float",
-            "source": _threshold_source(k, file_values),
-            "env": memory_config.ENV_PREFIX + k.upper(),
-            "label": info["label"],
-            "desc": info["desc"],
-        }
-    return {
-        "vault": str(vault) if vault else None,
-        "config_path": str(path) if path is not None else None,
-        "file_exists": bool(path is not None and path.is_file()),
-        "writable": bool(cfg["config_write"] and path is not None),
-        "keys": keys,
-        "last_error": parse_error or memory_config.last_error(),
-        "ttl": memory_config.CACHE_TTL,
-    }
+    st = await _mcp_json(cfg, "memory_config",
+                         {"action": "get", "output_format": "json"})
+    # writable 是**两侧的与**：服务端要认得 vault（定位得到 memory.toml），本台要
+    # 没被 AI_MEMORY_WEB_CONFIG_WRITE=0 关掉。少任何一半，界面都不该显示可编辑。
+    st["writable"] = bool(cfg["config_write"] and st.get("config_path"))
+    return st
 
 
-def write_thresholds(values: dict[str, Any], cfg: dict | None = None) -> dict:
-    """校验 → 备份 → 原子写 memory.toml（**只写这个文件，绝不碰 *.md**）。"""
+async def write_thresholds(values: dict, cfg: dict | None = None) -> dict:
+    """整状态写阈值（键集校验 / 备份 / 原子替换都在服务端），返回写入后的快照。"""
     cfg = cfg or config()
     if not cfg["config_write"]:
         raise WebConfigError("阈值写入已被 AI_MEMORY_WEB_CONFIG_WRITE=0 关闭（只读模式）。")
-    vault = resolve_vault()
-    memory_config.set_vault(vault)
-    path = memory_config.config_path()
-    if path is None:
-        raise WebConfigError(
-            "未知 vault 位置 ⇒ 无法定位 memory.toml。请设置环境变量 AI_MEMORY_DIR，"
-            "或在「配置 → 记忆库」里填写 vault 目录。")
-
-    text = render_toml(values)                     # 内含类型校验
-    memory_config.parse_toml(text)                 # 写前自解析一遍（fail-fast）
-
-    backup = None
-    if path.is_file():
-        bak_dir = config_path().parent / "backups"
-        bak_dir.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup = bak_dir / f"memory.toml.{stamp}.bak"
-        shutil.copyfile(str(path), str(backup))
-
-    tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
-    tmp.write_text(text, encoding="utf-8", newline="\n")
-    os.replace(str(tmp), str(path))
-    memory_config.reload()
-    state = thresholds_state(cfg)
-    state["backup"] = str(backup) if backup else None
-    return state
+    if not isinstance(values, dict):
+        raise WebConfigError("需要 {'values': {键: 值}}。")
+    st = await _mcp_json(cfg, "memory_config",
+                         {"action": "set", "values": values, "output_format": "json"})
+    st["writable"] = bool(cfg["config_write"] and st.get("config_path"))
+    return st
 
 
 # ---------------------------------------------------------------------------
@@ -617,6 +557,10 @@ _TOOL_GROUP_OF = {
     "memory_heat_suggest": "maintain",
     "memory_batch_tier": "maintain",
     "memory_batch_tag": "maintain",
+    # 2026-10-16：运行时阈值（memory.toml）纳入 MCP。归「库维护」而非「体检诊断」
+    # —— 它写盘、改变全库行为（去重阈值/热度阈值/正文预算），不是只读的报告工具；
+    # 与 memory_heat_suggest 同类（都是"默认只报、可显式落盘"的调参口）。
+    "memory_config": "maintain",
     # 生命周期与系统
     "memory_archive": "lifecycle",
     "memory_archive_old": "lifecycle",
@@ -686,10 +630,10 @@ async def mcp_tools(endpoint: str, timeout: float = MCP_TIMEOUT) -> list[dict]:
 # 本仓只含 Web 侧代码 ⇒ 白名单 = 本仓全部程序文件。核心模块（memory_config /
 # transport_http）与 MCP 服务端（server.py / serve_http.py 等）**不在本仓**：
 # 它们由 MCP 仓 ai-memory-template 独立更新，故不列入。
+# 2026-10-16：`core_path.py` 随「Web 不再 import 核心模块」一并删除，白名单同步收敛。
 UPDATE_BACKEND_FILES = (
     "web_console.py",
     "serve_web.py",
-    "core_path.py",
 )
 UPDATE_FRONTEND_DIR = "web"
 UPDATE_PATHS = UPDATE_BACKEND_FILES + (UPDATE_FRONTEND_DIR,)
@@ -1260,7 +1204,13 @@ class WebConsole:
                              "resolved": {"mcp_endpoint": resolve_mcp(self.cfg)}})
 
     async def thresholds_get(self, request: Request) -> Response:
-        return JSONResponse({"ok": True, **thresholds_state(self.cfg)})
+        try:
+            state = await thresholds_state(self.cfg)
+        except WebConfigError as e:
+            return _err(400, str(e))
+        except Exception as e:                                    # noqa: BLE001
+            return _err(502, f"读取阈值失败：{type(e).__name__}: {e}")
+        return JSONResponse({"ok": True, **state})
 
     async def thresholds_post(self, request: Request) -> Response:
         try:
@@ -1268,11 +1218,11 @@ class WebConsole:
             values = body.get("values")
             if not isinstance(values, dict):
                 raise WebConfigError("需要 {'values': {键: 值}}。")
-            state = write_thresholds(values, self.cfg)
+            state = await write_thresholds(values, self.cfg)
         except WebConfigError as e:
             return _err(400, str(e))
         except Exception as e:                                    # noqa: BLE001
-            return _err(500, f"写入失败：{type(e).__name__}: {e}")
+            return _err(502, f"写入阈值失败：{type(e).__name__}: {e}")
         return JSONResponse({"ok": True, **state})
 
     # -------- 调试台 --------
@@ -1412,7 +1362,7 @@ __all__ = [
     "WebConfigError", "config", "describe", "create_app", "WebConsole",
     "is_loopback", "static_dir", "config_path",
     "load_app_config", "save_app_config", "resolve_mcp", "resolve_vault",
-    "render_toml", "thresholds_state", "write_thresholds",
+    "thresholds_state", "write_thresholds",
     "mcp_health", "mcp_tools", "mcp_session_calls",
     "TOOL_GROUPS", "TOOL_GROUP_OTHER",
     "UPDATE_PATHS", "UPDATE_BACKEND_FILES", "UPDATE_FRONTEND_DIR",

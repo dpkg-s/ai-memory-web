@@ -5,11 +5,13 @@
 覆盖：
   A  配置校验 / fail-fast（`serve_web.py --check` 的**进程级退出码**，不是看文案）
   B  前端静态资源完整性（挂载点 + 本地 vendor 三件 + app/style 非空）
-  C  分层：导入控制台**不得**把 server 拉进 sys.modules（v3 判死项「不进程内直调」）
+  C  分层：导入控制台**不得**把 server 拉进 sys.modules（v3 判死项「不进程内直调」），
+     且**不得**把核心仓任何模块（memory_config / transport_http）拉进来（2026-10-16
+     拆掉跨仓 import 通道后的新不变量）
   D  鉴权中间件（httpx ASGI transport，无需端口）：无 token 401 / Bearer /
      X-Auth-Token / 静态资源不校验 / OPTIONS 204
   E  写保护：AI_MEMORY_WEB_CONFIG_WRITE=0 ⇒ POST /api/thresholds 被拒（400）
-  F  端到端（真起 serve_http + serve_web）：health / tools(24) / overview /
+  F  端到端（真起 serve_http + serve_web）：health / tools(25) / overview /
      thresholds(8 键) / index 回落 / assets 可达 / /api/call 真往返 / 阈值写读往返
   H  更新面（2026-10-15）：白名单安全边界 / 行首状态位回归 / 三点 diff 语义 /
      restarter 显式失败（H1~H5 静态，F11 走真服务）
@@ -53,12 +55,23 @@ for _n in ["笔记A", "笔记B", "笔记C"]:
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
 
-import core_path  # noqa: E402  （本仓模块：定位核心模块目录）
 import web_console  # noqa: E402
 
-# 核心模块与 MCP 端点入口（serve_http.py）的唯一事实源在 MCP 仓
-# ai-memory-template —— 端到端段要真起它，故在此解析一次。
-_CORE = core_path.find_core_dir()
+# 核心仓目录：端到端段要真起 serve_http.py（它属于核心仓，不在本仓）。
+# 2026-10-16 起本仓**不再有**自动上溯逻辑（那是已删除的 core_path.py 的职责），
+# 故这里由测试自己解析：显式 AI_MEMORY_CORE_DIR > submodule 布局（本仓的上一级）。
+# 两者都不成立时**大声退出** —— 端到端段是本文件的主要价值，静默跳过比失败更糟。
+_CORE = None
+_core_env = (os.environ.get("AI_MEMORY_CORE_DIR") or "").strip()
+for _cand in ([Path(_core_env)] if _core_env else []) + [_ROOT.parent]:
+    if (_cand / "server.py").is_file() and (_cand / "serve_http.py").is_file():
+        _CORE = _cand.resolve()
+        break
+if _CORE is None:
+    print("[F] 找不到核心仓（需含 server.py + serve_http.py）。\n"
+          "    请把本仓作为 submodule 挂在 ai-memory-template 下，或设 "
+          "AI_MEMORY_CORE_DIR 指向它。", file=sys.stderr)
+    sys.exit(2)
 
 _passed: list[str] = []
 _failed: list[str] = []
@@ -215,6 +228,14 @@ check("C1 import web_console 后 sys.modules 里没有 server",
       "server" not in sys.modules,
       f"被拉入 ⇒ 控制台有进程内直调风险；modules={'server' in sys.modules}")
 
+# C2/C3 钉的是 2026-10-16 拆掉的「第二条腿」：本仓曾 import core_path 定位核心目录、
+# 再 import memory_config / transport_http。现在对核心仓的关系只剩「连接 MCP」，
+# 所以导入控制台后，**核心仓的模块一个都不该出现在内存里** —— 这条比 C1 更严：
+# server 只是核心仓的一个文件，import memory_config 同样意味着两份事实源。
+for _core_mod in ("memory_config", "transport_http", "core_path", "web_console_core"):
+    check(f"C2 import web_console 后 sys.modules 里没有 {_core_mod}（无跨仓 import）",
+          _core_mod not in sys.modules, "被拉入 ⇒ 跨仓 import 通道又回来了")
+
 
 # =====================================================================
 section("D 鉴权中间件（ASGI，无需端口）")
@@ -325,16 +346,25 @@ for _node in _ast.walk(_ast.parse(_srv_py.read_text(encoding="utf-8"))):
     if not isinstance(_node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
         continue
     for _dec in _node.decorator_list:
-        _f = _dec.func if isinstance(_dec, _ast.Call) else _dec
-        if getattr(_f, "attr", None) == "tool":
-            _registered.add(_node.name)
+        if not isinstance(_dec, _ast.Call):
+            _f, _kw = _dec, {}
+        else:
+            _f, _kw = _dec.func, {k.arg: k.value for k in _dec.keywords}
+        if getattr(_f, "attr", None) != "tool":
+            continue
+        # `@mcp.tool(name="x")` 可以把注册名与函数名解耦（memory_config 就是这么做的：
+        # 函数名叫 _memory_config_tool，免得遮蔽同名的 memory_config 模块）。
+        # 只取 _node.name 会把这类工具记成函数名 ⇒ G3 立刻报「分组表有陈旧键」。
+        _nm = _kw.get("name")
+        _registered.add(_nm.value if isinstance(_nm, _ast.Constant) and isinstance(_nm.value, str)
+                        else _node.name)
 
 _mapped = set(web_console._TOOL_GROUP_OF)
 _group_keys = {g["key"] for g in web_console.TOOL_GROUPS}
 _used_keys = set(web_console._TOOL_GROUP_OF.values())
 
-check("G1 server.py 注册了 24 个 @mcp.tool 工具",
-      len(_registered) == 24, f"实际 {len(_registered)} 个")
+check("G1 server.py 注册了 25 个 @mcp.tool 工具",
+      len(_registered) == 25, f"实际 {len(_registered)} 个")
 check("G2 分组表无遗漏（每个已注册工具都有归属）",
       not (_registered - _mapped), ", ".join(sorted(_registered - _mapped)))
 check("G3 分组表无陈旧键（没有已不存在的工具）",
@@ -351,10 +381,10 @@ section("H 更新面（2026-10-15）")
 # H1/H2 钉的是**安全边界**：白名单决定「更新」能覆盖哪些文件。少了控制台后端或
 # 前端目录，功能就名不副实；混进 *.md / *.db，就会碰到 vault 数据。
 _wl = set(web_console.UPDATE_PATHS)
-check("H1 白名单覆盖本仓后端三件 + 前端目录",
-      {"web_console.py", "serve_web.py", "core_path.py",
+check("H1 白名单覆盖本仓后端两件 + 前端目录",
+      {"web_console.py", "serve_web.py",
        web_console.UPDATE_FRONTEND_DIR} <= _wl,
-      f"缺={sorted({'web_console.py', 'serve_web.py', 'core_path.py',
+      f"缺={sorted({'web_console.py', 'serve_web.py',
                     web_console.UPDATE_FRONTEND_DIR} - _wl)}")
 check("H2 白名单不含数据类文件（.md / .db / .sqlite）",
       not any(str(p).endswith((".md", ".db", ".sqlite", ".sqlite3")) for p in _wl),
@@ -425,8 +455,9 @@ try:
     st, txt = _http("/api/tools")
     j = json.loads(txt) if st == 200 else {}
     names = {t.get("name") for t in j.get("tools", [])} if j else set()
-    check("F2 /api/tools 返回 24 个工具且含关键项",
-          st == 200 and j.get("count") == 24 and {"memory_batch_tag",
+    check("F2 /api/tools 返回 25 个工具且含关键项",
+          st == 200 and j.get("count") == 25 and {"memory_batch_tag",
+                                                  "memory_config",
                                                   "memory_orphans"} <= names,
           f"status={st} count={j.get('count')}")
 
@@ -438,8 +469,8 @@ try:
     check("F2b /api/tools 下发 6 个功能组且首组为 content",
           st == 200 and len(_gkeys) == 6 and _gkeys[0] == "content",
           f"groups={_gkeys}")
-    check("F2c 24 项工具全部带 group，且值都在组定义内",
-          st == 200 and len(_gtools) == 24
+    check("F2c 25 项工具全部带 group，且值都在组定义内",
+          st == 200 and len(_gtools) == 25
           and all(t.get("group") in _gkeys for t in _gtools),
           ", ".join(sorted({str(t.get("group")) for t in _gtools} - set(_gkeys))))
     check("F2d 没有工具落入 other 兜底组（映射表无遗漏）",
@@ -502,7 +533,9 @@ try:
           st == 200 and want <= keys and j.get("writable") is True,
           f"status={st} missing={sorted(want - keys)} writable={j.get('writable')}")
 
-    # 接线断言：文案只有 memory_config.META 一处来源，接口必须把它带出来。
+    # 接线断言：文案的唯一事实源是核心仓 memory_config.META，控制台已不再 import 它
+    # ⇒ 文案只能**经 MCP 工具 memory_config 传过来**。这条因此同时证明了两件事：
+    # 服务端把文案带出来了，且控制台确实在走 MCP 而不是偷偷 import。
     # 断言口径是「**每个**键都非空」，而不是「至少有一个」—— 后者在 7 个键都空时照样绿。
     _no_meta = [k for k, v in (j.get("keys") or {}).items()
                 if not str(v.get("label") or "").strip()
@@ -521,7 +554,7 @@ try:
           # 白名单 = 本仓程序文件（2026-10-16 拆仓后收敛）。
           # 用**精确集合包含**而不是「长度 >= N」：长度断言分辨不出「混进了不该
           # 覆盖的文件」与「漏了本仓文件」，两者都能凑够数量。
-          and {"web_console.py", "serve_web.py", "core_path.py",
+          and {"web_console.py", "serve_web.py",
                web_console.UPDATE_FRONTEND_DIR} <= set(j.get("whitelist") or []),
           f"status={st} checked={j.get('checked')} is_repo={j.get('is_repo')} "
           f"whitelist={j.get('whitelist')}")

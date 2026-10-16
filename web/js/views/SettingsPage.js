@@ -425,7 +425,7 @@ var SettingsPage = {
     '        </div>' +
     '        <div class="hint mt">' +
     '          <div>热度类阈值（<span class="mono">heat_*</span>）只影响分层建议：核心页（记忆索引、近期工作动态等）一律豁免，不参与升降。</div>' +
-    '          <div>写入前会先备份到 vault 之外，且只写这一个配置文件，绝不触碰任何 .md 笔记。</div>' +
+    '          <div>写入前会先备份为同目录下的 <span class="mono">memory.toml.bak.&lt;时间戳&gt;</span>（保留最近 10 份，已被 vault 自带的 .gitignore 覆盖），且只写这一个配置文件，绝不触碰任何 .md 笔记。</div>' +
     '        </div>' +
     '      </div></x-card>' +
     "  </div>" +

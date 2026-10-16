@@ -46,7 +46,8 @@ function saveThresholds() {
     "确认写入 memory.toml",
     "将写入 " +
       (st.data.config_path || "memory.toml") +
-      "（约 2 秒内生效）。仅写入该配置文件，不会触碰任何 .md 笔记；写入前会自动备份到 vault 之外。",
+      "（约 2 秒内生效）。仅写入该配置文件，不会触碰任何 .md 笔记；写入前会自动备份" +
+      "为同目录下的 memory.toml.bak.<时间戳>（保留最近 10 份）。",
     "写入",
     function () {
       st.saving = true;

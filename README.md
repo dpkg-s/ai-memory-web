@@ -19,18 +19,23 @@
 
 ## 与 ai-memory-template 的关系（先读这条）
 
-**本仓不含核心模块。** 控制台依赖两个核心模块：
+**本仓不 import 核心仓的任何模块，对核心仓的关系只有一种：连接。**（2026-10-16 收敛）
 
-| 模块 | 用途 | 谁也在用 |
-| --- | --- | --- |
-| `memory_config.py` | 读写 vault 根的 `memory.toml`（阈值配置面） | `server.py` / `locks.py` / `text_utils.py` |
-| `transport_http.py` | MCP HTTP 端点的默认地址常量 | `serve_http.py` |
+历史形态是两条腿：「连 MCP」+「通过 `core_path.py` 上溯定位核心目录、注入 `sys.path`，再 `import memory_config` / `transport_http`」。第二条腿已于 2026-10-16 整体拆除：
 
-它们同时被 MCP 服务端使用，因此**唯一事实源留在 `ai-memory-template`**，本仓运行时不复制、不派生。`core_path.py` 负责定位核心目录并注入 `sys.path`——这是两个仓之间，也是整个仓库**唯一**的耦合点，集中在一处以便审计。
+| 曾经要 import 的东西 | 现在怎么拿 |
+| --- | --- |
+| `memory_config.py`（读写 vault 根的 `memory.toml`） | MCP 工具 **`memory_config`**（唯一实现在核心仓，MCP 服务端与 Web 台共用同一份） |
+| `transport_http.py`（MCP 端点默认地址常量） | 本仓字面常量 `DEFAULT_MCP_URL`（它本来就只是个可被 `AI_MEMORY_WEB_MCP` 覆盖的默认值） |
+| `core_path.py`（定位核心目录 + 注入 `sys.path`） | **已删除**；仅 `serve_web.py --with-mcp` 需要核心仓目录（找 `serve_http.py` 入口），且必须显式给 `--core-dir` / `AI_MEMORY_CORE_DIR` |
+
+为什么值得拆：跨仓 import 意味着「`memory.toml` 怎么读、怎么写、怎么校验」在两侧各有一份实现，任一侧改动都可能让两边对不上；而定位逻辑本身还得维护一套上溯/回落规则。现在这三件事只有一处实现，本仓只负责「转成前端契约的 JSON」和「施加本台的只读开关」。
+
+`tests/test_web.py` 的 C 段把这条钉成了断言：导入控制台后 `sys.modules` 里**不得**出现 `memory_config` / `transport_http` / `core_path` / `server`。
 
 | 层 | 所在仓库 |
 | --- | --- |
-| MCP 服务端（24 工具 / Markdown vault） | [ai-memory-template](https://github.com/dpkg-s/ai-memory-template) |
+| MCP 服务端（25 工具 / Markdown vault） | [ai-memory-template](https://github.com/dpkg-s/ai-memory-template) |
 | 核心模块（`server.py` / `memory_config.py` / `transport_http.py` / `serve_http.py` …） | [ai-memory-template](https://github.com/dpkg-s/ai-memory-template) |
 | **Web 控制台：前端 + 后端（本仓）** | **ai-memory-web** |
 
@@ -40,7 +45,7 @@
 
 ### 形态一：作为 submodule（推荐，零配置）
 
-本仓在 `ai-memory-template/web-console/`，上一级即核心目录，`core_path.py` 自动上溯定位：
+本仓挂在 `ai-memory-template/web-console/`，与核心仓同处一个工作副本：
 
 ```bash
 git clone --recursive git@github.com:dpkg-s/ai-memory-template.git
@@ -48,26 +53,31 @@ cd ai-memory-template/web-console
 python serve_web.py --port 8811 --mcp http://127.0.0.1:8700/mcp
 ```
 
-### 形态二：独立 clone（显式指定核心目录）
+### 形态二：独立 clone
 
 ```bash
 git clone git@github.com:dpkg-s/ai-memory-web.git
 cd ai-memory-web
 
-# Windows: set AI_MEMORY_CORE_DIR=D:\path\to\ai-memory-template
-export AI_MEMORY_CORE_DIR=/path/to/ai-memory-template
+# 只要有一个可达的 MCP 端点即可，不需要核心仓目录
 python serve_web.py --port 8811 --mcp http://127.0.0.1:8700/mcp
 ```
 
-未指定且无法自动上溯时，进程会**明确报错并给出可照抄的修复命令**，不会静默回落。
+本形态**不需要** `AI_MEMORY_CORE_DIR`——控制台已不 import 核心仓任何模块。该变量只在
+`--with-mcp`（要让控制台替你拉起 MCP 端点）时才需要。
 
 ### 形态三：一条命令拉起前后端（单机试用最省事）
 
 ```bash
+# Windows: set AI_MEMORY_CORE_DIR=D:\path\to\ai-memory-template
+export AI_MEMORY_CORE_DIR=/path/to/ai-memory-template
 python serve_web.py --with-mcp
 ```
 
 `--with-mcp` 会把核心仓的 `serve_http.py` 作为**子进程**拉起（仍是进程间调用，不破坏分层）。
+核心仓目录**必须显式给出**（`--core-dir` 或 `AI_MEMORY_CORE_DIR`）：本仓可能被单独克隆，
+自动上溯猜出来的路径一旦猜错，报错会指向一个无关的文件。未给出时进程**明确报错并打印
+可照抄的修复命令**，不会静默回落。
 
 ### 其他
 
@@ -83,7 +93,7 @@ python -m http.server 8080 --directory web
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `AI_MEMORY_CORE_DIR` | （空） | 核心模块目录；默认自动上溯定位 |
+| `AI_MEMORY_CORE_DIR` | （空） | 核心仓目录；**仅** `--with-mcp` 需要（用于找 `serve_http.py`），不再用于 import |
 | `AI_MEMORY_WEB_HOST` | `127.0.0.1` | 监听地址；非回环**必须**配 token，否则拒绝启动 |
 | `AI_MEMORY_WEB_PORT` | `8811` | 监听端口 |
 | `AI_MEMORY_WEB_TOKEN` | （空） | 设了之后 `/api/*` 需 `Authorization: Bearer <token>` |
@@ -107,7 +117,7 @@ python -m http.server 8080 --directory web
 | Hash 路由 | 页面 | 职责 |
 | --- | --- | --- |
 | `#/dashboard` | 概览 | 条目统计、类型/作用域分布、写入趋势、近期活动 |
-| `#/console` | 调试台 | 24 个 MCP 工具的调用台（按用途分 6 组，参数表单 + 结果面板） |
+| `#/console` | 调试台 | 25 个 MCP 工具的调用台（按用途分 6 组，参数表单 + 结果面板） |
 | `#/library` | 记忆库 | 条目浏览、搜索、阅读 |
 | `#/settings` | 配置 | 连接、阈值、FNS 导入、关于与更新 |
 
@@ -116,7 +126,6 @@ python -m http.server 8080 --directory web
 ```
 ├── serve_web.py            # 后端入口：参数解析 + 配置校验 + 拉起 uvicorn
 ├── web_console.py          # 后端装配层：Starlette 应用 + /api/* 代理 + 配置面 + 鉴权
-├── core_path.py            # 核心模块定位：AI_MEMORY_CORE_DIR / 自动上溯 → 注入 sys.path
 ├── requirements.txt        # mcp>=1.30,<2（starlette / uvicorn / httpx / anyio 均为其传递依赖）
 ├── web/                    # 前端（静态根；后端把它挂在 /assets）
 │   ├── index.html          # 入口：主题预置脚本 + vendor 同步加载 + ESM 入口 js/main.js
@@ -149,8 +158,8 @@ python -m http.server 8080 --directory web
 
 1. **零构建**：前端没有打包器、没有 npm 依赖、没有产物目录，改完刷新浏览器即生效。
 2. **CSS 分片顺序不可变**：CSS 没有 `import` 那样的显式依赖，层叠顺序就是加载顺序，因此 `web/index.html` 中 8 个 `<link>` 的顺序不可调换、不可改为按需加载。
-3. **核心模块不复制**：需要 `memory_config` / `transport_http` 时一律走 `core_path.ensure_core_on_path()`，不要在仓内新增副本——那会让两仓的配置逻辑各自漂移。
-4. **分层**：控制台不 import `server`，对记忆库的一切读写都走 MCP 协议（不直连 vault、不进程内直调）。
+3. **核心模块不复制、也不 import**：阈值一律经 MCP 工具 `memory_config` 读写；需要新能力时**先加 MCP 工具**，而不是在仓内新增一份核心逻辑的副本或副本式 import——那会让两仓各自漂移。
+4. **分层**：控制台不 import `server`，也不 import 核心仓任何模块（`memory_config` / `transport_http` / `core_path`）；对记忆库的一切读写都走 MCP 协议（不直连 vault、不进程内直调）。`tests/test_web.py` C 段机器守卫这两条。
 5. **主题**：`data-theme`（解析值）+ `data-theme-pref`（用户偏好），早于首帧生效以避免闪烁；`?theme=light|dark|auto` 可作深链覆盖并写回 `localStorage`。
 6. **hash 路由**：`#/dashboard` 等，不依赖服务端路由重写。
 
