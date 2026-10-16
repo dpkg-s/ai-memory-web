@@ -1,0 +1,15 @@
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# 本机备份（跨仓同步或改版前的临时副本，一律不入库）
+*.prebak.*
+*.syncbak.*
+*.bak.*
+
+# 前端无构建步骤：以下目录若出现，说明误引入了构建链或有临时产物
+node_modules/
+dist/
+build/
