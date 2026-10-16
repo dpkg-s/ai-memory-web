@@ -1,0 +1,9 @@
+# ai-memory-web（Web 控制台）的运行时依赖。
+#
+# 只有 mcp 一个：starlette / uvicorn / httpx / anyio 全部是 mcp 的**传递依赖**
+# （2026-10-13 实测确认），故不单独列出 —— 单列反而会在 mcp 换版本时留下与
+# 实际情况不符的版本约束。
+#
+# 上界 <2 是硬约束：mcp 2.x 把 FastMCP 更名为 MCPServer，装到 2.x 会 import 失败。
+# 与 MCP 仓 ai-memory-template 的 requirements.txt 保持一致。
+mcp>=1.30,<2

@@ -1,11 +1,11 @@
 # ai-memory-web
 
-**ai-memory 记忆库的 Web 控制台。**
+**ai-memory 记忆库的 Web 控制台 —— 前端 + 后端。**
 
-浏览器里的记忆库控制面：概览、记忆库、调试台、配置四页。纯静态前端、**零构建步骤** —— 原生 ES 模块 + 本地 vendor，`git clone` 后即可运行。
+浏览器里的记忆库控制面：概览、记忆库、调试台、配置四页。前端纯静态、**零构建**；后端是一个 Starlette 应用，同源托管前端并把 `/api/*` 代理到 MCP 端点。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Frontend](https://img.shields.io/badge/build-none%20(vanilla%20ESM)-blue)]()
+[![Frontend](https://img.shields.io/badge/build-none-blue)]()
 [![Vue](https://img.shields.io/badge/Vue-3.4.38-42b883)](https://vuejs.org/)
 [![Console](https://img.shields.io/badge/console-v3.1-informational)]()
 
@@ -13,51 +13,94 @@
 
 ## 这是什么
 
-「ai 融合记忆库」（[ai-memory-template](https://github.com/dpkg-s/ai-memory-template)）的浏览器控制台前端。本仓库由该仓库的 `web/` 目录拆分而来，成为可独立部署、独立演进的前端仓库。
+「ai 融合记忆库」（[ai-memory-template](https://github.com/dpkg-s/ai-memory-template)）的浏览器控制台，由一个入口脚本（`serve_web.py`）、一个装配层（`web_console.py`）和一套前端（`web/`）组成。
 
-一条硬约束决定了它的形态：**浏览器不直连 MCP**。前端只与同源 HTTP API（`/api/*`）通信，由后端代理到 MCP 端点。
+一条硬约束决定它的形态：**浏览器不直连 MCP**。MCP 端点的 `allowed_origins` 默认为空，任何带 `Origin` 头的请求一律 403，且 SDK 不返回 CORS 头、`OPTIONS` 预检返 405。因此前端只与**同源** HTTP API 通信，由后端用 MCP SDK 完成上游调用。
 
-## 与 ai-memory-template 的关系
+## 与 ai-memory-template 的关系（先读这条）
+
+**本仓不含核心模块。** 控制台依赖两个核心模块：
+
+| 模块 | 用途 | 谁也在用 |
+| --- | --- | --- |
+| `memory_config.py` | 读写 vault 根的 `memory.toml`（阈值配置面） | `server.py` / `locks.py` / `text_utils.py` |
+| `transport_http.py` | MCP HTTP 端点的默认地址常量 | `serve_http.py` |
+
+它们同时被 MCP 服务端使用，因此**唯一事实源留在 `ai-memory-template`**，本仓运行时不复制、不派生。`core_path.py` 负责定位核心目录并注入 `sys.path`——这是两个仓之间，也是整个仓库**唯一**的耦合点，集中在一处以便审计。
 
 | 层 | 所在仓库 |
 | --- | --- |
-| MCP 服务端（24 工具 / 7 模块 / Markdown vault） | [ai-memory-template](https://github.com/dpkg-s/ai-memory-template) |
-| Web 后端（`serve_web.py` + `web_console.py`：API 层 + 静态托管） | [ai-memory-template](https://github.com/dpkg-s/ai-memory-template) |
-| **Web 前端（本仓库）** | **ai-memory-web** |
+| MCP 服务端（24 工具 / Markdown vault） | [ai-memory-template](https://github.com/dpkg-s/ai-memory-template) |
+| 核心模块（`server.py` / `memory_config.py` / `transport_http.py` / `serve_http.py` …） | [ai-memory-template](https://github.com/dpkg-s/ai-memory-template) |
+| **Web 控制台：前端 + 后端（本仓）** | **ai-memory-web** |
 
-拆分基线：`ai-memory-template@98f27b4`。
+> 拆分为两个仓的意义：Web 控制台可以独立演进、独立发版，而不必牵动 MCP 服务端的版本节奏。
 
 ## 快速开始
 
-### 方式一：对接真实后端（推荐）
+### 形态一：作为 submodule（推荐，零配置）
 
-后端通过 `AI_MEMORY_WEB_STATIC` 指向本仓库根目录，其余零改动：
-
-```bash
-# 在 ai-memory-template 目录下执行
-AI_MEMORY_WEB_STATIC=/path/to/ai-memory-web \
-  python serve_web.py --port 8811 --mcp http://127.0.0.1:8700/mcp
-```
-
-打开 <http://127.0.0.1:8811/>
-
-### 方式二：仅预览界面（无数据）
+本仓在 `ai-memory-template/web-console/`，上一级即核心目录，`core_path.py` 自动上溯定位：
 
 ```bash
-python -m http.server 8080 --directory .
+git clone --recursive git@github.com:dpkg-s/ai-memory-template.git
+cd ai-memory-template/web-console
+python serve_web.py --port 8811 --mcp http://127.0.0.1:8700/mcp
 ```
 
-此模式下 `/api/*` 全部 404，数据区为空或报错 —— 仅用于布局与视觉检查。
+### 形态二：独立 clone（显式指定核心目录）
+
+```bash
+git clone git@github.com:dpkg-s/ai-memory-web.git
+cd ai-memory-web
+
+# Windows: set AI_MEMORY_CORE_DIR=D:\path\to\ai-memory-template
+export AI_MEMORY_CORE_DIR=/path/to/ai-memory-template
+python serve_web.py --port 8811 --mcp http://127.0.0.1:8700/mcp
+```
+
+未指定且无法自动上溯时，进程会**明确报错并给出可照抄的修复命令**，不会静默回落。
+
+### 形态三：一条命令拉起前后端（单机试用最省事）
+
+```bash
+python serve_web.py --with-mcp
+```
+
+`--with-mcp` 会把核心仓的 `serve_http.py` 作为**子进程**拉起（仍是进程间调用，不破坏分层）。
+
+### 其他
+
+```bash
+python serve_web.py --check   # 只校验配置并打印摘要，不起服务（自检 / CI）
+python serve_web.py --open    # 启动后自动打开浏览器
+
+# 只看界面、无后端（/api/* 会 404，仅用于布局与视觉检查）
+python -m http.server 8080 --directory web
+```
+
+## 环境变量
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `AI_MEMORY_CORE_DIR` | （空） | 核心模块目录；默认自动上溯定位 |
+| `AI_MEMORY_WEB_HOST` | `127.0.0.1` | 监听地址；非回环**必须**配 token，否则拒绝启动 |
+| `AI_MEMORY_WEB_PORT` | `8811` | 监听端口 |
+| `AI_MEMORY_WEB_TOKEN` | （空） | 设了之后 `/api/*` 需 `Authorization: Bearer <token>` |
+| `AI_MEMORY_WEB_MCP` | `http://127.0.0.1:8700/mcp` | 上游 MCP 端点 |
+| `AI_MEMORY_WEB_STATIC` | `<本仓根>/web` | 前端静态资源目录 |
+| `AI_MEMORY_WEB_CONFIG` | `~/.ai-memory-web/config.json` | 配置面存储 |
+| `AI_MEMORY_WEB_CONFIG_WRITE` | `1` | `0` = 阈值只读 |
 
 ## URL 约定
 
 | 路径 | 去向 |
 | --- | --- |
-| `/` | `index.html` |
-| `/assets/*` | 本仓库根（`css/`、`js/`、`vendor/`） |
-| `/api/*` | 后端 API（同源 fetch，可选 `Bearer` Token） |
+| `/` | `web/index.html` |
+| `/assets/*` | `web/` 目录（`css/`、`js/`、`vendor/`） |
+| `/api/*` | 后端代理到 MCP（可选 `Bearer` Token） |
 
-后端使用的接口：`/api/health`、`/api/overview`、`/api/tools`、`/api/call`、`/api/thresholds`、`/api/config`、`/api/update`、`/api/update/restart`。
+后端接口：`/api/health`、`/api/overview`、`/api/tools`、`/api/call`、`/api/thresholds`、`/api/config`、`/api/update`、`/api/update/restart`。
 
 ## 页面
 
@@ -71,37 +114,45 @@ python -m http.server 8080 --directory .
 ## 目录结构
 
 ```
-├── index.html              # 入口：主题预置脚本 + vendor 同步加载 + ESM 入口 js/main.js
-├── css/                    # 8 片；CSS 无显式依赖，层叠顺序即加载顺序（不可调换）
-│   ├── 1-tokens.css        # 设计令牌（颜色 / 间距 / 动效时长）
-│   ├── 2-layout.css        # 外壳骨架（sidebar / 三栏 / grid）
-│   ├── 3-components.css    # 基础组件
-│   ├── 4-console.css       # 调试台
-│   ├── 5-overlays.css      # 模态 / Toast
-│   ├── 6-anim.css          # 动画与过渡
-│   ├── 7-views.css         # 各页面样式
-│   └── 8-responsive.css    # 响应式分档
-├── js/
-│   ├── main.js             # 入口：挂载 Vue 应用
-│   ├── core/               # 核心层：api / store / router / data / theme / icons / util / anim
-│   ├── components/         # 14 个基础组件（XCard / XStat / XKv / XPill / XSkel / …）
-│   ├── features/           # 功能层：console / library / settings / update / fnsImport
-│   └── views/              # 页面层：Root / Dashboard / ConsolePage / LibraryPage / SettingsPage
-└── vendor/                 # 本地化第三方库（无 CDN、无 npm）
-    ├── vue.esm-browser.prod.js   # Vue 3.4.38（ESM 具名导入，比 global 版小 126 KB）
-    ├── marked.min.js             # Markdown 渲染 12.0.2（UMD → window.marked）
-    ├── purify.min.js             # DOMPurify 3.1.6（HTML 消毒）
-    ├── gsap.min.js               # GSAP 3.13.0
-    └── Flip.min.js               # GSAP Flip 3.13.0
+├── serve_web.py            # 后端入口：参数解析 + 配置校验 + 拉起 uvicorn
+├── web_console.py          # 后端装配层：Starlette 应用 + /api/* 代理 + 配置面 + 鉴权
+├── core_path.py            # 核心模块定位：AI_MEMORY_CORE_DIR / 自动上溯 → 注入 sys.path
+├── requirements.txt        # mcp>=1.30,<2（starlette / uvicorn / httpx / anyio 均为其传递依赖）
+├── web/                    # 前端（静态根；后端把它挂在 /assets）
+│   ├── index.html          # 入口：主题预置脚本 + vendor 同步加载 + ESM 入口 js/main.js
+│   ├── css/                # 8 片；CSS 无显式依赖，层叠顺序即加载顺序（不可调换）
+│   │   ├── 1-tokens.css    #   设计令牌（颜色 / 间距 / 动效时长）
+│   │   ├── 2-layout.css    #   外壳骨架（sidebar / 三栏 / grid）
+│   │   ├── 3-components.css#   基础组件
+│   │   ├── 4-console.css   #   调试台
+│   │   ├── 5-overlays.css  #   模态 / Toast
+│   │   ├── 6-anim.css      #   动画与过渡
+│   │   ├── 7-views.css     #   各页面样式
+│   │   └── 8-responsive.css#   响应式分档
+│   ├── js/
+│   │   ├── main.js         #   入口：挂载 Vue 应用
+│   │   ├── core/           #   核心层：api / store / router / data / theme / icons / util / anim
+│   │   ├── components/     #   14 个基础组件（XCard / XStat / XKv / XPill / XSkel / …）
+│   │   ├── features/       #   功能层：console / library / settings / update / fnsImport
+│   │   └── views/          #   页面层：Root / Dashboard / ConsolePage / LibraryPage / SettingsPage
+│   └── vendor/             #   本地化第三方库（无 CDN、无 npm）
+│       ├── vue.esm-browser.prod.js   # Vue 3.4.38（ESM 具名导入）
+│       ├── marked.min.js             # Markdown 渲染 12.0.2
+│       ├── purify.min.js             # DOMPurify 3.1.6
+│       ├── gsap.min.js               # GSAP 3.13.0
+│       └── Flip.min.js               # GSAP Flip 3.13.0
+├── LICENSE
+└── README.md
 ```
 
 ## 开发约定
 
-1. **零构建**：没有打包器、没有 npm 依赖、没有产物目录。改完刷新浏览器即生效。
-2. **CSS 分片顺序不可变**：CSS 没有 `import` 那样的显式依赖，层叠顺序就是加载顺序，因此 `index.html` 中的 8 个 `<link>` 顺序不可调换、不可改为按需加载。
-3. **模块加载次序**：vendor 的 UMD 脚本（`marked` / `DOMPurify` / `gsap` / `Flip`）为同步普通脚本，先于 ESM 入口执行；模块顶层读取 `window.marked` 等一定拿得到值。
-4. **主题**：`data-theme`（解析后的实际值）+ `data-theme-pref`（用户偏好）；早于首帧生效以避免闪烁。`?theme=light|dark|auto` 可作深链覆盖，并写回 `localStorage`。
-5. **hash 路由**：`#/dashboard` 等，不依赖服务端路由重写。
+1. **零构建**：前端没有打包器、没有 npm 依赖、没有产物目录，改完刷新浏览器即生效。
+2. **CSS 分片顺序不可变**：CSS 没有 `import` 那样的显式依赖，层叠顺序就是加载顺序，因此 `web/index.html` 中 8 个 `<link>` 的顺序不可调换、不可改为按需加载。
+3. **核心模块不复制**：需要 `memory_config` / `transport_http` 时一律走 `core_path.ensure_core_on_path()`，不要在仓内新增副本——那会让两仓的配置逻辑各自漂移。
+4. **分层**：控制台不 import `server`，对记忆库的一切读写都走 MCP 协议（不直连 vault、不进程内直调）。
+5. **主题**：`data-theme`（解析值）+ `data-theme-pref`（用户偏好），早于首帧生效以避免闪烁；`?theme=light|dark|auto` 可作深链覆盖并写回 `localStorage`。
+6. **hash 路由**：`#/dashboard` 等，不依赖服务端路由重写。
 
 ## 许可
 
