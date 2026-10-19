@@ -126,7 +126,7 @@ from mcp.client.streamable_http import streamablehttp_client
 
 logger = logging.getLogger("ai-memory.web")
 
-WEB_VERSION = "1.1.0"
+WEB_VERSION = "1.2.0"
 DEFAULT_WEB_HOST = "127.0.0.1"
 # ⚠️ 本机实测（2026-10-13，Windows）：8800/8801/8802 均被系统保留（bind 报
 # WinError 10013），故默认改用 8811 段。可选：8811-8820。
@@ -627,16 +627,47 @@ async def mcp_tools(endpoint: str, timeout: float = MCP_TIMEOUT) -> list[dict]:
 #   报「N 个文件不在版本库」，而不是显示「已是最新」。本机在 2026-10-15 之前
 #   前端与控制台后端正处于这个状态（内存记录「评估_记忆库GitHub分发更新可行性」）。
 # ---------------------------------------------------------------------------
-# 本仓只含 Web 侧代码 ⇒ 白名单 = 本仓全部程序文件。核心模块（memory_config /
-# transport_http）与 MCP 服务端（server.py / serve_http.py 等）**不在本仓**：
-# 它们由 MCP 仓 ai-memory-template 独立更新，故不列入。
+# 本仓只含 Web 侧代码 ⇒ **web 目标**的白名单 = 本仓全部程序文件。
 # 2026-10-16：`core_path.py` 随「Web 不再 import 核心模块」一并删除，白名单同步收敛。
 UPDATE_BACKEND_FILES = (
     "web_console.py",
     "serve_web.py",
 )
 UPDATE_FRONTEND_DIR = "web"
-UPDATE_PATHS = UPDATE_BACKEND_FILES + (UPDATE_FRONTEND_DIR,)
+UPDATE_WEB_PATHS = UPDATE_BACKEND_FILES + (UPDATE_FRONTEND_DIR,)
+
+# 🔴 2026-10-16（晚）：更新面扩为**双目标** —— 核心（MCP）与 Web 分属两个仓、
+# 两个目录（`dpkg-s/ai-memory-template` vs `dpkg-s/ai-memory-web`），各有独立
+# 远端与独立白名单，**不能共用** `update_root()`。
+#
+# 核心白名单口径与 Web 侧一致：只含「程序」—— 运行时模块 + 依赖声明。
+# 刻意**不含**安装器（ai_memory_setup.py / install.*）、CI、Dockerfile、文档与
+# `template/` 数据页：它们不是运行面，混进来会把「更新」变成一次全仓覆盖。
+CORE_PROGRAM_FILES = (
+    "server.py",
+    "serve_http.py",
+    "transport_http.py",
+    "memory_config.py",
+    "memory_index.py",
+    "metrics.py",
+    "locks.py",
+    "text_utils.py",
+    "yaml_io.py",
+    "requirements.txt",
+    "requirements-dev.txt",
+    "ruff.toml",
+)
+#: 核心仓的识别标记 —— 两个文件同时存在才算「像核心仓」，避免把碰巧同名的
+#: 目录当成核心，从而对错误的仓执行 restore。
+CORE_ROOT_MARKERS = ("serve_http.py", "server.py")
+CORE_ROOT_ENV = "AI_MEMORY_CORE_DIR"
+
+#: 目标登记表：key → (显示名, 白名单)。顺序即界面顺序。
+UPDATE_TARGET_KEYS = ("web", "core")
+UPDATE_TARGET_NAMES = {"web": "Web 控制台", "core": "核心（MCP）"}
+
+#: 兼容旧引用（既有调用点与测试 H1/H2）：裸名 = web 目标。
+UPDATE_PATHS = UPDATE_WEB_PATHS
 
 UPDATE_TIMEOUT = 90.0                       # 单条 git 命令超时（秒）
 UPDATE_BACKUP_DIR = ".ai-memory-backup"
@@ -674,6 +705,50 @@ def restarter_path() -> str:
         return raw if Path(raw).is_file() else ""
     cand = Path.home() / "Desktop" / RESTARTER_NAME
     return str(cand) if cand.is_file() else ""
+
+
+def _ok_core_root(p: Path) -> bool:
+    try:
+        return all((p / m).is_file() for m in CORE_ROOT_MARKERS)
+    except OSError:
+        return False
+
+
+def core_root() -> tuple[Path | None, str]:
+    """定位核心（MCP）仓目录，返回 ``(目录, 错误说明)``；成功时错误说明为空串。
+
+    与 `restarter_path()` 同一原则：**显式设了 ``AI_MEMORY_CORE_DIR`` 却无效时
+    绝不静默回落** —— 否则「更新了错误的目录」这类事故会变得不可复现。
+
+    候选顺序：
+      1. 环境变量 ``AI_MEMORY_CORE_DIR``（桌面 launcher 起 Web 进程时注入）
+      2. 本文件所在目录的**父目录** —— submodule 布局下即核心仓根
+      3. ``~/.workbuddy/mcp-servers/ai-memory``
+    """
+    markers = " / ".join(CORE_ROOT_MARKERS)
+    explicit = (os.environ.get(CORE_ROOT_ENV) or "").strip()
+    if explicit:
+        p = Path(explicit)
+        if _ok_core_root(p):
+            return p, ""
+        return None, (f"{CORE_ROOT_ENV} 指向的目录不像核心仓（缺 {markers}）：{explicit}")
+
+    for cand in (update_root().parent,
+                 Path.home() / ".workbuddy" / "mcp-servers" / "ai-memory"):
+        if _ok_core_root(cand):
+            return cand, ""
+    return None, (f"未找到核心仓目录（需同时含 {markers}）。"
+                  f"可设环境变量 {CORE_ROOT_ENV} 显式指定。")
+
+
+def update_target(key: str) -> tuple[Path | None, tuple[str, ...], str]:
+    """``key`` → ``(目录, 白名单, 错误说明)``。未知 key 返回空目录 + 错误。"""
+    if key == "web":
+        return update_root(), UPDATE_WEB_PATHS, ""
+    if key == "core":
+        root, err = core_root()
+        return root, CORE_PROGRAM_FILES, err
+    return None, (), f"未知更新目标：{key}"
 
 
 def _git(args: list[str], cwd: Path, timeout: float = UPDATE_TIMEOUT) -> tuple[int, str]:
@@ -728,15 +803,19 @@ def _version_from_changelog(root: Path, ref: str | None = None) -> str:
     return m.group(1) if m else ""
 
 
-def _whitelist_tracking(root: Path) -> tuple[list[str], list[str]]:
+def _whitelist_tracking(root: Path,
+                        paths: tuple[str, ...] | None = None) -> tuple[list[str], list[str]]:
     """白名单内的 ``(已入库, 未入库)`` 两组路径。
 
     未入库 = 文件在工作区存在、git 却不认识它们 ⇒ 远端不会有它们。这个事实必须
     显式呈现，否则界面会用「已是最新」掩盖「一半文件根本没被跟踪」。
+
+    ``paths`` 可覆盖白名单 —— 双目标下每个目标各有自己的白名单。
     """
-    rc, out = _git(["ls-files", "--", *UPDATE_PATHS], root, timeout=60)
+    spec = tuple(paths) if paths else UPDATE_PATHS
+    rc, out = _git(["ls-files", "--", *spec], root, timeout=60)
     tracked = sorted({x for x in out.splitlines() if x}) if rc == 0 else []
-    rc, out = _git(["ls-files", "--others", "--exclude-standard", "--", *UPDATE_PATHS],
+    rc, out = _git(["ls-files", "--others", "--exclude-standard", "--", *spec],
                    root, timeout=60)
     untracked = sorted({x for x in out.splitlines() if x}) if rc == 0 else []
     return tracked, untracked
@@ -797,10 +876,18 @@ def _diff_head_to(root: Path, ref: str,
     return items, ""
 
 
-def update_status(root: Path | None = None) -> dict:
-    """仓库基本面（**纯本地，不联网**）。"""
+def update_status(root: Path | None = None,
+                  paths: tuple[str, ...] | None = None,
+                  key: str = "web") -> dict:
+    """**单个目标**的仓库基本面（纯本地，不联网）。
+
+    ``root`` / ``paths`` 省略时退回 web 目标，保持既有调用点与测试可用。
+    """
+    spec = tuple(paths) if paths else UPDATE_PATHS
     root = root or update_root()
     info: dict = {
+        "target": key,
+        "target_name": UPDATE_TARGET_NAMES.get(key, key),
         "root": str(root),
         "is_repo": False,
         "branch": "",
@@ -813,7 +900,7 @@ def update_status(root: Path | None = None) -> dict:
         "dirty": [],
         "restarter": restarter_path(),
         "backup_dir": str(root / UPDATE_BACKUP_DIR),
-        "whitelist": list(UPDATE_PATHS),
+        "whitelist": list(spec),
     }
     rc, _ = _git(["rev-parse", "--is-inside-work-tree"], root, timeout=20)
     if rc != 0:
@@ -827,15 +914,19 @@ def update_status(root: Path | None = None) -> dict:
     rc_url, url = _git(["remote", "get-url", "origin"], root, timeout=20)
     info["remote_url"] = url.strip() if rc_url == 0 else ""
     info["version"] = _version_from_changelog(root)
-    info["tracked"], info["untracked"] = _whitelist_tracking(root)
-    info["dirty"] = _whitelist_dirty(root)
+    info["tracked"], info["untracked"] = _whitelist_tracking(root, spec)
+    info["dirty"] = _whitelist_dirty(root, spec)
     return info
 
 
-def update_check(root: Path | None = None, timeout: float = UPDATE_TIMEOUT) -> dict:
+def update_check(root: Path | None = None,
+                 paths: tuple[str, ...] | None = None,
+                 key: str = "web",
+                 timeout: float = UPDATE_TIMEOUT) -> dict:
     """联网检查：``git fetch`` → 比对白名单 → 给出可执行性判断。**只读不写盘**。"""
+    spec = tuple(paths) if paths else UPDATE_PATHS
     root = root or update_root()
-    state = update_status(root)
+    state = update_status(root, spec, key)
     if not state["is_repo"]:
         return {**state, "ok": False, "fetched": False,
                 "error": f"程序目录不是 git 仓库：{state['root']}"}
@@ -851,7 +942,7 @@ def update_check(root: Path | None = None, timeout: float = UPDATE_TIMEOUT) -> d
                 "stderr": out}
 
     remote_sha = _git(["rev-parse", ref], root, timeout=20)[1].strip()
-    changed, diff_err = _diff_head_to(root, ref)
+    changed, diff_err = _diff_head_to(root, ref, spec)
     _, counts = _git(["rev-list", "--left-right", "--count", f"HEAD...{ref}"],
                      root, timeout=30)
     ahead = behind = 0
@@ -898,21 +989,26 @@ def update_check(root: Path | None = None, timeout: float = UPDATE_TIMEOUT) -> d
     }
 
 
-def update_apply(root: Path | None = None, force: bool = False, ref: str = "",
+def update_apply(root: Path | None = None,
+                 paths: tuple[str, ...] | None = None,
+                 key: str = "web",
+                 force: bool = False, ref: str = "",
                  expected_sha: str = "", timeout: float = UPDATE_TIMEOUT) -> dict:
-    """执行更新：备份 → 按白名单 restore → 记录元数据（进程内互斥）。"""
+    """执行**单个目标**的更新：备份 → 按白名单 restore → 记录元数据（进程内互斥）。"""
+    spec = tuple(paths) if paths else UPDATE_PATHS
     root = root or update_root()
     if not _UPDATE_LOCK.acquire(blocking=False):
         return {"ok": False, "error": "已有一次更新正在执行，请稍后再试。"}
     try:
-        return _update_apply_locked(root, force, ref, expected_sha, timeout)
+        return _update_apply_locked(root, spec, key, force, ref, expected_sha, timeout)
     finally:
         _UPDATE_LOCK.release()
 
 
-def _update_apply_locked(root: Path, force: bool, ref: str,
+def _update_apply_locked(root: Path, spec: tuple[str, ...], key: str,
+                         force: bool, ref: str,
                          expected_sha: str, timeout: float) -> dict:
-    state = update_status(root)
+    state = update_status(root, spec, key)
     if not state["is_repo"]:
         return {"ok": False, "error": f"程序目录不是 git 仓库：{state['root']}"}
 
@@ -927,11 +1023,13 @@ def _update_apply_locked(root: Path, force: bool, ref: str,
             f"远端提交已变化（检查时 {expected_sha[:7]}，现在 {cur_sha[:7]}），"
             "请重新检查更新。")}
 
-    changed, diff_err = _diff_head_to(root, target)
+    changed, diff_err = _diff_head_to(root, target, spec)
     if diff_err:
-        return {"ok": False, "error": "无法计算差异。", "stderr": diff_err}
+        return {"ok": False, "target": key, "error": "无法计算差异。", "stderr": diff_err}
     if not changed:
-        return {"ok": True, "up_to_date": True, "ref": target, "written": [],
+        return {"ok": True, "up_to_date": True, "target": key,
+                "target_name": UPDATE_TARGET_NAMES.get(key, key),
+                "ref": target, "written": [],
                 "removed": [], "backed_up": [], "backup": None,
                 "message": "已是最新，未改动任何文件。"}
 
@@ -977,7 +1075,9 @@ def _update_apply_locked(root: Path, force: bool, ref: str,
         except (OSError, ValueError):
             meta = {}
     if isinstance(meta, dict):
-        meta["last_web_update"] = {
+        # 双目标后按目标分键。`last_web_update` 是 2026-10-16 之前的旧键，
+        # web 目标继续写一份，避免既有读取方（若有）突然读空。
+        entry = {
             "at": datetime.now().astimezone().isoformat(timespec="seconds"),
             "ref": target,
             "expected_sha": expected_sha,
@@ -985,6 +1085,9 @@ def _update_apply_locked(root: Path, force: bool, ref: str,
             "removed": len(removed),
             "backup": str(backup_root) if backed_up else "",
         }
+        meta[f"last_update_{key}"] = entry
+        if key == "web":
+            meta["last_web_update"] = entry
         try:
             meta_file.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n",
                                  encoding="utf-8", newline="\n")
@@ -994,6 +1097,8 @@ def _update_apply_locked(root: Path, force: bool, ref: str,
     result = {
         "ok": not restore_failed,
         "up_to_date": False,
+        "target": key,
+        "target_name": UPDATE_TARGET_NAMES.get(key, key),
         "ref": target,
         "remote_sha": expected_sha,
         "remote_short": expected_sha[:7],
@@ -1255,36 +1360,73 @@ class WebConsole:
 
     # -------- 更新面 --------
     async def update_get(self, request: Request) -> Response:
-        """检查更新。``?fetch=0`` 只回本地状态，不联网。"""
-        root = update_root()
+        """检查更新。
+
+        ``?target=web|core|all``（缺省 ``all``）；``?fetch=0`` 只回本地状态。
+        返回恒为 ``{"ok", "checked", "targets":[...]}`` —— 每个元素是一个目标的
+        完整 payload。**定位不到的目标也占一个位置**（带 error），不静默消失，
+        否则界面会把「核心没找到」误读成「核心已是最新」。
+        """
+        raw_key = (request.query_params.get("target") or "all").strip().lower()
+        keys = list(UPDATE_TARGET_KEYS) if raw_key in ("", "all") else [raw_key]
+        bad = [k for k in keys if k not in UPDATE_TARGET_KEYS]
+        if bad:
+            return _err(400, f"未知更新目标：{bad[0]}（可用："
+                             f"{', '.join(UPDATE_TARGET_KEYS)}, all）")
         raw = (request.query_params.get("fetch") or "1").strip().lower()
-        if raw in ("0", "false", "no", "off"):
-            return JSONResponse({"ok": True, "checked": False, **update_status(root)})
-        try:
-            # git fetch 同步阻塞且可能跑几十秒 —— 必须挪出事件循环。
-            data = await anyio.to_thread.run_sync(update_check, root)
-        except Exception as e:                                    # noqa: BLE001
-            return _err(500, f"检查更新失败：{type(e).__name__}: {e}")
-        return JSONResponse(data)
+        online = raw not in ("0", "false", "no", "off")
+
+        targets: list[dict] = []
+        for key in keys:
+            base = {"target": key, "target_name": UPDATE_TARGET_NAMES[key]}
+            root, paths, err = update_target(key)
+            if root is None:
+                targets.append({**base, "root": "", "available": False,
+                                "is_repo": False, "checked": False, "ok": False,
+                                "fetched": False, "error": err,
+                                "whitelist": list(paths),
+                                "tracked": [], "untracked": [], "dirty": []})
+                continue
+            try:
+                if online:
+                    # git fetch 同步阻塞且可能跑几十秒 —— 必须挪出事件循环。
+                    data = await anyio.to_thread.run_sync(
+                        lambda r=root, p=paths, k=key: update_check(r, p, k))
+                    data["checked"] = True
+                else:
+                    data = {"ok": True, "checked": False, **update_status(root, paths, key)}
+                data["available"] = True
+            except Exception as e:                                # noqa: BLE001
+                data = {**base, "root": str(root), "available": True, "is_repo": True,
+                        "checked": False, "ok": False, "fetched": False,
+                        "whitelist": list(paths),
+                        "error": f"检查更新失败：{type(e).__name__}: {e}"}
+            targets.append(data)
+
+        return JSONResponse({"ok": all(t.get("ok") for t in targets),
+                             "checked": online, "targets": targets})
 
     async def update_post(self, request: Request) -> Response:
         try:
             body = await _json_body(request)
         except WebConfigError as e:
             return _err(400, str(e))
-        root = update_root()
+        key = str(body.get("target") or "web").strip().lower()
+        root, paths, err = update_target(key)
+        if root is None:
+            return _err(400, err or f"未知更新目标：{key}")
         force = bool(body.get("force"))
         ref = str(body.get("ref") or "").strip()
         expected_sha = str(body.get("expected_sha") or "").strip()
         try:
             data = await anyio.to_thread.run_sync(
-                lambda: update_apply(root, force, ref, expected_sha))
+                lambda: update_apply(root, paths, key, force, ref, expected_sha))
         except Exception as e:                                    # noqa: BLE001
             return _err(500, f"更新失败：{type(e).__name__}: {e}")
         return JSONResponse(data, status_code=200 if data.get("ok") else 409)
 
     async def restart(self, request: Request) -> Response:
-        """重启后端（MCP + Web）。控制台随后自退，由助手接手。"""
+        """重启服务（MCP 上游 + Web 控制台）。控制台随后自退，由助手接手。"""
         try:
             data = await anyio.to_thread.run_sync(update_restart)
         except Exception as e:                                    # noqa: BLE001

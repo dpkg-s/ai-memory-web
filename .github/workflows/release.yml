@@ -1,0 +1,68 @@
+# 推 tag（v*）时自动发布 Release：先跑全量回归，再建 Release。
+#
+# 标题约定：Release 标题 = 「tag — 一句话描述」，取自**带注释 tag 的 subject**
+#   （`git tag -a v1.2.0 -m "v1.2.0 — 描述"`）；轻量 tag（无注释）回落为 tag 名。
+#
+# ⚠️ 不从本地 `git tag -l --format='%(contents:subject)'` 取标题：runner 上本地 tag
+#   未必是带注释形态，该占位符会**静默退回被指向提交的主题**（核心仓 v3.0.0 曾因此
+#   把 Release 标题写成 commit subject）。这里改走 API 先看 ref 的 object.type，
+#   确为 tag 才读它的 message；任何一步失败都老实回落为 tag 名 —— 宁可为空，不可为错。
+#
+# 与核心仓的差异：本仓不做 SHA256 清单、不附二进制——它就是控制台源码本身，
+#   GitHub 自动附带的 Source code (zip/tar.gz) 已足够；更新面走 git fetch，不依赖附件。
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Publish release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout web
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout core（测试的端到端段需要 serve_http.py）
+        uses: actions/checkout@v4
+        with:
+          repository: dpkg-s/ai-memory-template
+          path: _core
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run tests before publishing
+        env:
+          AI_MEMORY_CORE_DIR: ${{ github.workspace }}/_core
+        run: |
+          pip install -r requirements.txt
+          python tests/test_web.py
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          TITLE="$TAG"
+          OBJ="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" \
+                   --jq '.object.type + " " + .object.sha' 2>/dev/null || true)"
+          KIND="${OBJ%% *}"; SHA="${OBJ##* }"
+          if [ "$KIND" = "tag" ]; then
+            MSG="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$SHA" \
+                     --jq '.message' 2>/dev/null || true)"
+            SUBJ="$(printf '%s\n' "$MSG" | head -n1)"
+            if [ -n "$SUBJ" ]; then TITLE="$SUBJ"; fi
+          fi
+          echo "release title = $TITLE"
+          gh release create "$TAG" --title "$TITLE" --generate-notes

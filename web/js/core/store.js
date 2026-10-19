@@ -121,20 +121,24 @@ var S = reactive({
     flash: false,
   },
   fns: { dirty: false, saved: null },
-  /* 更新面（2026-10-15，方案 A：配置 → 关于页内嵌）。
-     数据源 `GET /api/update`（`?fetch=0` 只看本地状态、不联网）。
-     🔴 白名单（哪些文件算「程序」）由**服务端** `web_console.UPDATE_PATHS` 决定，
-     前端不维护第二份清单 —— 否则每加一个运行时模块就要改两处，必然失配。
-     这里只存服务端给的结果，不做任何 git 语义推断。 */
+  /* 更新面（2026-10-15 建立；2026-10-16 扩为**双目标**：Web 控制台 + 核心 MCP）。
+     数据源 `GET /api/update`，返回 `targets` 数组 —— 每项是一个目标的完整
+     payload，**定位不到的目标也占位并带 error**，界面据此显式提示而不是静默少一张卡。
+     🔴 白名单（哪些文件算「程序」）由**服务端**决定（web = UPDATE_WEB_PATHS，
+     core = CORE_PROGRAM_FILES），前端不维护第二份清单 —— 否则每加一个运行时
+     模块就要改两处，必然失配。这里只存服务端给的结果，不做任何 git 语义推断。 */
   update: {
     loading: false,
-    applying: false,
     restarting: false,
     error: null,
-    data: null,          // update_status / update_check 的合并结果
-    result: null,        // 最近一次 apply 的返回值
-    reconnecting: false, // 重启后轮询 /api/health 期间为 true
+    targets: [],          // [{target, target_name, root, available, ...}]
+    applying: {},         // target -> bool（该目标正在执行更新）
+    result: {},           // target -> 最近一次 apply 的返回值
+    reconnecting: false,  // 重启后轮询 /api/health 期间为 true
     seconds: 0,
+    /* 进 web 时那次自动检测是否已发起（2026-10-19）。一次页面会话只联网一次，
+       避免 mounted / 深链 / watch 多处调用各跑一遍 git fetch。 */
+    autoStarted: false,
   },
   confirm: {
     open: false,

@@ -168,6 +168,22 @@
   font-family: var(--mono);
 }
 
+/* 「有可用更新」的持久标记（2026-10-19）：导航项右上角的小圆点。
+   与 toast 的分工 —— toast 只报一次（9s 后消失），圆点留到更新完成或
+   下次检测为最新；pointer-events:none 保证它不挡住点击。
+   窄图标条（桌面默认态）与手机抽屉（文字态）都能看见。 */
+.nav-dot {
+  position: absolute;
+  top: 8px;
+  right: 9px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--warn);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 22%, transparent);
+  pointer-events: none;
+}
+
 .sidebar-foot {
   margin-top: auto;
   padding: 12px 10px 2px;

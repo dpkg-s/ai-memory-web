@@ -2,6 +2,28 @@
 
 本仓由 [ai-memory-template](https://github.com/dpkg-s/ai-memory-template) 的 Web 控制台部分拆分而来，自拆分起独立维护。
 
+## [1.2.0] - 2026-10-19
+
+> 主题：**让「有更新」自己浮出来** —— 更新面扩为双目标，进台即检；并把「远端版本读不到」这一整类观感问题从三处堵掉。
+
+### Added
+
+- **更新面扩为双目标**（2026-10-16）：`web`（本仓）与 `core`（`ai-memory-template` 的 MCP 运行时）各查各的、各更各的。后端拆出 `CORE_PROGRAM_FILES`（12 项运行时/依赖）+ `core_root()`（`AI_MEMORY_CORE_DIR` → 本文件父目录 → `~/.workbuddy/mcp-servers/ai-memory`，**设错不回落**），`/api/update` 支持 `?target=web|core|all` 并恒返 `{ok, checked, targets:[…]}`（**定位不到的目标也占位**，不静默少一张卡）；前端改为双卡 + 旧契约 `normalize()` 兜底。
+- **进 web 自动检测更新**（2026-10-19）：`Root.mounted` 调 `autoCheckUpdates()` —— 后台跑一次 `?fetch=1`，**不阻塞首屏、失败静默**（`loadUpdate(..., quiet)`，原因仍在关于页 banner）。一次页面会话只联网一次（`S.update.autoStarted`）。
+- **「有可用更新」提示**：有更新时发一条 `warn` toast（目标名 + 远端版本，9 s），并在侧栏「配置」右上角留一个 `.nav-dot` 圆点，直到更新完成或再检测为最新。判据只认服务端 `behind > 0 || changed_count > 0`（`pendingOf()`）——**不拿版本号差异当判据**，本地领先远端时那样会误报。
+- **CI 与自动发布**：新增 `.github/workflows/ci.yml`（Python 3.10~3.13 矩阵 + `ruff`）与 `release.yml`（推 `v*` tag：先跑全量回归，再 `gh release create --generate-notes`）。测试套的端到端段需要核心仓的 `serve_http.py`，故 CI 额外检出 `dpkg-s/ai-memory-template` 并导出 `AI_MEMORY_CORE_DIR` —— 本仓首次具备可独立运行的 CI 与 Release。
+
+### Fixed
+
+- **离线状态覆盖已联网的远端结论**：`?fetch=0` 的 payload 不含任何 `remote_*` 字段，而 `mergeTargets()` 原本无条件替换 ⇒ 刚联网拿到的 `v1.1.0  94e0521` 会在进「关于」页或点「只读本地」时瞬间退回「（未检查）」，看起来像远端版本读不到。现按 `REMOTE_KEYS` 做降级保护（`checked === false` 且旧值 `checked === true` 时保留旧远端结论），本地字段仍照常更新。
+- **「远端版本」三态文案**：原来只判 `!remote_sha`，把「压根没联网」和「联网失败」显示成同一句「（未检查）」。现在区分 **`（未检查）` / `检查失败（原因见下方）` / `已检查，未取到提交号`**，有提交号时正常显示 `vX.Y.Z  <短 sha>`；`remote_version` 为空会附注「CHANGELOG 首段非 `## [x.y.z]`」。
+
+### Tests
+
+- 本仓 **83 断言全绿**（1.1.0 为 72，双目标扩到 80，本次 +3），退出码 0。
+- 新增源码守卫：**H11** 离线状态不覆盖联网结论（`REMOTE_KEYS` 降级保护）、**H12** 自动检测接线 + 导航圆点、**H13** 三态文案。
+- 端到端真起 `serve_http` + `serve_web`，`/api/update?fetch=0` 两目标均占位且 `checked=false`；真机 `?fetch=1` 联网检查两目标均 `ok`。
+
 ## [1.1.0] - 2026-10-16
 
 > 主题：**拆掉「第二条腿」** —— 本仓不再 import 核心仓的任何模块，对核心仓的关系只剩「连接 MCP」。

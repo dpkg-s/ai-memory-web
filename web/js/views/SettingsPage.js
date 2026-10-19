@@ -51,8 +51,10 @@ var SettingsPage = {
     thKeys: function () {
       return this.th && this.th.data ? Object.keys(this.th.data.keys) : [];
     },
-    upd: function () {
-      return S.update.data || {};
+    /* 双目标（2026-10-16）：每张卡对应一个目标；服务端保证定位失败的目标也占位，
+       所以这里不做过滤 —— 少一张卡会让人误以为「那个目标没问题」。 */
+    updList: function () {
+      return S.update.targets || [];
     },
   },
   methods: {
@@ -227,29 +229,37 @@ var SettingsPage = {
       return desc || label;
     },
 
-    /* ---------- 版本与更新（2026-10-15） ----------
+    /* ---------- 版本与更新（2026-10-15 建立；2026-10-16 扩为双目标） ----------
        状态文案与配色全部**派生自服务端返回的字段**（fetched / behind /
        untracked / can_apply）。前端不重新判断「有没有更新」—— 那种判据一旦
-       在这里复制一份，就会与服务端的白名单与分叉逻辑各说各话。 */
-    checkUpdate: function (withFetch) {
-      loadUpdate(withFetch !== false);
+       在这里复制一份，就会与服务端的白名单与分叉逻辑各说各话。
+       所有取值函数都接收一个**目标 payload**（`d`），不再读全局单一 data。 */
+    checkTarget: function (key, withFetch) {
+      loadUpdate(withFetch !== false, key);
     },
-    doUpdate: function (force) {
-      applyUpdate(force);
+    doUpdate: function (key, force) {
+      applyUpdate(key, force);
     },
     restartBackend: restartBackend,
-    updKind: function () {
-      var d = S.update.data;
-      if (!d || !d.is_repo) return "";
+    applyingOf: function (key) {
+      return !!S.update.applying[key];
+    },
+    resultOf: function (key) {
+      return S.update.result[key] || null;
+    },
+    updKind: function (d) {
+      if (!d) return "";
+      if (!d.available || d.error) return "err";
+      if (!d.is_repo) return "";
       if (d.untracked && d.untracked.length) return "warn";
       if (!d.fetched) return "";
       if (d.behind > 0 && !d.can_apply) return "err";
       if (d.behind > 0) return "warn";
       return "ok";
     },
-    updText: function () {
-      var d = S.update.data;
+    updText: function (d) {
       if (!d) return "未读取";
+      if (!d.available) return "未找到目录";
       if (!d.is_repo) return "不是 git 仓库";
       if (d.untracked && d.untracked.length)
         return "有 " + d.untracked.length + " 个文件未入库";
@@ -257,8 +267,8 @@ var SettingsPage = {
       if (d.behind > 0) return "落后 " + d.behind + " 个提交";
       return "已是最新";
     },
-    localLabel: function () {
-      var d = S.update.data || {};
+    localLabel: function (d) {
+      d = d || {};
       if (!d.local_sha) return "";
       return (
         (d.version ? "v" + d.version + "  " : "") +
@@ -266,22 +276,32 @@ var SettingsPage = {
         (d.branch ? "  (" + d.branch + ")" : "")
       );
     },
-    remoteLabel: function () {
-      var d = S.update.data || {};
-      if (!d.remote_sha) return "（未检查）";
-      return (d.remote_version ? "v" + d.remote_version + "  " : "") + (d.remote_short || "");
+    remoteLabel: function (d) {
+      d = d || {};
+      /* 三态（2026-10-19 修）：原来只判 remote_sha，「压根没联网」与「联网失败」
+         会显示成同一句「（未检查）」—— 主人报「远端版本读不到」，一半是它。
+         现在按 checked / fetched 分开表达，失败时指到下方的 error banner。 */
+      if (d.remote_sha)
+        return (
+          (d.remote_version ? "v" + d.remote_version + "  " : "") +
+          (d.remote_short || "") +
+          (d.remote_version ? "" : "  （CHANGELOG 首段非 ## [x.y.z]）")
+        );
+      if (d.checked && d.fetched === false) return "检查失败（原因见下方）";
+      if (d.checked) return "已检查，未取到提交号";
+      return "（未检查）";
     },
     /* 差异状态 → 徽章配色（A 新增 / D 删除 / M 修改）。 */
     statusKind: function (s) {
       return s === "D" ? "err" : s === "A" ? "ok" : "info";
     },
     /* 长清单只预览前 8 项 —— 整列铺开会把卡片撑爆。 */
-    untrackedPreview: function () {
-      var a = (S.update.data || {}).untracked || [];
+    untrackedPreview: function (d) {
+      var a = (d || {}).untracked || [];
       return a.slice(0, 8).join("、") + (a.length > 8 ? " …（共 " + a.length + " 个）" : "");
     },
-    conflictsPreview: function () {
-      var a = (S.update.data || {}).conflicts || [];
+    conflictsPreview: function (d) {
+      var a = (d || {}).conflicts || [];
       return a.slice(0, 8).join("、") + (a.length > 8 ? " …（共 " + a.length + " 个）" : "");
     },
   },
@@ -491,79 +511,91 @@ var SettingsPage = {
 '      <div class="hint">控制台不直连 vault、不在进程内直调：对记忆库的一切读写都走完整 MCP 协议，因此与其它 AI 客户端共享同一把锁与同一套索引维护。</div>' +
 '    </x-card>' +
 
-/* -------- 版本与更新（2026-10-15，方案 A：关于页内嵌，骨架零变更） --------
+/* -------- 版本与更新（2026-10-16 起为**双目标卡**） --------
    设计口径：
-     · 状态与配色全部派生自服务端字段（fetched / behind / untracked / can_apply），
-       前端不复制「有没有更新」这套判据。
+     · 每个更新目标一张卡（web = 本仓 / core = 核心仓），状态与配色全部派生自
+       服务端字段（available / fetched / behind / untracked / can_apply），前端
+       不复制「有没有更新」这套判据。
+     · **定位不到的目标也渲染**（带 error 横幅）—— 少一张卡会让人误以为那个目标
+       「没问题」，而实际上可能是根本没找着目录。
      · git 的报错原文（stderr）原样呈现，不做美化 —— 沙箱/代理/主机密钥问题
        只有原文能定位。
-     · 「重启后端」独立于更新：只换前端时不必重启，换后端模块才需要。 */
-'    <x-card class="mt" title="版本与更新">' +
+     · 「重启服务」是**全局**动作（launcher 的 restart 同时停/起 8700 与 8811），
+       因此不按目标重复，只在其后放一颗。 */
+'    <x-card class="mt" v-for="d in updList" :key="d.target" :title="\'版本与更新 · \' + (d.target_name || d.target)">' +
 '      <template #head>' +
-'        <x-pill mono>git</x-pill>' +
-'        <x-pill :kind="updKind()">{{ updText() }}</x-pill>' +
+'        <x-pill mono>{{ d.target }}</x-pill>' +
+'        <x-pill :kind="updKind(d)">{{ updText(d) }}</x-pill>' +
 '      </template>' +
 '      <template #actions>' +
-'        <button class="btn btn-sm" :class="{loading:S.update.loading}" @click="checkUpdate(false)">只读本地</button>' +
-'        <button class="btn btn-sm btn-primary" :class="{loading:S.update.loading}" @click="checkUpdate(true)">检查更新</button>' +
+'        <button class="btn btn-sm" :class="{loading:S.update.loading}" @click="checkTarget(d.target, false)">只读本地</button>' +
+'        <button class="btn btn-sm btn-primary" :class="{loading:S.update.loading}" @click="checkTarget(d.target, true)">检查更新</button>' +
 '      </template>' +
 
+'      <x-banner kind="warn" icon="alert" v-if="!d.available">' +
+'        <div><b>未定位到该目标的程序目录</b>' +
+'          <div class="small">{{ d.error }}</div>' +
+'        </div></x-banner>' +
+
 '      <x-kv class="cfg-stagger">' +
-'        <x-kv-row label="程序目录" mono :value="upd.root"></x-kv-row>' +
-'        <x-kv-row label="远端仓库" mono :value="upd.remote_url"></x-kv-row>' +
-'        <x-kv-row label="本地版本" mono :value="localLabel()"></x-kv-row>' +
-'        <x-kv-row label="远端版本" mono :value="remoteLabel()"></x-kv-row>' +
+'        <x-kv-row label="程序目录" mono :value="d.root"></x-kv-row>' +
+'        <x-kv-row label="远端仓库" mono :value="d.remote_url"></x-kv-row>' +
+'        <x-kv-row label="本地版本" mono :value="localLabel(d)"></x-kv-row>' +
+'        <x-kv-row label="远端版本" mono :value="remoteLabel(d)"></x-kv-row>' +
 '      </x-kv>' +
 
-'      <x-banner kind="err" icon="alert" v-if="upd.error">' +
+'      <x-banner kind="err" icon="alert" v-if="d.error && d.available">' +
 '        <div><b>检查未完成</b>' +
-'          <div class="small">{{ upd.error }}</div>' +
-'          <div class="small mono" style="white-space:pre-wrap" v-if="upd.stderr">{{ upd.stderr }}</div>' +
+'          <div class="small">{{ d.error }}</div>' +
+'          <div class="small mono" style="white-space:pre-wrap" v-if="d.stderr">{{ d.stderr }}</div>' +
 '        </div></x-banner>' +
 
-'      <x-banner kind="warn" icon="alert" v-else-if="upd.untracked && upd.untracked.length">' +
-'        <div><b>有 {{ upd.untracked.length }} 个文件未纳入版本控制</b>' +
+'      <x-banner kind="warn" icon="alert" v-else-if="d.untracked && d.untracked.length">' +
+'        <div><b>有 {{ d.untracked.length }} 个文件未纳入版本控制</b>' +
 '          <div class="small">远端不会有这些文件，更新不会触及它们。</div>' +
-'          <div class="small mono">{{ untrackedPreview() }}</div>' +
+'          <div class="small mono">{{ untrackedPreview(d) }}</div>' +
 '        </div></x-banner>' +
 
-'      <x-banner kind="warn" icon="alert" v-else-if="upd.fetched && upd.behind > 0 && !upd.can_apply">' +
-'        <div class="small">{{ upd.blocked_reason }}</div></x-banner>' +
+'      <x-banner kind="warn" icon="alert" v-else-if="d.fetched && d.behind > 0 && !d.can_apply">' +
+'        <div class="small">{{ d.blocked_reason }}</div></x-banner>' +
 
-'      <x-banner kind="warn" icon="alert" v-if="upd.conflicts && upd.conflicts.length">' +
-'        <div><b>{{ upd.conflicts.length }} 个文件有本地未提交改动</b>' +
+'      <x-banner kind="warn" icon="alert" v-if="d.conflicts && d.conflicts.length">' +
+'        <div><b>{{ d.conflicts.length }} 个文件有本地未提交改动</b>' +
 '          <div class="small">直接更新会丢弃这些改动；如需覆盖请用「强制覆盖」（会先备份）。</div>' +
-'          <div class="small mono">{{ conflictsPreview() }}</div>' +
+'          <div class="small mono">{{ conflictsPreview(d) }}</div>' +
 '        </div></x-banner>' +
 
-'      <div v-if="upd.changed && upd.changed.length">' +
-'        <div class="hint mt">待更新 {{ upd.changed.length }} 个文件</div>' +
+'      <div v-if="d.changed && d.changed.length">' +
+'        <div class="hint mt">待更新 {{ d.changed.length }} 个文件</div>' +
 '        <div class="list cfg-stagger" style="max-height:200px;overflow:auto">' +
-'          <div class="list-item" v-for="c in upd.changed" :key="c.path">' +
+'          <div class="list-item" v-for="c in d.changed" :key="c.path">' +
 '            <x-pill mono :kind="statusKind(c.status)">{{ c.status }}</x-pill>' +
 '            <span class="mono small">{{ c.path }}</span>' +
 '          </div>' +
 '        </div>' +
 '      </div>' +
 
-'      <x-banner kind="ok" icon="check" v-if="S.update.result && S.update.result.ok && !S.update.result.up_to_date">' +
-'        <div><b>已更新 {{ (S.update.result.written || []).length }} 个文件</b>' +
-'          <div class="small">备份：{{ S.update.result.backup || "（没有文件被覆盖）" }}</div>' +
-'          <div class="small" v-if="S.update.result.restart_required">后端模块已变化，需重启后端才能生效。</div>' +
+'      <x-banner kind="ok" icon="check" v-if="resultOf(d.target) && resultOf(d.target).ok && !resultOf(d.target).up_to_date">' +
+'        <div><b>已更新 {{ (resultOf(d.target).written || []).length }} 个文件</b>' +
+'          <div class="small">备份：{{ resultOf(d.target).backup || "（没有文件被覆盖）" }}</div>' +
+'          <div class="small" v-if="resultOf(d.target).restart_required">后端模块已变化，需重启服务才能生效。</div>' +
 '        </div></x-banner>' +
 
-'      <x-banner kind="warn" icon="alert" v-if="S.update.reconnecting">' +
-'        <div>正在等待后端恢复… 剩余 {{ S.update.seconds }} 秒</div></x-banner>' +
-
 '      <div class="center wrap mt">' +
-'        <button class="btn btn-primary" :class="{loading:S.update.applying}" :disabled="!upd.changed_count" @click="doUpdate(false)">执行更新</button>' +
-'        <button class="btn btn-danger" v-if="upd.conflicts && upd.conflicts.length" :class="{loading:S.update.applying}" @click="doUpdate(true)">强制覆盖</button>' +
-'        <button class="btn btn-ghost" :class="{loading:S.update.restarting}" @click="restartBackend">重启后端</button>' +
+'        <button class="btn btn-primary" :class="{loading:applyingOf(d.target)}" :disabled="!d.can_apply" @click="doUpdate(d.target, false)">执行更新</button>' +
+'        <button class="btn btn-danger" v-if="d.conflicts && d.conflicts.length" :class="{loading:applyingOf(d.target)}" @click="doUpdate(d.target, true)">强制覆盖</button>' +
 '      </div>' +
+'    </x-card>' +
 
+'    <x-card class="mt" title="服务重启">' +
+'      <x-banner kind="warn" icon="alert" v-if="S.update.reconnecting">' +
+'        <div>正在等待服务恢复… 剩余 {{ S.update.seconds }} 秒</div></x-banner>' +
+'      <div class="center wrap">' +
+'        <button class="btn btn-ghost" :class="{loading:S.update.restarting}" @click="restartBackend">重启服务（MCP 8700 + 控制台 8811）</button>' +
+'      </div>' +
 '      <div class="hint mt">' +
-'        <div>更新只覆盖<b>程序文件</b>（后端运行时模块 + 前端 web/），不触碰 vault 数据与任何 .md 笔记。</div>' +
-'        <div>覆盖前逐个备份到程序目录下的 <span class="mono">.ai-memory-backup/</span>；版本库里没有的文件不会被更新。</div>' +
+'        <div>更新只覆盖<b>程序文件</b>：Web 目标 = 后端运行时模块 + 前端 web/；核心目标 = MCP 运行时模块 + 依赖声明。两者都不触碰 vault 数据与任何 .md 笔记。</div>' +
+'        <div>覆盖前逐个备份到各自程序目录下的 <span class="mono">.ai-memory-backup/</span>；版本库里没有的文件不会被更新。</div>' +
 '      </div>' +
 '    </x-card>' +
 "  </div>" +

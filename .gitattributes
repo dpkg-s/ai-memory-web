@@ -1,0 +1,25 @@
+# 统一换行符：代码/配置/CI 文件强制 LF。
+#
+# 为什么本仓需要自己一份：`web-console/` 是**独立仓**（submodule），父仓
+# ai-memory-template 的 .gitattributes **不作用于本仓**。此前本仓没有这份文件，
+# 而本机 core.autocrlf=true ⇒ 工作区被转成 CRLF。后果不是洁癖问题：
+#   1. Web 前端（.js/.css/.html）—— 工作区与索引行尾不一致时，「从远端更新前端」
+#      会为每个文件产生**整文件 diff**，让真正的改动被噪声淹没；
+#   2. `.github/workflows/*.yml` —— 带 CRLF 的 `run: |` 块会交给 bash 执行，
+#      CRLF 会让脚本报 `$'\r': command not found`，CI 直接红。
+*.py text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.toml text eol=lf
+*.sh text eol=lf
+*.txt text eol=lf
+*.json text eol=lf
+*.js text eol=lf
+*.mjs text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.md text eol=lf
+Dockerfile text eol=lf
+.dockerignore text eol=lf
+# 自身也锁 LF：否则规则生效前的首次 add 仍会提示它自己被转成 CRLF。
+/.gitattributes text eol=lf

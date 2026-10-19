@@ -13,8 +13,9 @@
   E  写保护：AI_MEMORY_WEB_CONFIG_WRITE=0 ⇒ POST /api/thresholds 被拒（400）
   F  端到端（真起 serve_http + serve_web）：health / tools(25) / overview /
      thresholds(8 键) / index 回落 / assets 可达 / /api/call 真往返 / 阈值写读往返
-  H  更新面（2026-10-15）：白名单安全边界 / 行首状态位回归 / 三点 diff 语义 /
-     restarter 显式失败（H1~H5 静态，F11 走真服务）
+  H  更新面（2026-10-15 建立；2026-10-16 扩为 web + core 双目标）：白名单安全边界 /
+     行首状态位回归 / 三点 diff 语义 / restarter 与 AI_MEMORY_CORE_DIR 的显式失败
+     （H1~H10 静态，F11~F11d 走真服务）
 
 运行:
     python tests/test_web.py       # 退出码 0=全绿, 1=有失败
@@ -381,11 +382,14 @@ section("H 更新面（2026-10-15）")
 # H1/H2 钉的是**安全边界**：白名单决定「更新」能覆盖哪些文件。少了控制台后端或
 # 前端目录，功能就名不副实；混进 *.md / *.db，就会碰到 vault 数据。
 _wl = set(web_console.UPDATE_PATHS)
+# ⚠️ 3.10 兼容（2026-10-19）：f-string 的替换字段里**不能换行**（PEP 701 是 3.12
+# 才放开）。本机 3.13 跑得通，但 CI 矩阵含 3.10/3.11 —— 在那两个版本上这是
+# SyntaxError，会让整个测试文件连编译都过不去。故表达式先算出来再插值。
+_wl_need = {"web_console.py", "serve_web.py", web_console.UPDATE_FRONTEND_DIR}
+_wl_missing = sorted(_wl_need - _wl)
 check("H1 白名单覆盖本仓后端两件 + 前端目录",
-      {"web_console.py", "serve_web.py",
-       web_console.UPDATE_FRONTEND_DIR} <= _wl,
-      f"缺={sorted({'web_console.py', 'serve_web.py',
-                    web_console.UPDATE_FRONTEND_DIR} - _wl)}")
+      _wl_need <= _wl,
+      f"缺={_wl_missing}")
 check("H2 白名单不含数据类文件（.md / .db / .sqlite）",
       not any(str(p).endswith((".md", ".db", ".sqlite", ".sqlite3")) for p in _wl),
       ", ".join(sorted(_wl)))
@@ -440,6 +444,71 @@ else:
     os.environ["AI_MEMORY_RESTARTER"] = _keep_env
 check("H5 AI_MEMORY_RESTARTER 指向不存在文件时返回空串（不静默回落）",
       _got_restarter == "", f"得到 {_got_restarter!r}")
+
+# H6~H8 双目标（2026-10-16）：核心白名单的**安全边界**。少了它，「更新核心」要么
+#    名不副实（漏掉 server.py 就永远更不到 MCP 本体），要么越界（把安装器 / CI /
+#    模板数据页一起覆盖）。
+_cwl = set(web_console.CORE_PROGRAM_FILES)
+_core_must = {"server.py", "serve_http.py", "memory_config.py"}
+check("H6 核心白名单覆盖 MCP 运行时三件（server / serve_http / memory_config）",
+      _core_must <= _cwl, f"缺={sorted(_core_must - _cwl)}")
+check("H7 核心白名单不含数据类文件（.md / .db / .sqlite）",
+      not any(str(p).endswith((".md", ".db", ".sqlite", ".sqlite3")) for p in _cwl),
+      ", ".join(sorted(_cwl)))
+check("H8 核心白名单不含安装器 / CI / 模板数据（那不是运行面）",
+      not any(p.startswith(("install", "template/", "setup/", ".github/"))
+              for p in _cwl) and "ai_memory_setup.py" not in _cwl,
+      ", ".join(sorted(_cwl)))
+
+# H9 核心根定位：显式设了 AI_MEMORY_CORE_DIR 却无效时**必须报错而非静默回落**
+#    —— 静默回落会让「更新了错误的目录」变成不可复现的事故（口径同 H5）。
+_keep_core = os.environ.get(web_console.CORE_ROOT_ENV)
+try:
+    os.environ[web_console.CORE_ROOT_ENV] = str(_TMP / "definitely-not-a-core-repo")
+    _bad_root, _bad_err = web_console.core_root()
+finally:
+    if _keep_core is None:
+        os.environ.pop(web_console.CORE_ROOT_ENV, None)
+    else:
+        os.environ[web_console.CORE_ROOT_ENV] = _keep_core
+check("H9 AI_MEMORY_CORE_DIR 设错时报错且不回落",
+      _bad_root is None and web_console.CORE_ROOT_ENV in (_bad_err or ""),
+      f"root={_bad_root} err={_bad_err!r}")
+
+# H10 可移植断言：core_root() 要么返回 None，要么返回**真**核心仓（含全部标记
+#     文件）。本机是 submodule 布局（父目录即核心仓），但这条不能依赖本机布局。
+_ok_root, _ok_err = web_console.core_root()
+check("H10 core_root() 成功时必为真核心仓（含全部标记文件）",
+      _ok_root is None
+      or all((_ok_root / m).is_file() for m in web_console.CORE_ROOT_MARKERS),
+      f"root={_ok_root} err={_ok_err!r}")
+
+# H11~H13 前端更新面（2026-10-19）：「进 web 自动检测 + 有更新提示」与「远端版本
+#   三态文案」全在前端，后端接口测不到，所以沿用 H1~H5 的源码守卫手法钉契约。
+#   H11 守的是本轮真正修掉的回归 —— 进「关于」页发的 `?fetch=0` 不含 remote_*，
+#   若无条件合并，会把刚联网拿到的 v1.1.0 抹回「（未检查）」，即主人报的「读不到」。
+_upd_js = (_static / "js" / "features" / "update.js").read_text(encoding="utf-8")
+_root_js = (_static / "js" / "views" / "Root.js").read_text(encoding="utf-8")
+_set_js = (_static / "js" / "views" / "SettingsPage.js").read_text(encoding="utf-8")
+
+check("H11 离线状态不覆盖已联网的远端结论（mergeTargets 降级保护）",
+      "REMOTE_KEYS" in _upd_js
+      and "t.checked === false && p.checked === true" in _upd_js
+      and '"remote_version"' in _upd_js,
+      "缺降级保护：?fetch=0 会把远端版本抹成『未检查』")
+
+check("H12 进 web 自动检测更新（mounted 调 autoCheckUpdates + 导航圆点）",
+      "function autoCheckUpdates" in _upd_js
+      and "autoCheckUpdates()" in _root_js
+      and "pendingCount()" in _root_js
+      and "nav-dot" in _root_js,
+      "自动检测未接线：Root.mounted 或导航圆点缺失")
+
+check("H13 远端版本三态文案（未检查 / 检查失败 / 有提交号）",
+      "检查失败（原因见下方）" in _set_js
+      and "已检查，未取到提交号" in _set_js
+      and "（未检查）" in _set_js,
+      "remoteLabel 仍把『没联网』与『联网失败』压成同一句")
 
 
 try:
@@ -543,21 +612,45 @@ try:
     check("F4b 每个阈值键都随接口下发 label/desc（界面据此渲染作用说明）",
           st == 200 and not _no_meta, f"缺文案的键={_no_meta}")
 
-    # F11 更新面端点（2026-10-15）。只读本地状态这条必须是**真不联网**：
-    #     `?fetch=0` 是打开配置页「关于」时的默认路径，它若能联网，就会在每次
-    #     进页面时静默跑一次可能耗时几十秒的 git fetch。
+    # F11 更新面端点（2026-10-15 建立；2026-10-16 扩为**双目标**）。
+    #     只读本地状态这条必须是**真不联网**：`?fetch=0` 是打开配置页「关于」时的
+    #     默认路径，它若能联网，就会在每次进页面时静默跑一次可能耗时几十秒的
+    #     git fetch。
+    #     契约（2026-10-16 起）：{"ok", "checked", "targets":[…]}
+    #     —— 定位不到的目标**也必须占位**并带 error，否则界面会把「核心没找到」
+    #     误读成「核心已是最新」。
     st, txt = _http("/api/update?fetch=0")
     j = json.loads(txt) if st == 200 else {}
-    check("F11 GET /api/update?fetch=0 返回本地状态且 checked=false",
-          st == 200 and j.get("checked") is False and j.get("is_repo") is True
-          and bool(j.get("local_sha")) and isinstance(j.get("whitelist"), list)
-          # 白名单 = 本仓程序文件（2026-10-16 拆仓后收敛）。
+    _ts = {t.get("target"): t for t in (j.get("targets") or [])}
+    _wj = _ts.get("web") or {}
+    _cj = _ts.get("core") or {}
+    check("F11 GET /api/update?fetch=0 两个目标都占位且 checked=false",
+          st == 200 and j.get("checked") is False
+          and set(_ts) == set(web_console.UPDATE_TARGET_KEYS)
+          and all(t.get("checked") is False for t in _ts.values()),
+          f"status={st} checked={j.get('checked')} targets={sorted(_ts)}")
+    check("F11b web 目标带本地状态与白名单（白名单 = 本仓程序文件）",
+          _wj.get("is_repo") is True and bool(_wj.get("local_sha"))
+          and isinstance(_wj.get("whitelist"), list)
           # 用**精确集合包含**而不是「长度 >= N」：长度断言分辨不出「混进了不该
           # 覆盖的文件」与「漏了本仓文件」，两者都能凑够数量。
           and {"web_console.py", "serve_web.py",
-               web_console.UPDATE_FRONTEND_DIR} <= set(j.get("whitelist") or []),
-          f"status={st} checked={j.get('checked')} is_repo={j.get('is_repo')} "
-          f"whitelist={j.get('whitelist')}")
+               web_console.UPDATE_FRONTEND_DIR} <= set(_wj.get("whitelist") or []),
+          f"is_repo={_wj.get('is_repo')} whitelist={_wj.get('whitelist')}")
+    check("F11c core 目标占位、带核心白名单，定位失败时给出可读原因",
+          isinstance(_cj.get("available"), bool)
+          and set(web_console.CORE_PROGRAM_FILES) <= set(_cj.get("whitelist") or [])
+          # 可用 ⇒ 必须真解析到一个仓库（有 root 与 local_sha）；
+          # 不可用 ⇒ 必须给出非空原因，且**不得**同时声称「已是最新」。
+          and (_cj.get("available") is not True
+               or (bool(_cj.get("root")) and bool(_cj.get("local_sha"))))
+          and (_cj.get("available") is True
+               or (isinstance(_cj.get("error"), str) and bool(_cj.get("error").strip())))
+          and not (_cj.get("available") is False and _cj.get("up_to_date") is True),
+          f"available={_cj.get('available')} root={_cj.get('root')!r} "
+          f"local_sha={_cj.get('local_sha')!r} error={_cj.get('error')!r}")
+    st, txt = _http("/api/update?target=nope&fetch=0")
+    check("F11d 未知 target 返回 400（不静默回落成 web）", st == 400, f"status={st}")
 
     st, txt = _http("/")
     check("F5 GET / 返回 index.html（含 #app）", st == 200 and 'id="app"' in txt,

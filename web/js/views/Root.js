@@ -5,6 +5,7 @@ import { go, readHash, syncNavInd, syncTabInd } from "../core/router.js";
 import { S, closeConfirm, dismiss } from "../core/store.js";
 import { applyTheme } from "../core/theme.js";
 import { loadThresholds } from "../features/settings.js";
+import { autoCheckUpdates, pendingCount } from "../features/update.js";
 
 /* ======================================================================
  * 14. 根组件
@@ -111,6 +112,9 @@ var Root = {
   methods: {
     dismiss: dismiss,
     closeConfirm: closeConfirm,
+    /* 「有可用更新」的导航圆点判据（2026-10-19）。方法而非 computed：
+       S.update 是普通响应式对象，模板渲染时读到 targets 就能正常追踪。 */
+    pendingCount: pendingCount,
     theme: function (p) {
       S.themePref = p;
       S.theme = applyTheme(p);
@@ -162,6 +166,9 @@ var Root = {
     window.addEventListener("resize", fixSidebarVar);
     window.addEventListener("keydown", this.onKey);
     boot();
+    /* 进 web 就检测一次更新（不阻塞首屏、失败静默）。有更新时
+       toast 提示一次 + 侧栏「配置」上留一个圆点，直到更新完/再检测为最新。 */
+    autoCheckUpdates();
     if (S.page === "console") loadTools();
     if (S.page === "settings") loadThresholds();
     /* 首帧落位不带动画（不走 hashchange 分支） */
@@ -190,7 +197,9 @@ var Root = {
     "        :title=\"n.label + '（' + n.key + '）'\" :aria-label=\"n.label\" @click=\"go(n.id)\">" +
     '        <span class="nav-icon" v-html="svg(n.icon)"></span>' +
     '        <span class="nav-label">{{ n.label }}</span>' +
-    '        <span class="nav-kbd">{{ n.key }}</span></button>' +
+    '        <span class="nav-kbd">{{ n.key }}</span>' +
+    '        <span class="nav-dot" v-if="n.id===\'settings\' && pendingCount()"' +
+    "          :title=\"'有 ' + pendingCount() + ' 个目标可更新'\"></span></button>" +
     "    </nav>" +
     '    <div class="sidebar-foot">' +
     '      <div class="foot-line"><span>端点</span><b class="mono">{{ endpointShort }}</b></div>' +
