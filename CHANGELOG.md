@@ -2,6 +2,31 @@
 
 本仓由 [ai-memory-template](https://github.com/dpkg-s/ai-memory-template) 的 Web 控制台部分拆分而来，自拆分起独立维护。
 
+## [1.11.1] - 2026-10-22
+
+> 主题：**镜像真能起来了**。1.11.0 的容器定义写完就打了 tag，但第一次冒烟就发现容器启动即 `exit 2` —— 被自己的守卫打回。这一版修掉它，并把「连不到宿主 MCP」的真实原因（421 Invalid Host header）查清写进文档。
+
+### Fixed
+
+- **容器启动即退出（1.11.0 从未真正跑起来）** —— `AI_MEMORY_WEB_HOST=0.0.0.0` 撞上「非回环必须配 `AI_MEMORY_WEB_TOKEN`」的 fail-fast 守卫（`web_console.config()`），而该守卫写在登录配置解析**之前**、判据只看 token。可容器的标准形态恰恰是「`0.0.0.0` + 账号登录、不给 token」（令牌是给脚本用的，不该塞给浏览器用户），于是镜像一起来就被自家守卫打回：
+  ```
+  [web] 配置错误：监听非回环地址 '0.0.0.0' 时必须设置 AI_MEMORY_WEB_TOKEN …   → exit 2
+  ```
+  改法：守卫移到登录配置解析之后，判据变成「**token 或账号登录至少一道**」。守卫要防的是「裸奔：局域网内谁都能打开调试台写记忆库」，两道认证任一成立都不算裸奔。半配（只给 `USER` 不给口令）依旧 rc=2。
+- **启动提示语与事实相反** —— `serve_web.py` 只判 `auth_enabled`（token），在「`0.0.0.0` + 账号登录」下会打印「未设 token：仅回环可访问」，恰好说反。改为按两道认证分别措辞。
+
+### Added
+
+- **回归 4 条**（`tests/test_web.py` A3b~A3e）—— 非回环 + 账号登录 ⇒ 放行；首次启动把初始 admin 落盘且**不含明文口令**；二次启动不重建账号；非回环 + 只给 `USER` ⇒ 仍拒绝。测试里把 `config/users/tokens` 全钉到临时目录，不碰宿主机 `~/.ai-memory-web`。
+- **`_mcp_error_text()`** —— `streamablehttp_client` 抛的常是 `ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)`，真正原因藏在子异常里，界面显示这句等于没提示。现在逐层下钻到叶子异常；碰到 421 时追加一句「把 host:port 写进 MCP 侧的 `AI_MEMORY_HTTP_ALLOWED_HOSTS`，该变量是替换语义」。接入 health / tools / overview / 阈值 / 调用共 9 处。
+
+### Note
+
+- **容器连宿主机 MCP 会 421** —— MCP 的 transport 默认只放行 `127.0.0.1`/`localhost`/`[::1]` 作为 Host。实测（同一 IP:端口，只换 Host 头）：`127.0.0.1:8700` → 200，`host.docker.internal:8700` → **421 Invalid Host header**。解法在 MCP 侧：`AI_MEMORY_HTTP_ALLOWED_HOSTS="127.0.0.1:*,localhost:*,host.docker.internal:8700"`（**替换**默认值，回环两项必须一起写）。已用独立端口的临时 MCP 端到端验证：控制台 `health.ok=true`、25 个工具、`memory_stats` 读到 243 条。
+- **`--network host` 在 Docker Desktop for Windows/macOS 上不是宿主机网络** —— 它走的是 VM 的命名空间：容器里连不到宿主机 `127.0.0.1`，外部也访问不到容器端口（实测 18811 从宿主机 `ConnectionRefused`）。本文件头部注释里那句「本机最省事用 `--network host`」是错的，已改为白名单方案。
+- **healthcheck 端口改为读 `AI_MEMORY_WEB_PORT`** —— 原来硬编码 8811，改端口即误判不健康。
+- **多架构坑**：本机 `docker` 里缓存的 `python:3.13-slim` 是 arm64（此前做 `base-arm64` 留下的），直接构建报 `exec /bin/sh: exec format error`；`--platform linux/amd64` 不足以让它重拉，需先 `docker pull --platform linux/amd64 python:3.13-slim`。
+
 ## [1.11.0] - 2026-10-22
 
 > 主题：**把「跑起来」这件事收进仓库**。此前容器镜像是在设备上手工 `docker build -f Dockerfile.offline` 拼出来的，仓库里没有任何容器定义 —— 换台机器就得重新摸一遍。这一版补上 `Dockerfile` / `docker-compose.yml` / `.dockerignore`，并把默认账号定成 **admin / password**，开箱即可登录。

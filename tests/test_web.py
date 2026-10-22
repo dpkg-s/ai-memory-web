@@ -94,7 +94,12 @@ def section(name: str) -> None:
 _ENV_KEYS = ["AI_MEMORY_WEB_HOST", "AI_MEMORY_WEB_PORT", "AI_MEMORY_WEB_MCP",
              "AI_MEMORY_WEB_TOKEN", "AI_MEMORY_WEB_ALLOWED_HOSTS",
              "AI_MEMORY_WEB_CONFIG", "AI_MEMORY_WEB_CONFIG_WRITE",
-             "AI_MEMORY_WEB_STATIC"]
+             "AI_MEMORY_WEB_STATIC",
+             # 账号登录：必须一并净化 —— 否则宿主机的 .env 会漏进「无认证」用例里，
+             # 把 A3「裸奔 ⇒ 拒绝启动」测成放行。
+             "AI_MEMORY_WEB_USER", "AI_MEMORY_WEB_PASSWORD",
+             "AI_MEMORY_WEB_PASSWORD_HASH",
+             "AI_MEMORY_WEB_USERS", "AI_MEMORY_WEB_TOKENS"]
 _BASELINE = {k: os.environ.get(k) for k in _ENV_KEYS}
 
 
@@ -154,6 +159,47 @@ check("A3 非回环且无 token ⇒ 拒绝启动（rc=2）", rc == 2, f"rc={rc} 
 rc, out = _check_rc(_clean_env(AI_MEMORY_WEB_HOST="0.0.0.0",
                                AI_MEMORY_WEB_TOKEN="s3cret"))
 check("A4 非回环 + token ⇒ 放行（rc=0）", rc == 0, f"rc={rc} out={out[-200:]}")
+
+# ---- 容器标准形态：HOST=0.0.0.0 + 账号登录、不给 token（2026-10-22 补）--------
+# v1.11.0 的镜像正是这个形态，但旧守卫只认 token ⇒ 容器启动即 exit 2。
+# 这一组用例钉住「两道认证任一成立即放行」，同时确认初始 admin 真被落盘。
+_ACC = _TMP / "acc"
+_ACC.mkdir(exist_ok=True)
+_ACC_ENV = dict(AI_MEMORY_WEB_HOST="0.0.0.0",
+                AI_MEMORY_WEB_USER="admin",
+                AI_MEMORY_WEB_PASSWORD="password",
+                AI_MEMORY_WEB_CONFIG=str(_ACC / "config.json"),
+                AI_MEMORY_WEB_USERS=str(_ACC / "users.json"),
+                AI_MEMORY_WEB_TOKENS=str(_ACC / "tokens.json"))
+
+rc, out = _check_rc(_clean_env(**_ACC_ENV))
+check("A3b 非回环 + 账号登录（无 token）⇒ 放行（容器标准形态，rc=0）",
+      rc == 0, f"rc={rc} out={out[-300:]}")
+
+_users_file = _ACC / "users.json"
+try:
+    _users_txt = _users_file.read_text(encoding="utf-8")
+except OSError:
+    _users_txt = ""
+check("A3c 首次启动把初始 admin 落盘（users.json 含 admin 且不含明文口令）",
+      "admin" in _users_txt and "scrypt" in _users_txt.lower()
+      and "password" not in _users_txt,
+      f"exists={_users_file.is_file()} len={len(_users_txt)}")
+
+# 二次启动：表里已有账号，不再重写（bootstrap 只在空表时建号）
+_before = _users_txt
+rc, out = _check_rc(_clean_env(**_ACC_ENV))
+check("A3d 二次启动不重建账号（users.json 内容不变）",
+      rc == 0 and _users_file.read_text(encoding="utf-8") == _before,
+      f"rc={rc}")
+
+rc, out = _check_rc(_clean_env(AI_MEMORY_WEB_HOST="0.0.0.0",
+                               AI_MEMORY_WEB_USER="admin",
+                               AI_MEMORY_WEB_CONFIG=str(_ACC / "c2.json"),
+                               AI_MEMORY_WEB_USERS=str(_ACC / "u2.json"),
+                               AI_MEMORY_WEB_TOKENS=str(_ACC / "t2.json")))
+check("A3e 非回环 + 只给 USER（半配）⇒ 仍拒绝启动（rc=2）",
+      rc == 2, f"rc={rc} out={out[-200:]}")
 
 rc, out = _check_rc(_clean_env(AI_MEMORY_WEB_PORT="70000"))
 check("A5 端口越界 ⇒ 拒绝启动（rc=2）", rc == 2, f"rc={rc}")

@@ -5,11 +5,16 @@
 #
 # 🔴 默认口令只是首次启动的种子：/config/users.json 一旦有内容就不再理会环境变量。
 #    第一次登录后请到「访问控制」页改掉，或删掉 am-conf 卷重来。
+#
+# 🔴 上游 MCP 若跑在本机，需要它在启动时放行容器用的 Host，否则控制台 MCP 面板
+#    会一直报 421 Invalid Host header（TCP 是通的，是 MCP 的防 DNS rebinding 在校验）：
+#      AI_MEMORY_HTTP_ALLOWED_HOSTS="127.0.0.1:*,localhost:*,host.docker.internal:8700"
+#    该变量是**替换**默认值，回环两项要一起写。详见 README。
 
 services:
   ai-memory-web:
     build: .
-    image: ai-memory-web:1.11.0
+    image: ai-memory-web:1.11.1
     container_name: ai-memory-web
     ports:
       - "8811:8811"
@@ -18,7 +23,7 @@ services:
       AI_MEMORY_WEB_PASSWORD: password
       # 上游 MCP 端点：容器内的 127.0.0.1 是它自己，必须指到容器外
       AI_MEMORY_WEB_MCP: ${AI_MEMORY_WEB_MCP:-http://host.docker.internal:8700/mcp}
-      # 会话寿命（秒），默认 7 天
+      # 会话寿命（秒），默认 12 小时
       # AI_MEMORY_WEB_SESSION_TTL: "604800"
     volumes:
       # config.json / users.json / tokens.json 都落在这里，别丢

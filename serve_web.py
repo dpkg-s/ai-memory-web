@@ -143,8 +143,14 @@ def main(argv: list[str] | None = None) -> int:
         print("[web] 阈值写入：开启（仅写 vault 根的 memory.toml，绝不触碰 *.md）")
     else:
         print("[web] 阈值写入：关闭（只读模式）")
-    if not cfg["auth_enabled"]:
-        print("[web] 未设 token：仅回环可访问；要暴露到局域网请设 AI_MEMORY_WEB_TOKEN")
+    # 提示语要跟真实的两道认证对齐（2026-10-22）：只判 auth_enabled（token）会把
+    # 「0.0.0.0 + 账号登录」的容器误说成「仅回环可访问」，恰好与事实相反。
+    if not cfg["auth_enabled"] and not cfg["login_enabled"]:
+        print("[web] 未设 token 也未开登录：仅回环可访问；"
+              "要暴露到局域网请设 AI_MEMORY_WEB_TOKEN 或账号登录")
+    elif not cfg["auth_enabled"]:
+        print("[web] 未设 token：/api/* 由账号登录（Cookie 会话）保护；"
+              "给脚本调用再加 AI_MEMORY_WEB_TOKEN")
     if args.check:
         return 0
 

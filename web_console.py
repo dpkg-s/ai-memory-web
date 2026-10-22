@@ -45,11 +45,13 @@
 ⇒ 定稿：浏览器只与 Web 台**同源**通信（普通 ``fetch`` + JSON，无 CORS），MCP 调用
 一律在后端完成。
 
-安全（回环默认 + 非回环必须给 token）
-------------------------------------
+安全（回环默认 + 非回环必须有认证）
+-----------------------------------
 * 监听地址默认 ``127.0.0.1``（宿主机局域网看不到）。
-* 一旦监听非回环地址且**未配置 token** ⇒ **拒绝启动**（fail-fast）。理由是
-  「全放行调试台」= 对记忆库具备完整破坏能力的写入口，裸奔暴露在局域网上不可接受。
+* 一旦监听非回环地址且**既无 token 也无账号登录** ⇒ **拒绝启动**（fail-fast）。
+  理由是「全放行调试台」= 对记忆库具备完整破坏能力的写入口，裸奔暴露在局域网上
+  不可接受。判据是**两道认证任一成立**即放行（2026-10-22 修：原判据只认 token，
+  导致「容器 = HOST=0.0.0.0 + USER/PASSWORD」这一标准形态被自家守卫打回 exit 2）。
 * 配了 token 后，``/api/*`` 必须带 ``Authorization: Bearer <token>``（或
   ``X-Auth-Token``）；静态资源不校验（里面没有秘密）。前端把 token 存在
   ``sessionStorage``，**不进 URL、不进 bundle**。
@@ -137,7 +139,7 @@ import web_store
 
 logger = logging.getLogger("ai-memory.web")
 
-WEB_VERSION = "1.11.0"
+WEB_VERSION = "1.11.1"
 DEFAULT_WEB_HOST = "127.0.0.1"
 # ⚠️ 本机实测（2026-10-13，Windows）：8800/8801/8802 均被系统保留（bind 报
 # WinError 10013），故默认改用 8811 段。可选：8811-8820。
@@ -287,11 +289,8 @@ def config() -> dict:
         raise WebConfigError(f"AI_MEMORY_WEB_PORT={port} 不在 1..65535。")
 
     token = _env_str("AI_MEMORY_WEB_TOKEN")
-    if not is_loopback(host) and not token:
-        raise WebConfigError(
-            f"监听非回环地址 {host!r} 时必须设置 AI_MEMORY_WEB_TOKEN，"
-            "否则局域网内任何人都能打开调试台并对记忆库执行破坏性操作。"
-            '示例：AI_MEMORY_WEB_TOKEN="$(openssl rand -hex 16)"')
+    # 非回环监听的认证守卫**移到登录配置解析之后**（见下方 2026-10-22 的修）：
+    # 判据是「token 或账号登录至少有一道」，而不是「必须有 token」。
 
     mcp = _env_str("AI_MEMORY_WEB_MCP", DEFAULT_MCP_URL) or DEFAULT_MCP_URL
     if not re.match(r"^https?://", mcp):
@@ -329,6 +328,19 @@ def config() -> dict:
         if not _LOGIN_HASH_CACHE:
             _LOGIN_HASH_CACHE = web_auth.hash_password(login_plain)
         login_hash = _LOGIN_HASH_CACHE
+
+    # ---- 非回环监听的认证守卫（2026-10-22 修）----------------------------
+    # 原判据只认 ``AI_MEMORY_WEB_TOKEN``，而容器的标准形态是
+    # ``HOST=0.0.0.0`` + ``USER/PASSWORD``（令牌不给用户看）——于是容器**一启动
+    # 就被自家守卫打回 exit 2**，v1.11.0 的镜像根本起不来（冒烟测试逮到）。
+    # 守卫要防的是「裸奔：局域网内谁都能打开调试台写记忆库」，令牌与账号登录
+    # 都构成一道认证，任一成立即不算裸奔。
+    if not is_loopback(host) and not token and not login_enabled:
+        raise WebConfigError(
+            f"监听非回环地址 {host!r} 时至少要有一道认证："
+            "AI_MEMORY_WEB_TOKEN，或账号登录（AI_MEMORY_WEB_USER + 口令）。"
+            "两者都没有时，局域网内任何人都能打开调试台并对记忆库执行破坏性操作。"
+            '示例：AI_MEMORY_WEB_TOKEN="$(openssl rand -hex 16)"')
 
     secret = _env_str("AI_MEMORY_WEB_SECRET")
     # 会话密钥：显式 secret 优先；否则从 token 派生（换 token = 全场会话立即失效）。
@@ -640,6 +652,37 @@ async def mcp_session_calls(endpoint: str, calls: list[tuple[str, dict]],
     return out
 
 
+def _mcp_error_text(exc: BaseException) -> str:
+    """把 anyio / httpx 的嵌套异常压成**一句能照着做**的话。
+
+    🔴 ``streamablehttp_client`` 抛的通常就是
+    ``ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)`` ——
+    真正的原因（连接被拒、421 Invalid Host header、超时…）全藏在子异常里，
+    直接 ``str(e)`` 只会让界面显示这句废话，用户无从下手。
+    这里逐层下钻到叶子异常；对容器场景最常见的 421 额外补一句怎么放行。
+    """
+    chain: list[str] = []
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        chain.append(f"{type(cur).__name__}: {cur}")
+        subs = getattr(cur, "exceptions", None) or ()
+        nxt = subs[0] if subs else None
+        if nxt is None:
+            nxt = cur.__cause__ or cur.__context__
+        cur = nxt
+    text = chain[-1]
+    if len(chain) > 1 and type(exc).__name__ not in text:
+        text = f"{type(exc).__name__} → {text}"
+    low = " ".join(chain).lower()
+    if "421" in low or "invalid host" in low:
+        text += ("（上游 MCP 的 DNS rebinding 防护拒了这个 Host。把它的 host:port 写进"
+                 " MCP 侧的 AI_MEMORY_HTTP_ALLOWED_HOSTS —— 该变量是**替换**默认值，"
+                 "记得同时带上 127.0.0.1:* 与 localhost:*）")
+    return text
+
+
 async def mcp_health(endpoint: str, timeout: float = MCP_HEALTH_TIMEOUT) -> dict:
     """连通性探针：握手 + 工具清单。失败返回 ``ok=False`` 而不是抛错。"""
     t0 = time.perf_counter()
@@ -670,7 +713,7 @@ async def mcp_health(endpoint: str, timeout: float = MCP_HEALTH_TIMEOUT) -> dict
             "server": None,
             "protocol": None,
             "tools_count": 0,
-            "error": f"{type(e).__name__}: {e}",
+            "error": _mcp_error_text(e),
         }
 
 
@@ -1433,7 +1476,7 @@ class WebConsole:
         try:
             items = await mcp_tools(endpoint)
         except Exception as e:                                    # noqa: BLE001
-            return _err(502, f"无法获取工具清单：{type(e).__name__}: {e}",
+            return _err(502, f"无法获取工具清单：{_mcp_error_text(e)}",
                         endpoint=endpoint)
         groups = list(TOOL_GROUPS)
         if any(i.get("group") == TOOL_GROUP_OTHER["key"] for i in items):
@@ -1452,7 +1495,7 @@ class WebConsole:
                 ("memory_list", {"limit": 14, "output_format": "json"}),
             ])
         except Exception as e:                                    # noqa: BLE001
-            return _err(502, f"无法获取概览：{type(e).__name__}: {e}",
+            return _err(502, f"无法获取概览：{_mcp_error_text(e)}",
                         endpoint=endpoint)
         return JSONResponse({"ok": True, "endpoint": endpoint,
                              "stats": stats, "recent": recent, "list": listing})
@@ -1484,11 +1527,11 @@ class WebConsole:
                 clip=False,
             )
         except Exception as e:                                    # noqa: BLE001
-            return _err(502, f"无法读取更新日历：{type(e).__name__}: {e}")
+            return _err(502, f"无法读取更新日历：{_mcp_error_text(e)}")
         try:
             payload = json.loads(results[0].get("text") or "{}")
         except Exception as e:                                    # noqa: BLE001
-            return _err(502, f"更新日历数据不是合法 JSON：{type(e).__name__}: {e}")
+            return _err(502, f"更新日历数据不是合法 JSON：{_mcp_error_text(e)}")
 
         counts: dict[str, int] = {}
         items: dict[str, list[list[str]]] = {}
@@ -1549,7 +1592,7 @@ class WebConsole:
         except WebConfigError as e:
             return _err(400, str(e))
         except Exception as e:                                    # noqa: BLE001
-            return _err(502, f"读取阈值失败：{type(e).__name__}: {e}")
+            return _err(502, f"读取阈值失败：{_mcp_error_text(e)}")
         return JSONResponse({"ok": True, **state})
 
     async def thresholds_post(self, request: Request) -> Response:
@@ -1562,7 +1605,7 @@ class WebConsole:
         except WebConfigError as e:
             return _err(400, str(e))
         except Exception as e:                                    # noqa: BLE001
-            return _err(502, f"写入阈值失败：{type(e).__name__}: {e}")
+            return _err(502, f"写入阈值失败：{_mcp_error_text(e)}")
         return JSONResponse({"ok": True, **state})
 
     # -------- 调试台 --------
@@ -1592,7 +1635,7 @@ class WebConsole:
         try:
             results = await mcp_session_calls(endpoint, [(tool, arguments)])
         except Exception as e:                                    # noqa: BLE001
-            return _err(502, f"调用失败：{type(e).__name__}: {e}")
+            return _err(502, f"调用失败：{_mcp_error_text(e)}")
         res = dict(results[0])
         res["tool"] = tool
         res["arguments"] = arguments
@@ -2017,7 +2060,7 @@ class WebConsole:
             await client.aclose()
             logger.warning("MCP 反代失败：%s %s -> %s（%s: %s）",
                            request.method, target, url, type(e).__name__, e)
-            return _err(502, f"MCP 上游不可达：{type(e).__name__}: {e}")
+            return _err(502, f"MCP 上游不可达：{_mcp_error_text(e)}")
 
         out_headers = {k: v for k, v in resp.headers.items()
                        if k.lower() not in _PROXY_DROP_RESP}

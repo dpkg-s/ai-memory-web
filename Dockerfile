@@ -4,12 +4,22 @@
 # 上游 MCP 由 AI_MEMORY_WEB_MCP 指过去（本机、另一容器、局域网设备都行）。
 #
 # 构建与运行：
-#   docker build -t ai-memory-web:1.11.0 .
+#   docker build -t ai-memory-web:1.11.1 .
 #   docker run -d --name ai-memory-web -p 8811:8811 \
 #     -v am-conf:/config \
-#     -e AI_MEMORY_WEB_MCP=http://192.168.0.1:8700/mcp \
-#     ai-memory-web:1.11.0
+#     -e AI_MEMORY_WEB_MCP=http://host.docker.internal:8700/mcp \
+#     ai-memory-web:1.11.1
 #   然后打开 http://127.0.0.1:8811 登录。
+#
+# 🔴 桥接网络（-p 8811:8811）下连宿主机的 MCP 会 **421 Invalid Host header**：
+#    MCP 的 streamable HTTP transport 默认只放行 localhost / 127.0.0.1 作为
+#    Host（防 DNS rebinding），host.docker.internal 与局域网域名同样被拒。
+#    解法在 **MCP 侧**放行（实测同一 IP:端口只换 Host 头：127.0.0.1 → 200，
+#    host.docker.internal → 421）：
+#      AI_MEMORY_HTTP_ALLOWED_HOSTS="127.0.0.1:*,localhost:*,host.docker.internal:8700"
+#    该变量是**替换**默认值，回环两项要一起写。详见 README。
+#    ⚠️ 不要指望 --network host：Docker Desktop for Windows/macOS 下它是 VM 的
+#    网络命名空间，既连不到宿主机回环，外部也访问不到容器端口（实测拒连）。
 #
 # 🔴 默认账号 admin / password 是**首次启动的种子**：
 #    web_console 只在 /config/users.json 为空时用它建初始管理员（存 scrypt 哈希，
@@ -59,7 +69,8 @@ EXPOSE 8811
 
 # 探活打 /api/session（公开端点）。别用 /api/health —— 开启登录后它要 401，
 # 容器会被判成不健康然后反复重启。
+# 端口读环境变量：用 --network host 或改 AI_MEMORY_WEB_PORT 时硬编码会误判。
 HEALTHCHECK --interval=30s --timeout=3s --start-period=20s --retries=3 \
-  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8811/api/session', timeout=2)"
+  CMD python -c "import os,urllib.request; p=os.environ.get('AI_MEMORY_WEB_PORT','8811'); urllib.request.urlopen('http://127.0.0.1:%s/api/session'%p, timeout=2)"
 
 CMD ["python", "serve_web.py"]
