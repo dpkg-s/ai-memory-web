@@ -8,8 +8,16 @@
 #   把 Release 标题写成 commit subject）。这里改走 API 先看 ref 的 object.type，
 #   确为 tag 才读它的 message；任何一步失败都老实回落为 tag 名 —— 宁可为空，不可为错。
 #
-# 与核心仓的差异：本仓不做 SHA256 清单、不附二进制——它就是控制台源码本身，
-#   GitHub 自动附带的 Source code (zip/tar.gz) 已足够；更新面走 git fetch，不依赖附件。
+# 与核心仓的差异：本仓不做 SHA256 清单。
+#
+# ⚠️ 2026-10-22：**Release 现在带两个附件**。
+#   1. `web-console-<tag>.tgz` —— 控制台源码包（排除 `.github/` 与 `tests/`），
+#      与历史 Release 的附件形态一致，由本工作流现场打包，不再手工上传。
+#   2. `ai-memory-setup.exe` —— **快捷安装器，与核心仓是同一个文件**。
+#      本仓不构建它（它由核心仓在本地 conda 环境打出、随 `dist/` 入库），
+#      这里只从核心仓的 latest Release 把附件搬过来转挂。
+#      ⇒ **发布顺序：核心仓先、本仓后**，否则会搬到上一版的安装器。
+#      搬运失败直接红，不静默产出「没有安装器」的 Release。
 name: Release
 
 on:
@@ -66,3 +74,38 @@ jobs:
           fi
           echo "release title = $TITLE"
           gh release create "$TAG" --title "$TITLE" --generate-notes
+
+      # 附件一：控制台源码包。排除 .github/ 与 tests/，与历史 Release 的 tgz 形态对齐。
+      - name: Attach source tarball
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          mkdir -p _asset/pack
+          git archive --format=tar --prefix=web-console/ "$TAG" -o _asset/wc.tar
+          tar -xf _asset/wc.tar -C _asset/pack
+          rm -rf _asset/pack/web-console/.github _asset/pack/web-console/tests
+          tar -czf "_asset/web-console-$TAG.tgz" -C _asset/pack web-console
+          ls -l "_asset/web-console-$TAG.tgz"
+          gh release upload "$TAG" "_asset/web-console-$TAG.tgz" --clobber
+
+      # 附件二：快捷安装器。**不在这里构建** —— 从核心仓 latest Release 搬附件转挂，
+      # 保证两边用户拿到的 exe 是同一个字节。核心仓尚未发布时这里会红，属预期。
+      - name: Attach installer exe（搬自核心仓）
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          mkdir -p _asset
+          URL="https://github.com/dpkg-s/ai-memory-template/releases/latest/download/ai-memory-setup.exe"
+          echo "source: $URL"
+          curl -fL --retry 3 --retry-delay 2 -o _asset/ai-memory-setup.exe "$URL"
+          SZ=$(stat -c%s _asset/ai-memory-setup.exe)
+          echo "downloaded $SZ bytes"
+          # 安装器实际约 12 MB；明显偏小说明下到的是错误页或残缺文件。
+          if [ "$SZ" -lt 10000000 ]; then
+            echo "::error::下载到的 exe 只有 $SZ 字节，疑似错误页/残缺文件 —— 检查核心仓 latest Release 是否已挂安装器"
+            exit 1
+          fi
+          gh release upload "$TAG" _asset/ai-memory-setup.exe --clobber
+          echo "attached: $(gh release view "$TAG" --json assets --jq '.assets[].name' | tr '\n' ' ')"

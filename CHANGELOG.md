@@ -2,6 +2,22 @@
 
 本仓由 [ai-memory-template](https://github.com/dpkg-s/ai-memory-template) 的 Web 控制台部分拆分而来，自拆分起独立维护。
 
+## [1.11.3] - 2026-10-22
+
+> 主题：**Release 自带两个附件，不再靠手工补**。上一版我手动往 v1.11.2 上挂了 tgz 和安装器 —— 手工的东西下次一定会漏。这一版把附件生产写进 `release.yml`。
+
+### Changed
+
+- **`release.yml` 新增「Attach source tarball」** —— tag 推上来后现场 `git archive` 打包，排除 `.github/` 与 `tests/`，产出 `web-console-<tag>.tgz` 并上传。与历史 Release 的附件形态一致，但不再依赖人工执行。
+- **`release.yml` 新增「Attach installer exe」—— 快捷安装器随本仓 Release 一起发** —— 本仓**不构建**它（它由核心仓在本地 conda 环境打出、随 `dist/` 入库），而是从核心仓的
+  `releases/latest/download/ai-memory-setup.exe` 搬附件转挂，保证两边用户拿到的是**同一个字节**。
+  - 下载后校验体积（< 10 MB 判为错误页/残缺文件），失败即红 —— 不允许静默产出「没有安装器」的 Release。
+  - **发布顺序因此变成：核心仓先、本仓后**。反了就会搬到上一版的安装器。
+
+### Note
+
+- 工作流头部注释里那句「本仓不附二进制」已作废并重写 —— 它描述的是一段历史事实，不是现在的约定。
+
 ## [1.11.2] - 2026-10-22
 
 > 主题：**容器定义搬家，控制台回归控制台**。1.11.0/1.11.1 把 `Dockerfile` / `docker-compose.yml` 直接放在控制台仓里，导致「怎么跑容器」这件事被劈成两半 —— MCP 服务端镜像在 `ai-memory-docker`，控制台镜像在本仓。这一版把容器定义全部交还给 docker 仓，本仓只留源码与运行时契约。
