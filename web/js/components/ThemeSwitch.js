@@ -1,5 +1,5 @@
 import { S, toast } from "../core/store.js";
-import { applyTheme, vtBusy, whenVtDone } from "../core/theme.js";
+import { applyTheme } from "../core/theme.js";
 import { reduced } from "../core/anim.js";
 
 /* ======================================================================
@@ -224,17 +224,13 @@ var ThemeSwitch = {
   methods: {
     toggle: function () {
       var p = S.theme === "dark" ? "light" : "dark";
-      /* 圆形扩散的原点 = 开关中心。取不到（隐藏/未挂载）就交给 theme.js 用视口中心。 */
-      var r = this._btn ? this._btn.getBoundingClientRect() : null;
-      var origin = r ? { x: r.left + r.width / 2, y: r.top + r.height / 2 } : null;
       S.themePref = p;
-      S.theme = applyTheme(p, origin);
+      /* 页面渐变与开关 timeline 同一帧起跑（2026-10-22 第三轮「单时钟」）。 */
+      S.theme = applyTheme(p);
     },
     followSystem: function () {
       S.themePref = "auto";
-      var r = this._btn ? this._btn.getBoundingClientRect() : null;
-      var origin = r ? { x: r.left + r.width / 2, y: r.top + r.height / 2 } : null;
-      S.theme = applyTheme("auto", origin);
+      S.theme = applyTheme("auto");
       toast("info", "已跟随系统主题", "外观将随系统深浅色自动切换");
     },
 
@@ -313,12 +309,13 @@ var ThemeSwitch = {
      * 再滑出来。连点两次时两条运动还会相向而行，错位叠加。
      *
      * 方案 A：把「并行窗口期」清零 —— timeline 播放期间窗口锁定为全展开并
-     * 禁用过渡（CSS 侧见 3-components.css §16 的 .tsw.animating），
-     * 等滑块落定（1.5s）后再解禁，此时若鼠标已移出，收窄才开始。
+     * 禁用过渡（CSS 侧见 3-components.css §16 的 .tsw[data-anim="1"]），
+     * 等滑块**第一段**落定（0.45s）后再解禁，此时若鼠标已移出，收窄才开始。
      *
-     * 为什么锁到 1.7s 而不是 timeline 末尾：星星闪烁（2.6–3.6s）与收窄窗口
-     * 不冲突 —— 夜间星星在画面上方、滑块在右侧，收窄到滑块位后看到的是月亮。
-     * 锁满 3.9s 会让开关「大着不动」太久，反而钝。
+     * 为什么锁到 0.45s 而不是 timeline 末尾（0.95s）：星星闪烁等尾巴与收窄窗口
+     * 不冲突 —— 夜间星星在画面上方、滑块在右侧，收窄到滑块位后看到的是月亮；
+     * 而 0.45s 后滑块已在 66、占 66~102，收窄窗口覆盖 59~101，月亮完整在窗内。
+     * 锁更久只会让开关「大着不动」，反而钝（0.65 → 0.45 是主人两次催快的结论）。
      *
      * 🔴 为什么用 data-anim 而不是加 class（2026-10-22 实测踩到）：
      *    这个 button 的模板是 `class="tsw" :class="{night: night}"`。Vue 3 的
@@ -370,26 +367,20 @@ var ThemeSwitch = {
       this.lock(true);
 
       var self = this;
-      /* 🔴 与主题扩散串行（2026-10-22 第二轮）：View Transition 期间整页是静态
-         快照，原 DOM 不可见。timeline 若照常起跑，观众看到「定格 → 揭示完成瞬间
-         跳到第 0.55s 帧」，滑块像被抽了一下 —— 这就是两段动画不融洽的来源。
-         所以扩散在跑时以 paused 创建，扩散结束（含失败/跳过）后由 whenVtDone 放行。 */
-      var waitVt = vtBusy();
-      var t = (this._tl = g.timeline({ paused: waitVt }));
-      /* 0.65s = 滑块**第一段**落定(0.45s) + 0.2s 余量。
-         为什么不必等第二段(0.45→0.95 的 66→63 微调)：门控要防的是「窗口按终态
-         左移 42.48px 而滑块还在半路」，而 0.45s 后滑块已在 66、占 66~102，
-         收窄窗口覆盖 59~101 ⇒ 月亮完整在窗内，之后 3px 微调不会跑出窗口。
-         原值 1.1s 白等了半秒（主人 10-22 第二次反馈「等待收纳时间可以再短」）。 */
+      /* 🔴 单时钟（2026-10-22 第三轮，主人定案 B）：View Transition 期间整页是
+         静态快照，开关被冻在快照里 —— 等扩散结束再放行，就成了「页面先换完、
+         开关 0.55s 后才补演」（实测错位 671ms）。撤掉 VT 后页面改走 0.45s 整页
+         渐变，与本 timeline 同帧起跑，这里不需要任何等待。 */
+      var t = (this._tl = g.timeline());
+      /* 0.45s = 滑块**第一段**落定。
+         为什么不必等第二段（66→63 的 3px 微调）：门控要防的是「窗口按终态左移
+         42.48px 而滑块还在半路」，而 0.45s 后滑块已在 66、占 66~102，收窄窗口
+         覆盖 59~101 ⇒ 月亮完整在窗内。
+         第二轮的 0.65s = 0.45 + 0.2 余量，那 0.2 是留给 VT 的；VT 撤掉后一并
+         去掉 ⇒ 点击到可收纳 0.6s（0.45 + 0.15 摘锁）。 */
       t.call(function () {
         self.lock(false);
-      }, null, 0.65);
-      if (waitVt) {
-        whenVtDone(function () {
-          /* 只放行仍在役的那一条：连点时旧 timeline 已被 kill，新的自己会等。 */
-          if (self._tl === t) t.play();
-        });
-      }
+      }, null, 0.45);
       if (night) {
         t.to(m.thumb, { x: 66, duration: 0.45, ease: "power2.inOut" }, 0).to(
           m.thumb,
