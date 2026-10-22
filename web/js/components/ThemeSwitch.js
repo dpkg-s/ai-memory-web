@@ -223,12 +223,17 @@ var ThemeSwitch = {
   },
   methods: {
     toggle: function () {
+      /* 动画期间不接受新点击（2026-10-22 第四轮，主人要求）：
+         连点会让旧 timeline 被 kill、门控重新加锁，视觉上「滑块抖一下再重来」。
+         互斥窗口 = timeline 主段（0.95s），到点自动放开。 */
+      if (this._busy) return;
       var p = S.theme === "dark" ? "light" : "dark";
       S.themePref = p;
-      /* 页面渐变与开关 timeline 同一帧起跑（2026-10-22 第三轮「单时钟」）。 */
+      /* 页面渐变与开关 timeline 同一帧起跑（单时钟）。 */
       S.theme = applyTheme(p);
     },
     followSystem: function () {
+      if (this._busy) return;
       S.themePref = "auto";
       S.theme = applyTheme("auto");
       toast("info", "已跟随系统主题", "外观将随系统深浅色自动切换");
@@ -335,13 +340,13 @@ var ThemeSwitch = {
         btn.setAttribute("data-anim", "1");
         return;
       }
-      /* 摘锁延迟 350 → 150ms（2026-10-22 第二轮，主人「等待收纳的时间再短一点」）：
-         150ms 只够把最后一帧画出来，收窄几乎紧跟滑块落定。 */
+      /* 摘锁延迟 150 → 300ms（2026-10-22 第四轮，主人要求「动画结束后等 0.3 收纳」）：
+         这个延迟就是「动画演完 → 停一拍 → 胶囊收窄」里那一拍。 */
       var self = this;
       this._unlock = setTimeout(function () {
         btn.removeAttribute("data-anim");
         self._unlock = null;
-      }, 150);
+      }, 300);
     },
 
     /* 落终态：animate=false 只摆位；true 则播 timeline。 */
@@ -354,6 +359,7 @@ var ThemeSwitch = {
       }
       var g = window.gsap;
       if (!animate || !g || reduced()) {
+        this._busy = false;
         this.lock(false);
         this.setStatic(night);
         return;
@@ -365,6 +371,8 @@ var ThemeSwitch = {
 
       /* 门控：从这一刻起窗口锁定为全展开，直到滑块落定后再解禁。 */
       this.lock(true);
+      /* 互斥窗口：动画期间 toggle / followSystem 直接早返回，连点不再互相 kill。 */
+      this._busy = true;
 
       var self = this;
       /* 🔴 单时钟（2026-10-22 第三轮，主人定案 B）：View Transition 期间整页是
@@ -372,15 +380,15 @@ var ThemeSwitch = {
          开关 0.55s 后才补演」（实测错位 671ms）。撤掉 VT 后页面改走 0.45s 整页
          渐变，与本 timeline 同帧起跑，这里不需要任何等待。 */
       var t = (this._tl = g.timeline());
-      /* 0.45s = 滑块**第一段**落定。
-         为什么不必等第二段（66→63 的 3px 微调）：门控要防的是「窗口按终态左移
-         42.48px 而滑块还在半路」，而 0.45s 后滑块已在 66、占 66~102，收窄窗口
-         覆盖 59~101 ⇒ 月亮完整在窗内。
-         第二轮的 0.65s = 0.45 + 0.2 余量，那 0.2 是留给 VT 的；VT 撤掉后一并
-         去掉 ⇒ 点击到可收纳 0.6s（0.45 + 0.15 摘锁）。 */
+      /* 0.95s = 滑块**回弹段**结束（0→66 用 0.45s，66→63 用 0.5s）——
+         也就是肉眼上「开关演完了」的时刻。此后 300ms 摘锁 ⇒ 动画结束 + 0.3s 才开始收窄。
+         为什么不等星星闪烁的尾巴（到 2.55s，见 TWINKLE）：星星在画面上方、滑块在
+         右侧，收窄后的窗口覆盖 59~101，月亮始终在窗内，等它只是白让开关「大着不动」。
+         第四轮主人明确「动画结束后等 0.3 收纳」，所以从第二轮的 0.45s 前移到整段结束。 */
       t.call(function () {
+        self._busy = false;
         self.lock(false);
-      }, null, 0.45);
+      }, null, 0.95);
       if (night) {
         t.to(m.thumb, { x: 66, duration: 0.45, ease: "power2.inOut" }, 0).to(
           m.thumb,
