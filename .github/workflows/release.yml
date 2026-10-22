@@ -18,6 +18,14 @@
 #      这里只从核心仓的 latest Release 把附件搬过来转挂。
 #      ⇒ **发布顺序：核心仓先、本仓后**，否则会搬到上一版的安装器。
 #      搬运失败直接红，不静默产出「没有安装器」的 Release。
+#
+# ⚠️ 2026-10-22 版本门禁：tag 名、`web_console.py` 的 `WEB_VERSION`、CHANGELOG 首条
+#   三者必须一致，任一不符在跑测试之前就判红。本仓没有 `VERSION` 文件 ——
+#   常量就是唯一机器可读版本源（刻意不引入第二处）。历史漂移：`WEB_VERSION`
+#   曾停在 1.11.1 而 tag 已 v1.11.3，界面「关于」显示旧号，两版无人发现。
+#
+# ⚠️ 2026-10-22 校验和：两个二进制附件各附 `<文件名>.sha256`（`sha256sum` 格式，
+#   只记裸文件名）。exe 的校验和与核心仓**必须一致** —— 是同一个字节。
 name: Release
 
 on:
@@ -49,6 +57,23 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Verify version consistency
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          V="${TAG#v}"
+          CONST="$(grep -m1 -oE '^WEB_VERSION = "[0-9]+\.[0-9]+\.[0-9]+"' web_console.py | tr -dc '0-9.')"
+          TOP="$(grep -m1 -oE '^## \[[0-9]+\.[0-9]+\.[0-9]+\]' CHANGELOG.md | tr -dc '0-9.')"
+          echo "tag=$V  WEB_VERSION=$CONST  CHANGELOG=$TOP"
+          if [ "$CONST" != "$V" ]; then
+            echo "::error::WEB_VERSION($CONST) 与 tag($V) 不一致 —— 改版本时 web_console.py 与 CHANGELOG 要一起改"
+            exit 1
+          fi
+          if [ "$TOP" != "$V" ]; then
+            echo "::error::CHANGELOG 首条 [$TOP] 与 tag($V) 不一致 —— 先在 CHANGELOG 顶部补一条 ## [$V] - 日期"
+            exit 1
+          fi
 
       - name: Run tests before publishing
         env:
@@ -87,7 +112,9 @@ jobs:
           rm -rf _asset/pack/web-console/.github _asset/pack/web-console/tests
           tar -czf "_asset/web-console-$TAG.tgz" -C _asset/pack web-console
           ls -l "_asset/web-console-$TAG.tgz"
-          gh release upload "$TAG" "_asset/web-console-$TAG.tgz" --clobber
+          ( cd _asset && sha256sum "web-console-$TAG.tgz" > "web-console-$TAG.tgz.sha256" )
+          cat "_asset/web-console-$TAG.tgz.sha256"
+          gh release upload "$TAG" "_asset/web-console-$TAG.tgz" "_asset/web-console-$TAG.tgz.sha256" --clobber
 
       # 附件二：快捷安装器。**不在这里构建** —— 从核心仓 latest Release 搬附件转挂，
       # 保证两边用户拿到的 exe 是同一个字节。核心仓尚未发布时这里会红，属预期。
@@ -108,4 +135,7 @@ jobs:
             exit 1
           fi
           gh release upload "$TAG" _asset/ai-memory-setup.exe --clobber
+          ( cd _asset && sha256sum ai-memory-setup.exe > ai-memory-setup.exe.sha256 )
+          cat _asset/ai-memory-setup.exe.sha256
+          gh release upload "$TAG" _asset/ai-memory-setup.exe.sha256 --clobber
           echo "attached: $(gh release view "$TAG" --json assets --jq '.assets[].name' | tr '\n' ' ')"
