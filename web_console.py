@@ -139,7 +139,10 @@ import web_store
 
 logger = logging.getLogger("ai-memory.web")
 
-WEB_VERSION = "1.11.1"
+WEB_VERSION = "1.11.3"
+# ⚠️ 2026-10-22：此常量是控制台**唯一**的机器可读版本源，release.yml 会校验
+#   `tag == WEB_VERSION == CHANGELOG 首条`。历史上一度停在 1.11.1 而 tag 已到
+#   v1.11.3（漂了两个版本），界面「关于」显示的是旧号 —— 改版本时必须同改三处。
 DEFAULT_WEB_HOST = "127.0.0.1"
 # ⚠️ 本机实测（2026-10-13，Windows）：8800/8801/8802 均被系统保留（bind 报
 # WinError 10013），故默认改用 8811 段。可选：8811-8820。
