@@ -19,7 +19,7 @@
 *.css text eol=lf
 *.html text eol=lf
 *.md text eol=lf
-Dockerfile text eol=lf
-.dockerignore text eol=lf
+# 容器定义（Dockerfile / compose / .dockerignore）已迁至 dpkg-s/ai-memory-docker，
+# 本仓不再持有，故此处也删掉对应的 eol 规则。
 # 自身也锁 LF：否则规则生效前的首次 add 仍会提示它自己被转成 CRLF。
 /.gitattributes text eol=lf

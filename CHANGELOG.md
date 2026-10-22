@@ -2,6 +2,21 @@
 
 本仓由 [ai-memory-template](https://github.com/dpkg-s/ai-memory-template) 的 Web 控制台部分拆分而来，自拆分起独立维护。
 
+## [1.11.2] - 2026-10-22
+
+> 主题：**容器定义搬家，控制台回归控制台**。1.11.0/1.11.1 把 `Dockerfile` / `docker-compose.yml` 直接放在控制台仓里，导致「怎么跑容器」这件事被劈成两半 —— MCP 服务端镜像在 `ai-memory-docker`，控制台镜像在本仓。这一版把容器定义全部交还给 docker 仓，本仓只留源码与运行时契约。
+
+### Changed
+
+- **容器定义迁出本仓** —— `Dockerfile` / `docker-compose.yml` / `.dockerignore` 删除，改由 [`dpkg-s/ai-memory-docker`](https://github.com/dpkg-s/ai-memory-docker) 的 `Dockerfile.web` 构建（构建上下文是该仓的 `template/web-console/`）。全栈编排（`ai-memory` 8700 + `ai-memory-web` 8811）见该仓 `compose.yaml`。
+- **README「容器运行（Docker）」重写** —— 不再教 `docker build`，改为列本仓对镜像的**运行时契约**（入口 `serve_web.py`、端口 `AI_MEMORY_WEB_PORT`、状态目录 `AI_MEMORY_WEB_CONFIG_DIR`、上游 `AI_MEMORY_WEB_MCP`），并指向 docker 仓承担部署细节。
+- **`.gitattributes` 移除 `Dockerfile` / `.dockerignore` 的 `eol=lf` 规则** —— 文件已不在本仓，规则留着是死引用。
+
+### Note
+
+- **1.11.0 / 1.11.1 里关于容器的那部分条目，现在归 docker 仓管** —— 默认账号种子语义、`421 Invalid Host header` 的成因与放行、healthcheck 打 `/api/session`、多架构 `exec format error`，都随容器定义一起迁到 docker 仓的 README 与 Releases。本文件保留历史条目原文，不再重复维护。
+- **源码侧契约未变** —— 迁出的只是构建与编排，`serve_web.py` / `web_console.py` / `web/` 的资源与行为一字未改，1.11.1 的守卫修复与 `_mcp_error_text()` 依旧有效。
+
 ## [1.11.1] - 2026-10-22
 
 > 主题：**镜像真能起来了**。1.11.0 的容器定义写完就打了 tag，但第一次冒烟就发现容器启动即 `exit 2` —— 被自己的守卫打回。这一版修掉它，并把「连不到宿主 MCP」的真实原因（421 Invalid Host header）查清写进文档。

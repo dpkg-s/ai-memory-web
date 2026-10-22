@@ -91,63 +91,27 @@ python -m http.server 8080 --directory web
 
 ## 容器运行（Docker）
 
-镜像只含**控制台**，不含 MCP 服务端 —— 上游由 `AI_MEMORY_WEB_MCP` 指过去。
+本仓**只提供控制台源码，不再自带容器定义**（`Dockerfile` / `compose.yaml` / `.dockerignore`
+已迁出）。全栈编排统一在 **<https://github.com/dpkg-s/ai-memory-docker>**：
 
 ```bash
-docker build -t ai-memory-web:1.11.1 .
-
-docker run -d --name ai-memory-web -p 8811:8811 \
-  -v am-conf:/config \
-  -e AI_MEMORY_WEB_MCP=http://host.docker.internal:8700/mcp \
-  ai-memory-web:1.11.1
+git clone --recurse-submodules https://github.com/dpkg-s/ai-memory-docker.git
+cd ai-memory-docker
+docker compose up -d --build     # 起 ai-memory(8700) + ai-memory-web(8811)
 ```
 
-或者用仓库里的 `docker-compose.yml`：
+打开 <http://127.0.0.1:8811>，默认账号 `admin` / `password`（首次启动的种子，改过即失效）。
 
-```bash
-docker compose up -d --build
-```
+镜像构建、卷布局、默认口令语义、`421 Invalid Host header` 的成因与放行方式、
+多架构与 healthcheck 细节，全部见 docker 仓 README 与 Releases ——
+本仓只保证「源码能被那个 `Dockerfile.web` 直接 COPY 进去」，即：
 
-打开 <http://127.0.0.1:8811>，默认账号：
+- 入口是 `serve_web.py`，监听 `AI_MEMORY_WEB_PORT`（默认 `8811`）
+- 状态落在 `AI_MEMORY_WEB_CONFIG_DIR`（默认 `/config`），**必须持久化**
+- 上游 MCP 由 `AI_MEMORY_WEB_MCP` 指向，镜像内不含 MCP 服务端
 
-| 用户名 | 口令 |
-| --- | --- |
-| `admin` | `password` |
-
-> 🔴 **默认口令是「首次启动的种子」，不是常驻配置。**
-> 控制台只在 `/config/users.json` 为空时用它建初始管理员，落盘的是 scrypt 哈希，没有明文。
-> 一旦在「访问控制」页改过口令，`AI_MEMORY_WEB_USER/PASSWORD` 就再也不起作用 ——
-> 这是刻意的，否则每次重启都会把口令打回默认值。对外暴露前请先改掉；改不了就删掉
-> `/config` 卷重来。口令以环境变量形式进入镜像层，能被 `docker inspect` 看到，别当保险箱。
-
-| 挂载点 | 作用 |
-| --- | --- |
-| `/config` | `config.json` / `users.json` / `tokens.json`，**必须持久化** |
-| `/vault` | 记忆库根目录（可选只读）；不挂则索引、笔记预览等页面无数据 |
-
-探活走 `/api/session`（公开端点）—— 开启登录后 `/api/health` 需要鉴权，
-拿它做 healthcheck 会让容器被反复判死；探针端口读 `AI_MEMORY_WEB_PORT`，改端口不会误判。
-
-### 🔴 连宿主机上的 MCP：会先撞 `421 Invalid Host header`
-
-MCP 的 streamable HTTP transport 默认只放行 `127.0.0.1` / `localhost` / `[::1]`
-作为 `Host`（防 DNS rebinding）。容器里写 `host.docker.internal:8700` 时，TCP 是通的，
-但 MCP 会直接回 **421**，控制台的 MCP 面板因而空白（实测：同一个 IP:端口，只换 Host 头
-`127.0.0.1:8700` → 200，`host.docker.internal:8700` → 421）。
-
-在 **MCP 侧**（`serve_http.py` 那台）放行即可：
-
-```bash
-AI_MEMORY_HTTP_ALLOWED_HOSTS="127.0.0.1:*,localhost:*,host.docker.internal:8700" \
-  python serve_http.py
-```
-
-> ⚠️ 该变量是**替换**默认值，不是追加：只写 `host.docker.internal:8700` 会把宿主机自己的
-> `127.0.0.1` 通道一起关掉，所以必须把回环两项也写上。
-
-连**另一台机器**上的 MCP 同理：把那台机器的 `IP:端口` 或域名加进同一个白名单。
-（`--network host` 在 Docker Desktop for Windows/macOS 下走的是**虚拟机**的网络命名空间，
-既到不了宿主机的 `127.0.0.1`，外部也访问不到容器端口，别指望它绕过去。）
+> 容器里连宿主机 MCP 会先撞 `421`，那是 MCP 侧 `Host` 白名单的问题，不是控制台的问题。
+> 解法写在 docker 仓 README 的「连宿主机上的 MCP」一节。
 
 ## 环境变量
 
