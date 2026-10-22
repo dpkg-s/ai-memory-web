@@ -2,6 +2,23 @@
 
 本仓由 [ai-memory-template](https://github.com/dpkg-s/ai-memory-template) 的 Web 控制台部分拆分而来，自拆分起独立维护。
 
+## [1.11.0] - 2026-10-22
+
+> 主题：**把「跑起来」这件事收进仓库**。此前容器镜像是在设备上手工 `docker build -f Dockerfile.offline` 拼出来的，仓库里没有任何容器定义 —— 换台机器就得重新摸一遍。这一版补上 `Dockerfile` / `docker-compose.yml` / `.dockerignore`，并把默认账号定成 **admin / password**，开箱即可登录。
+
+### Added
+
+- **`Dockerfile`** —— `python:3.13-slim` 基座，`pip install -r requirements.txt` 单独成层（改源码不重装 mcp）；非 root 运行（uid 10001）；`/config` 为唯一可写目录并声明为卷；`EXPOSE 8811`。
+  - **默认账号**：`AI_MEMORY_WEB_USER=admin` / `AI_MEMORY_WEB_PASSWORD=password` 写进镜像 ENV。它只是**首次启动的种子** —— `web_console` 只在 `/config/users.json` 为空时用它建初始管理员，落盘为 scrypt 哈希；一旦改过口令，环境变量即失效（否则每次重启都会把口令打回默认值）。
+  - **探活打 `/api/session`**，不是 `/api/health`：开启登录后后者要 401，拿它做 healthcheck 会让容器被反复判死。
+- **`docker-compose.yml`** —— `docker compose up -d --build` 即起；`/config` 落命名卷，`/vault` 只读挂载留成注释（按需打开）；上游 MCP 用 `AI_MEMORY_WEB_MCP` 指到容器外（容器内的 `127.0.0.1` 是它自己）。
+- **`.dockerignore`** —— 排除 `.git` / `tests` / `__pycache__` / `*.tgz`，镜像里不放测试与发布件。
+- **README「容器运行（Docker）」一节** —— 构建/运行命令、默认账号表、两个挂载点的作用、默认口令的失效语义，以及「口令以 ENV 形式进镜像层，`docker inspect` 能看到」这条风险提示。
+
+### Note
+
+- 离线设备（h29k）仍用设备侧 `Dockerfile.offline`（基座镜像已装好 mcp）：本文件的 `pip install` 需要网络，离线构建会在那一步失败。
+
 ## [1.10.0] - 2026-10-22
 
 > 主题：**圆形扩散回来了，而且和开关真正同时**。上一轮把扩散撤掉是因为浏览器 View Transition 会冻结整页快照；这一轮不再用它 —— 自己造一张「旧主题底片」盖在页面上，在底片中央挖一个不断扩大的圆孔，底片下面是**实时**页面。于是扩散扫到哪里，那里的开关就在演。

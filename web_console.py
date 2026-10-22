@@ -137,7 +137,7 @@ import web_store
 
 logger = logging.getLogger("ai-memory.web")
 
-WEB_VERSION = "1.10.0"
+WEB_VERSION = "1.11.0"
 DEFAULT_WEB_HOST = "127.0.0.1"
 # ⚠️ 本机实测（2026-10-13，Windows）：8800/8801/8802 均被系统保留（bind 报
 # WinError 10013），故默认改用 8811 段。可选：8811-8820。

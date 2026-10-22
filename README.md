@@ -89,6 +89,45 @@ python serve_web.py --open    # 启动后自动打开浏览器
 python -m http.server 8080 --directory web
 ```
 
+## 容器运行（Docker）
+
+镜像只含**控制台**，不含 MCP 服务端 —— 上游由 `AI_MEMORY_WEB_MCP` 指过去。
+
+```bash
+docker build -t ai-memory-web:1.11.0 .
+
+docker run -d --name ai-memory-web -p 8811:8811 \
+  -v am-conf:/config \
+  -e AI_MEMORY_WEB_MCP=http://192.168.0.1:8700/mcp \
+  ai-memory-web:1.11.0
+```
+
+或者用仓库里的 `docker-compose.yml`：
+
+```bash
+docker compose up -d --build
+```
+
+打开 <http://127.0.0.1:8811>，默认账号：
+
+| 用户名 | 口令 |
+| --- | --- |
+| `admin` | `password` |
+
+> 🔴 **默认口令是「首次启动的种子」，不是常驻配置。**
+> 控制台只在 `/config/users.json` 为空时用它建初始管理员，落盘的是 scrypt 哈希，没有明文。
+> 一旦在「访问控制」页改过口令，`AI_MEMORY_WEB_USER/PASSWORD` 就再也不起作用 ——
+> 这是刻意的，否则每次重启都会把口令打回默认值。对外暴露前请先改掉；改不了就删掉
+> `/config` 卷重来。口令以环境变量形式进入镜像层，能被 `docker inspect` 看到，别当保险箱。
+
+| 挂载点 | 作用 |
+| --- | --- |
+| `/config` | `config.json` / `users.json` / `tokens.json`，**必须持久化** |
+| `/vault` | 记忆库根目录（可选只读）；不挂则索引、笔记预览等页面无数据 |
+
+探活走 `/api/session`（公开端点）—— 开启登录后 `/api/health` 需要鉴权，
+拿它做 healthcheck 会让容器被反复判死。
+
 ## 环境变量
 
 | 变量 | 默认 | 说明 |
