@@ -1,5 +1,5 @@
 import { S, toast } from "../core/store.js";
-import { applyTheme } from "../core/theme.js";
+import { applyTheme, startReveal } from "../core/theme.js";
 import { reduced } from "../core/anim.js";
 
 /* ======================================================================
@@ -224,18 +224,24 @@ var ThemeSwitch = {
   methods: {
     toggle: function () {
       /* 动画期间不接受新点击（2026-10-22 第四轮，主人要求）：
-         连点会让旧 timeline 被 kill、门控重新加锁，视觉上「滑块抖一下再重来」。
+         连点会让旧 timeline 被 kill、门控重新加锁、扩散被打断重来。
          互斥窗口 = timeline 主段（0.95s），到点自动放开。 */
       if (this._busy) return;
       var p = S.theme === "dark" ? "light" : "dark";
+      /* 圆形扩散的圆心 = 开关中心。取不到（隐藏/未挂载）就交给 theme.js 用视口中心。
+         扩散与开关**同一帧**起跑（2026-10-22 第五轮）：theme.js 会先把旧页面拍成
+         底片再挖孔，底层始终是活页面，所以本组件的 timeline 从第 0 帧就在演。 */
+      var r = this._btn ? this._btn.getBoundingClientRect() : null;
+      var origin = r ? { x: r.left + r.width / 2, y: r.top + r.height / 2 } : null;
       S.themePref = p;
-      /* 页面渐变与开关 timeline 同一帧起跑（单时钟）。 */
-      S.theme = applyTheme(p);
+      S.theme = applyTheme(p, { origin: origin });
     },
     followSystem: function () {
       if (this._busy) return;
+      var r = this._btn ? this._btn.getBoundingClientRect() : null;
+      var origin = r ? { x: r.left + r.width / 2, y: r.top + r.height / 2 } : null;
       S.themePref = "auto";
-      S.theme = applyTheme("auto");
+      S.theme = applyTheme("auto", { origin: origin });
       toast("info", "已跟随系统主题", "外观将随系统深浅色自动切换");
     },
 
@@ -379,7 +385,9 @@ var ThemeSwitch = {
          静态快照，开关被冻在快照里 —— 等扩散结束再放行，就成了「页面先换完、
          开关 0.55s 后才补演」（实测错位 671ms）。撤掉 VT 后页面改走 0.45s 整页
          渐变，与本 timeline 同帧起跑，这里不需要任何等待。 */
-      var t = (this._tl = g.timeline());
+      /* 圆孔在 timeline 的 onStart 里才开始扩 —— 那一 tick 正是滑块被画到
+         第一帧的时刻，两者物理同帧。theme.js 已把旧主题底片盖好（孔半径 0）等着。 */
+      var t = (this._tl = g.timeline({ onStart: startReveal }));
       /* 0.95s = 滑块**回弹段**结束（0→66 用 0.45s，66→63 用 0.5s）——
          也就是肉眼上「开关演完了」的时刻。此后 300ms 摘锁 ⇒ 动画结束 + 0.3s 才开始收窄。
          为什么不等星星闪烁的尾巴（到 2.55s，见 TWINKLE）：星星在画面上方、滑块在
