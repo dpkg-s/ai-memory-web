@@ -1,6 +1,6 @@
 import { computed } from "../../vendor/vue.esm-browser.prod.js";
 import { S, toast } from "../core/store.js";
-import { fmtNum, mdRender } from "../core/util.js";
+import { confZh, fmtNum, mdRender, statusZh, tierZh, typeZh } from "../core/util.js";
 import { browseLibrary, onMdClick, openNote } from "../features/library.js";
 
 var LibraryPage = {
@@ -21,29 +21,31 @@ var LibraryPage = {
     },
     /* 节点信息 · 元数据：只挑「节点身份」字段；summary / source_context 这类
        长文本不进面板（否则右栏会被一句话撑爆）。
-       2026-10-14 汉化：键名走中文（口径 = 概览页既有译法：热度 / 读取 / 置信度），
-       **值保持原文**（type=project、tier=warm 等是数据值，汉化需另建 TYPE_ZH/TIER_ZH）。 */
+       2026-10-14 汉化：键名走中文（口径 = 概览页既有译法：热度 / 读取 / 置信度）。
+       2026-10-20 值也汉化：类型 / 热度 / 状态 / 置信度 四个枚举值改走 util.js 的
+       TYPE_ZH / TIER_ZH / STATUS_ZH / CONF_ZH —— 与概览页「记忆类型」卡共用同一份表。
+       原文放进 `raw`，模板挂在 title 上（指上去仍能看到 project / warm / high）。 */
     nodeMeta: function () {
       var n = this.L.note || {};
       var m = n.meta || {};
       var rows = [
-        ["路径", n.path || n.title],
-        ["类型", m.type],
-        ["大小", n.total_chars ? fmtNum(n.total_chars) + " 字符" : ""],
-        ["创建", this.dateOnly(m.created)],
-        ["更新", this.dateOnly(m.updated)],
-        ["热度", m.tier],
-        ["读取", m.access_count],
-        ["版本", m.version],
-        ["状态", m.status],
-        ["置信度", m.confidence],
+        ["路径", n.path || n.title, ""],
+        ["类型", typeZh(m.type), m.type],
+        ["大小", n.total_chars ? fmtNum(n.total_chars) + " 字符" : "", ""],
+        ["创建", this.dateOnly(m.created), ""],
+        ["更新", this.dateOnly(m.updated), ""],
+        ["热度", tierZh(m.tier), m.tier],
+        ["读取", m.access_count, ""],
+        ["版本", m.version, ""],
+        ["状态", statusZh(m.status), m.status],
+        ["置信度", confZh(m.confidence), m.confidence],
       ];
       return rows
         .filter(function (r) {
           return r[1] !== undefined && r[1] !== null && r[1] !== "";
         })
         .map(function (r) {
-          return { k: r[0], v: r[1] };
+          return { k: r[0], v: r[1], raw: r[2] || "" };
         });
     },
     nodeTags: function () {
@@ -180,7 +182,7 @@ var LibraryPage = {
     "        <template v-else>" +
     '          <div class="ni-sec">元数据</div>' +
     '          <x-kv class="ni-kv stagger-in">' +
-    '            <x-kv-row v-for="(r, i) in nodeMeta" :key="r.k" :style="\'--i:\' + i" :label="r.k" :value="r.v"></x-kv-row>' +
+    '            <x-kv-row v-for="(r, i) in nodeMeta" :key="r.k" :style="\'--i:\' + i" :label="r.k" :value="r.v" :title="r.raw || null"></x-kv-row>' +
     "          </x-kv>" +
     '          <div class="ni-sec">标签</div>' +
     '          <div class="tags stagger-in" v-if="nodeTags.length">' +

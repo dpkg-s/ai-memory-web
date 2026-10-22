@@ -103,6 +103,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -111,22 +112,32 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, urlencode
 
 import anyio
+import httpx
 from starlette.applications import Starlette
+from starlette.background import BackgroundTask
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import FileResponse, JSONResponse, Response
+from starlette.responses import (FileResponse, JSONResponse, Response,
+                                StreamingResponse)
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
+# 同目录模块（非第三方）。2026-10-21：账号登录与会话签名。
+# 只用标准库实现，不给 requirements.txt 加任何依赖 —— 见 web_auth.py 顶部取舍说明。
+# 2026-10-22：web_store 承载用户表与令牌表（多用户 + 可吊销令牌）。
+import web_auth
+import web_store
+
 logger = logging.getLogger("ai-memory.web")
 
-WEB_VERSION = "1.2.0"
+WEB_VERSION = "1.8.0"
 DEFAULT_WEB_HOST = "127.0.0.1"
 # ⚠️ 本机实测（2026-10-13，Windows）：8800/8801/8802 均被系统保留（bind 报
 # WinError 10013），故默认改用 8811 段。可选：8811-8820。
@@ -137,6 +148,14 @@ DEFAULT_WEB_PORT = 8811
 DEFAULT_MCP_URL = "http://127.0.0.1:8700/mcp"
 DEFAULT_CONFIG_PATH = Path.home() / ".ai-memory-web" / "config.json"
 DEFAULT_CONFIG_WRITE = True
+
+#: 登录启用时，若既无 token 也无 AI_MEMORY_WEB_SECRET，用它签会话。
+#: 这种组合只出现在「回环地址 + 无 token」——本来就不需要鉴权，会话稳定性无意义；
+#: 用进程内随机值即可，重启后自然失效。
+_FALLBACK_SESSION_KEY = secrets.token_bytes(32)
+#: 明文口令形态（AI_MEMORY_WEB_PASSWORD）的哈希缓存：scrypt 一次约 180 ms，
+#: 而 config() 会在启动时被多次调用，不缓存就是几十次无谓的慢哈希。
+_LOGIN_HASH_CACHE: str = ""
 MAX_BODY_BYTES = 2 * 1024 * 1024          # 请求体上限 2 MiB（拒绝无脑大包）
 MCP_TIMEOUT = 90.0                        # 单次会话总超时（秒）
 MCP_HEALTH_TIMEOUT = 20.0
@@ -144,6 +163,53 @@ MCP_HEALTH_TIMEOUT = 20.0
 # `output_format="json"` 是一条 JSON 字符串，截断会让它直接解析失败（探针踩过）。
 # 40k 字符足够容纳「列表 50 条 + 笔记正文」，又能挡住病态大包。
 _THUMB = 40000
+
+#: 网关回调本服务的内部校验端点（nginx ``auth_request`` 用）。
+#: 不在 ``/api/`` 前缀下 —— 它走的是容器间内网，凭据是 ``X-Internal-Key``
+#: 而不是用户会话；放错前缀会被用户鉴权中间件拦死。
+INTERNAL_VERIFY_PATH = "/internal/token/verify"
+
+#: MCP 反代入口（2026-10-22，v1.7.0）。控制台自己挂一个 ``/mcp``，鉴权后
+#: 流式转发到 ``resolve_mcp()`` 指向的上游（默认 ``127.0.0.1:8700/mcp``）。
+#: 存在的理由：上游 MCP 端点**根本不鉴权**（只绑回环），而令牌表只在控制台这边；
+#: 想让「另一台设备拿一枚限时令牌就能连 MCP」成立，必须有一个既认令牌又能
+#: 转发流式响应的门口。控制台本来就在这个位置上，加一层是零新增依赖。
+MCP_PROXY_PATH = "/mcp"
+
+#: 反代时**不转发**的请求头：跳数头 + 我们自己的凭据（令牌是给本控制台的，
+#: 不该漏给上游；上游也不需要 Cookie）。
+_PROXY_DROP_REQ = frozenset({
+    "host", "content-length", "connection", "transfer-encoding", "keep-alive",
+    "upgrade", "te", "trailer", "proxy-authorization", "proxy-connection",
+    "authorization", "x-auth-token", "cookie",
+})
+
+#: 反代时**不回传**的响应头：长度与编码由本层重新决定（httpx 已解压，若再
+#: 带上游的 content-encoding，客户端会把明文当 gzip 解，直接报错）。
+_PROXY_DROP_RESP = frozenset({
+    "content-length", "content-encoding", "transfer-encoding", "connection",
+    "keep-alive",
+})
+
+
+def token_from_request(request: Request) -> str:
+    """从请求里取令牌：``Authorization: Bearer`` > ``X-Auth-Token`` > ``?token=``。
+
+    ``?token=`` 是 2026-10-22 新增的第三通道，只为「MCP 客户端只让填一个 URL」
+    这类场景 —— 多数 MCP 客户端支持自定义 header，但配置项常常只暴露 URL 一项。
+    **代价必须说清**：令牌写进 URL 会进 uvicorn 的访问日志、浏览器历史和反代日志，
+    所以它适合内网/本机，不适合暴露到公网；能配 header 就用 header。
+    """
+    raw = request.headers.get("Authorization", "")
+    if raw.lower().startswith("bearer "):
+        got = raw[7:].strip()
+        if got:
+            return got
+    got = request.headers.get("X-Auth-Token", "").strip()
+    if got:
+        return got
+    return str(request.query_params.get("token") or "").strip()
+
 
 _TRUTHY = {"1", "true", "yes", "on", "y", "t"}
 
@@ -198,6 +264,21 @@ def config_path() -> Path:
     return Path(raw).expanduser() if raw else DEFAULT_CONFIG_PATH
 
 
+#: 用户表 / 令牌表的进程内单例，按用户表路径做键。
+#: **必须是单例**：``TokenStore`` 在内存里攒计次增量与「上次落盘时间」，
+#: 重复实例化会让同一枚令牌的每一次请求都读到旧的 uses 值 —— 限次直接失效。
+_STORES: dict[str, tuple] = {}
+
+
+def _get_stores(users_path: Path, tokens_path: Path):
+    key = str(users_path)
+    got = _STORES.get(key)
+    if got is None:
+        got = (web_store.UserStore(users_path), web_store.TokenStore(tokens_path))
+        _STORES[key] = got
+    return got
+
+
 def config() -> dict:
     """解析运行时配置（含全部校验）。危险组合一律抛错，不静默兜底。"""
     host = _env_str("AI_MEMORY_WEB_HOST", DEFAULT_WEB_HOST) or DEFAULT_WEB_HOST
@@ -228,11 +309,96 @@ def config() -> dict:
             " + vendor/ （vue/marked/purify/gsap/Flip）），"
             "或用 AI_MEMORY_WEB_STATIC 指定目录。")
 
+    # ---- 账号登录（2026-10-21，方案 A） ---------------------------------
+    # 三种配置形态，**半配即拒**：
+    #   · USER + PASSWORD_HASH → 标准形态（.env 里只存 scrypt 哈希）
+    #   · USER + PASSWORD      → 便捷形态（明文留在 .env，启动时现场哈希）
+    #   · 只给其一             → 拒绝启动：半配等于没配，却会让人以为已开启登录
+    global _LOGIN_HASH_CACHE
+    login_user = _env_str("AI_MEMORY_WEB_USER")
+    login_hash = _env_str("AI_MEMORY_WEB_PASSWORD_HASH")
+    login_plain = _env_str("AI_MEMORY_WEB_PASSWORD")
+    if bool(login_user) != bool(login_hash or login_plain):
+        raise WebConfigError(
+            "登录配置不完整：AI_MEMORY_WEB_USER 必须与 "
+            "AI_MEMORY_WEB_PASSWORD_HASH（或 AI_MEMORY_WEB_PASSWORD）同时给出。"
+            "生成哈希：python make_password.py（本仓根目录，交互输入不回显），"
+            "把它输出的两行一起填上。")
+    login_enabled = bool(login_user and (login_hash or login_plain))
+    if login_enabled and not login_hash:
+        if not _LOGIN_HASH_CACHE:
+            _LOGIN_HASH_CACHE = web_auth.hash_password(login_plain)
+        login_hash = _LOGIN_HASH_CACHE
+
+    secret = _env_str("AI_MEMORY_WEB_SECRET")
+    # 会话密钥：显式 secret 优先；否则从 token 派生（换 token = 全场会话立即失效）。
+    # 两者都空只会出现在「回环 + 无 token」——用进程内随机值，重启即失效。
+    session_key = (web_auth.derive_key(token, secret)
+                   if (token or secret) else _FALLBACK_SESSION_KEY)
+    session_ttl = _env_int("AI_MEMORY_WEB_SESSION_TTL", web_auth.SESSION_TTL)
+    if session_ttl < 60:
+        raise WebConfigError(
+            f"AI_MEMORY_WEB_SESSION_TTL={session_ttl} 太短（至少 60 秒）。")
+
+    # ---- 多用户与访问令牌（2026-10-22）-----------------------------------
+    # 两张表与 config.json 同目录（容器里是 /config，bind 到 web-config 卷）。
+    # **刻意不放进 .env**：账号要能在线增删改，而改 .env 需要重建容器才生效
+    # （-e 在建容器时固化），那样「管理员给同事开个号」就变成了停机操作。
+    cfg_dir = config_path().parent
+    users_path = Path(_env_str("AI_MEMORY_WEB_USERS") or (cfg_dir / "users.json"))
+    tokens_path = Path(_env_str("AI_MEMORY_WEB_TOKENS") or (cfg_dir / "tokens.json"))
+    users, tokens = _get_stores(users_path, tokens_path)
+
+    # 从旧版单用户配置平滑迁移：表为空时把 .env 里那组 USER + HASH 变成 admin。
+    # 没有这一步，升级后 users.json 是空的 —— 谁都登不进去，只能进容器手改文件。
+    if login_enabled and users.bootstrap(login_user, login_hash, "admin"):
+        logger.warning("用户表为空，已用 AI_MEMORY_WEB_USER=%s 建立初始管理员", login_user)
+
+    # 只要表里有账号，就必须开登录面 —— 否则「users.json 有 5 个人」而
+    # login_enabled 为 False，中间件不挂、人人免登录，是最危险的一种静默失配。
+    multi_user = users.count() > 0
+    if multi_user and not login_enabled:
+        logger.info("用户表已有账号，登录面自动启用")
+        login_enabled = True
+    if not multi_user and not login_enabled:
+        logger.warning("用户表为空且未配置账号登录：只有令牌通道可用，无法管理用户。")
+
+    # 内部校验密钥：网关（nginx auth_request）回调本服务时必带。
+    # 空 = 关闭内部端点（退回单 token 精确匹配的老路子），便于灰度与回滚。
+    internal_key = _env_str("AI_MEMORY_WEB_INTERNAL_KEY")
+
+    # 🔴 向后兼容：把 .env 里两枚老令牌认领进表。
+    # 不做这一步，升级后它们不在表里 ⇒ 校验全部落空 ⇒ 脚本与 MCP 客户端
+    # **在同一秒**集体 401，而且现象是「token 明明没改却失效了」。
+    # AI_MEMORY_TOKEN 是网关那枚：容器里本来没有这个环境变量，
+    # deploy 脚本改造后才会传进来（不传则跳过，不影响控制台自身）。
+    if token:
+        if tokens.adopt(token, name=".env AI_MEMORY_WEB_TOKEN",
+                        owner=login_user or "system"):
+            logger.info("已把 AI_MEMORY_WEB_TOKEN 纳入令牌表（admin / 永不过期）")
+    gw_token = _env_str("AI_MEMORY_TOKEN")
+    if gw_token:
+        if tokens.adopt(gw_token, name=".env AI_MEMORY_TOKEN（网关）",
+                        owner=login_user or "system"):
+            logger.info("已把 AI_MEMORY_TOKEN 纳入令牌表（admin / 永不过期）")
+
     return {
         "host": host,
         "port": port,
         "token": token,
         "auth_enabled": bool(token),
+        "login_enabled": login_enabled,
+        "login_user": login_user,
+        "login_hash": login_hash,
+        "session_key": session_key,
+        "session_ttl": session_ttl,
+        "cookie_secure": _env_bool("AI_MEMORY_WEB_COOKIE_SECURE", False),
+        "users_path": str(users_path),
+        "tokens_path": str(tokens_path),
+        "users": users,
+        "tokens": tokens,
+        "multi_user": multi_user,
+        "internal_key": internal_key,
         "mcp": mcp,
         "allowed_hosts": allowed_hosts,
         "static": static,
@@ -243,9 +409,14 @@ def config() -> dict:
 
 def describe(cfg: dict | None = None) -> str:
     cfg = cfg or config()
+    modes = []
+    if cfg["auth_enabled"]:
+        modes.append("token")
+    if cfg["login_enabled"]:
+        modes.append(f"登录:{cfg['login_user']}")
+    auth = "+".join(modes) if modes else "关（仅回环）"
     return (f"http://{cfg['host']}:{cfg['port']}/  →  MCP {cfg['mcp']}  "
-            f"auth={'token' if cfg['auth_enabled'] else '关（仅回环）'}  "
-            f"config={cfg['config_path']}")
+            f"auth={auth}  config={cfg['config_path']}")
 
 
 # ---------------------------------------------------------------------------
@@ -632,6 +803,7 @@ async def mcp_tools(endpoint: str, timeout: float = MCP_TIMEOUT) -> list[dict]:
 UPDATE_BACKEND_FILES = (
     "web_console.py",
     "serve_web.py",
+    "web_auth.py",
 )
 UPDATE_FRONTEND_DIR = "web"
 UPDATE_WEB_PATHS = UPDATE_BACKEND_FILES + (UPDATE_FRONTEND_DIR,)
@@ -749,6 +921,45 @@ def update_target(key: str) -> tuple[Path | None, tuple[str, ...], str]:
         root, err = core_root()
         return root, CORE_PROGRAM_FILES, err
     return None, (), f"未知更新目标：{key}"
+
+
+# 🔴 2026-10-21：容器部署下的两条报错（「程序目录不是 git 仓库：/app」/
+# 「未找到核心仓目录」）不是故障，而是**设计上的不可用** —— 镜像里的 /app 是
+# `COPY` 出来的构建产物，没有 `.git`，python:slim 基座里也没有 git 二进制；
+# 而 `core_root()` 的候选目录刻意不含 `/app` 自身（见该函数注释）。
+#
+# 在容器里做 `git restore` 有两重危害：① 必然失败并留下半截状态；
+# ② 即使失败也会先尝试 `git fetch`（联网 + 阻塞事件循环几十秒）。
+# 所以这里把「容器」这个事实显式建模成一个**独立的不可用原因**，
+# 让界面显示「部署形态不支持」，而不是含糊的「找不到 / 不是仓库」——
+# 后者会让人以为配错了路径，从而反复折腾一个本来就不该存在的目录。
+CONTAINER_UPDATE_MSG = (
+    "容器部署不支持在线更新：镜像内的 /app 是构建产物（无 .git，基座镜像也没有 git 二进制），"
+    "且 core_root() 的候选目录刻意不含 /app。"
+    "请在构建机完成更新：重新构建镜像 → 传输 → docker load → 重建容器。"
+)
+#: 部署形态开关：``container`` / ``docker`` / ``podman`` 强制判为容器，
+#: ``host`` 强制判为裸机（用于把镜像当裸机环境跑的罕见场景）。
+DEPLOY_MODE_ENV = "AI_MEMORY_DEPLOY_MODE"
+
+
+def _in_container() -> bool:
+    """是否运行在容器里。显式环境变量优先，其次看两个公认的运行时痕迹。"""
+    flag = (os.environ.get(DEPLOY_MODE_ENV) or "").strip().lower()
+    if flag:
+        return flag in ("container", "docker", "podman")
+    if Path("/.dockerenv").exists():
+        return True
+    try:
+        text = Path("/proc/1/cgroup").read_text(errors="ignore")
+    except OSError:
+        return False
+    return any(t in text for t in ("docker", "kubepods", "containerd"))
+
+
+def update_unsupported() -> str:
+    """当前部署形态是否从根上不支持在线更新；是则返回原因，否则返回空串。"""
+    return CONTAINER_UPDATE_MSG if _in_container() else ""
 
 
 def _git(args: list[str], cwd: Path, timeout: float = UPDATE_TIMEOUT) -> tuple[int, str]:
@@ -926,6 +1137,13 @@ def update_check(root: Path | None = None,
     """联网检查：``git fetch`` → 比对白名单 → 给出可执行性判断。**只读不写盘**。"""
     spec = tuple(paths) if paths else UPDATE_PATHS
     root = root or update_root()
+    unsup = update_unsupported()
+    if unsup:
+        # 容器里连 status 都不必算：不管 git 在不在，结论都是「不可更新」。
+        return {"target": key, "root": str(root), "available": False,
+                "unsupported": True, "is_repo": False, "checked": True,
+                "ok": False, "fetched": False, "error": unsup,
+                "whitelist": list(spec), "tracked": [], "untracked": [], "dirty": []}
     state = update_status(root, spec, key)
     if not state["is_repo"]:
         return {**state, "ok": False, "fetched": False,
@@ -997,6 +1215,9 @@ def update_apply(root: Path | None = None,
     """执行**单个目标**的更新：备份 → 按白名单 restore → 记录元数据（进程内互斥）。"""
     spec = tuple(paths) if paths else UPDATE_PATHS
     root = root or update_root()
+    unsup = update_unsupported()
+    if unsup:
+        return {"ok": False, "unsupported": True, "target": key, "error": unsup}
     if not _UPDATE_LOCK.acquire(blocking=False):
         return {"ok": False, "error": "已有一次更新正在执行，请稍后再试。"}
     try:
@@ -1182,11 +1403,25 @@ async def _json_body(request: Request) -> dict:
     return data
 
 
+def _client_ip(request: Request) -> str:
+    """限流用的来源标识。
+
+    **只认 TCP 对端，不认 ``X-Forwarded-For``**：这个控制台前面没有反向代理
+    （8811 直连），而 XFF 是客户端可以任意伪造的 —— 采信它等于给攻击者一个
+    「每试一次换个 IP」的开关，限流当场失效。将来真上了反代，应改成
+    「只信任来自反代地址的 XFF」，而不是无条件读。
+    """
+    return request.client.host if request.client else "?"
+
+
 class WebConsole:
     """把配置与处理器收在一起，便于测试注入 stub。"""
 
     def __init__(self, cfg: dict | None = None):
         self.cfg = cfg or config()
+        # 登录失败限流器：进程内单例（控制台是单进程）。5 次失败锁 5 分钟。
+        # 口令可以短到人能记住的程度，没有这条就等于把爆破成本降到「跑一晚上」。
+        self._limiter = web_auth.LoginLimiter(max_fails=5, window=300.0, lock_for=300.0)
 
     # -------- 只读接口 --------
     async def health(self, request: Request) -> Response:
@@ -1339,6 +1574,13 @@ class WebConsole:
         tool = str(body.get("tool") or "").strip()
         if not tool:
             return _err(400, "缺少 tool 字段。")
+        # 工具级权限：viewer 只能碰只读工具组。
+        # 分组用现成的 TOOL_GROUPS 表（唯一事实源），未登记的工具按最严处理 ——
+        # 新工具不会因为「忘了登记」而对只读账号意外敞开。
+        role = getattr(request.state, "auth_role", "") or ""
+        if role and not web_store.role_allows_tool(role, _TOOL_GROUP_OF.get(tool)):
+            grp = _TOOL_GROUP_OF.get(tool) or "未归类"
+            return _err(403, f"角色 {role} 无权调用 {tool}（属于「{grp}」组）。")
         arguments = body.get("arguments")
         if arguments is None:
             arguments = {}
@@ -1377,9 +1619,18 @@ class WebConsole:
         online = raw not in ("0", "false", "no", "off")
 
         targets: list[dict] = []
+        # 容器部署：两个目标一律「形态不支持」，且不触网（fetch 会在容器里白等几十秒）。
+        unsup = update_unsupported()
         for key in keys:
             base = {"target": key, "target_name": UPDATE_TARGET_NAMES[key]}
             root, paths, err = update_target(key)
+            if unsup:
+                targets.append({**base, "root": str(root or ""), "available": False,
+                                "unsupported": True, "is_repo": False,
+                                "checked": False, "ok": False, "fetched": False,
+                                "error": unsup, "whitelist": list(paths),
+                                "tracked": [], "untracked": [], "dirty": []})
+                continue
             if root is None:
                 targets.append({**base, "root": "", "available": False,
                                 "is_repo": False, "checked": False, "ok": False,
@@ -1433,6 +1684,354 @@ class WebConsole:
             return _err(500, f"重启失败：{type(e).__name__}: {e}")
         return JSONResponse(data, status_code=200 if data.get("ok") else 409)
 
+    # -------- 登录与会话（2026-10-21，方案 A） --------
+    async def login(self, request: Request) -> Response:
+        """账号密码 → 下发 ``HttpOnly`` 会话 Cookie。
+
+        两点刻意的设计：
+          * **用户名错与口令错返回同一句话**，且两者都用恒定时间比较、都真正跑一次
+            scrypt（用位与 ``&`` 而非短路 ``and``）—— 否则时间差与文案差会把
+            「这个用户名存不存在」暴露给枚举。
+          * **失败次数不告诉调用方还剩几次**：那等于免费送一个爆破进度条。
+        """
+        cfg = self.cfg
+        if not cfg["login_enabled"]:
+            return _err(400, "未启用账号登录：请设置 AI_MEMORY_WEB_USER 与口令。")
+        ip = _client_ip(request)
+        left = self._limiter.blocked_for(ip)
+        if left:
+            return _err(429, f"尝试过于频繁，请 {left} 秒后再试。", retry_after=left)
+        try:
+            body = await _json_body(request)
+        except WebConfigError as e:
+            return _err(400, str(e))
+        user = str(body.get("username") or "").strip()
+        password = str(body.get("password") or "")
+        # 校验交给用户表：它内部对「用户不存在」也跑一次 scrypt（陪跑哈希），
+        # 所以时间差与文案差都不会泄露「这个用户名存不存在」。
+        rec = cfg["users"].verify(user, password)
+        if not rec:
+            left = self._limiter.fail(ip)
+            msg = "用户名或口令不正确。"
+            if left:
+                msg += f" 已连续失败，请 {left} 秒后再试。"
+            return _err(401, msg, locked_for=left or 0)
+        self._limiter.reset(ip)
+        ttl = int(cfg["session_ttl"])
+        # role 与 epoch 都签进 Cookie：role 省掉每请求查表，epoch 是「单点吊销」的钩子。
+        value = web_auth.make_session(rec["name"], cfg["session_key"], ttl=ttl,
+                                      role=rec.get("role", "viewer"),
+                                      epoch=rec.get("epoch", ""))
+        resp = JSONResponse({"ok": True, "user": rec["name"],
+                             "role": rec.get("role", "viewer"),
+                             "mode": "session", "expires_in": ttl})
+        resp.set_cookie(
+            web_auth.COOKIE_NAME, value, max_age=ttl, path="/",
+            httponly=True,                 # JS 读不到 ⇒ XSS 偷不走
+            samesite="lax",                # 跨站 POST 不带 ⇒ 挡住大部分 CSRF
+            secure=bool(cfg["cookie_secure"]),
+        )
+        return resp
+
+    async def logout(self, request: Request) -> Response:
+        """清除会话 Cookie。
+
+        **不校验登录态**：登出必须永远成功。若要求先认证，那么「会话已过期但
+        页面还挂着」时用户点登出会收到 401，比登不出去更让人困惑。
+        """
+        resp = JSONResponse({"ok": True})
+        resp.delete_cookie(web_auth.COOKIE_NAME, path="/")
+        return resp
+
+    async def session(self, request: Request) -> Response:
+        """当前认证状态。前端启动时先问这一句，决定弹登录框还是直接进界面。"""
+        cfg = self.cfg
+        mode, user = "none", ""
+        supplied = ""
+        raw = request.headers.get("Authorization", "")
+        if raw.lower().startswith("bearer "):
+            supplied = raw[7:].strip()
+        if not supplied:
+            supplied = request.headers.get("X-Auth-Token", "").strip()
+        role = ""
+        if supplied:
+            hit = cfg["tokens"].verify(supplied)
+            if hit:
+                mode, user, role = "token", str(hit.get("owner") or ""), str(hit.get("role") or "")
+        # ⚠️ 这里必须是 ``mode == "none"`` 而不能写 ``not mode``：
+        # mode 的初值是字符串 "none"（真值），``not mode`` 恒为 False，
+        # 于是会话分支整段不会执行 —— 表现是「登录成功但立刻问状态又说没登录」。
+        if mode == "none" and cfg["session_key"]:
+            sess = web_auth.read_session(
+                request.cookies.get(web_auth.COOKIE_NAME, ""), cfg["session_key"])
+            if sess:
+                # 会话有效不等于**用户**仍然有效：可能已被禁用、改口令或删号。
+                # epoch 比对就是这一步（旧版 Cookie 没有 e 字段 ⇒ 这里必然落空，
+                # 于是升级后要求重新登录一次，是刻意的）。
+                live = cfg["users"].session_valid(
+                    str(sess.get("u") or ""), str(sess.get("e") or ""))
+                if live:
+                    mode, user, role = "session", live["name"], live["role"]
+        need = bool(cfg["auth_enabled"] or cfg["login_enabled"])
+        return JSONResponse({
+            "ok": mode != "none",
+            "auth_required": need and mode == "none",
+            "mode": mode,
+            "user": user,
+            "role": role,
+            "can_manage": role == "admin",
+            "multi_user": bool(cfg["multi_user"]),
+            "login_enabled": bool(cfg["login_enabled"]),
+            "session_ttl": int(cfg["session_ttl"]),
+        })
+
+    # -------- 管理面：用户与令牌（2026-10-22）----------------------------
+    #
+    # 权限模型：admin 能管人管令牌；operator 能调全部工具但不能管人；
+    # viewer 只能调只读工具组。单令牌时代「登录了就全通」的假设在这里结束。
+    #
+    # 一个刻意的细节：**本地无鉴权模式（回环 + 既无 token 又无账号）视为 admin**。
+    # 那种形态本来就是「谁打开谁全通」，若这里再要求 role 反而会让本地调试
+    # 完全无法管理 —— 安全增益为零（能打开界面的人本来就能调工具），
+    # 却把可用性打掉。
+
+    def _is_open_mode(self) -> bool:
+        cfg = self.cfg
+        return not (cfg["auth_enabled"] or cfg["login_enabled"])
+
+    def _need_admin(self, request: Request) -> Response | None:
+        if self._is_open_mode():
+            return None
+        role = getattr(request.state, "auth_role", "") or ""
+        if role != "admin":
+            return _err(403, "需要管理员权限：当前账号是 {}".format(role or "未知角色"))
+        return None
+
+    def _actor(self, request: Request) -> str:
+        return getattr(request.state, "auth_user", "") or ""
+
+    async def password_post(self, request: Request) -> Response:
+        """自己改自己的口令。改完 epoch 轮换 ⇒ 所有旧会话失效，需要重新登录。"""
+        if self._is_open_mode():
+            return _err(400, "未启用账号系统：本地无鉴权模式没有口令可改。")
+        user = self._actor(request)
+        if not user:
+            return _err(400, "当前是令牌通道，没有账号口令可改。")
+        try:
+            body = await _json_body(request)
+        except WebConfigError as e:
+            return _err(400, str(e))
+        old = str(body.get("old_password") or "")
+        new = str(body.get("new_password") or "")
+        if not self.cfg["users"].verify(user, old):
+            return _err(401, "原口令不正确。")
+        try:
+            self.cfg["users"].update(user, password=new)
+        except web_store.StoreError as e:
+            return _err(400, str(e))
+        resp = JSONResponse({"ok": True, "relogin": True})
+        resp.delete_cookie(web_auth.COOKIE_NAME, path="/")
+        return resp
+
+    async def users_get(self, request: Request) -> Response:
+        if (bad := self._need_admin(request)) is not None:
+            return bad
+        return JSONResponse({"ok": True, "users": self.cfg["users"].list(),
+                             "roles": list(web_store.ROLE_TOOLS.keys())})
+
+    async def users_post(self, request: Request) -> Response:
+        if (bad := self._need_admin(request)) is not None:
+            return bad
+        try:
+            body = await _json_body(request)
+        except WebConfigError as e:
+            return _err(400, str(e))
+        try:
+            rec = self.cfg["users"].create(
+                name=str(body.get("name") or ""),
+                password=str(body.get("password") or ""),
+                role=str(body.get("role") or "viewer"))
+        except web_store.StoreError as e:
+            return _err(400, str(e))
+        logger.info("用户已创建：%s（role=%s，操作人=%s）",
+                    rec["name"], rec["role"], self._actor(request) or "open-mode")
+        return JSONResponse({"ok": True, "user": rec})
+
+    async def user_patch(self, request: Request) -> Response:
+        if (bad := self._need_admin(request)) is not None:
+            return bad
+        name = str(request.path_params.get("name") or "")
+        try:
+            body = await _json_body(request)
+        except WebConfigError as e:
+            return _err(400, str(e))
+        try:
+            rec = self.cfg["users"].update(
+                name,
+                password=(str(body["password"]) if body.get("password") else None),
+                role=(str(body["role"]) if body.get("role") else None),
+                enabled=(bool(body["enabled"]) if "enabled" in body else None))
+        except web_store.StoreError as e:
+            return _err(400, str(e))
+        logger.info("用户已修改：%s（操作人=%s）", name, self._actor(request) or "open-mode")
+        return JSONResponse({"ok": True, "user": rec})
+
+    async def user_delete(self, request: Request) -> Response:
+        if (bad := self._need_admin(request)) is not None:
+            return bad
+        name = str(request.path_params.get("name") or "")
+        try:
+            self.cfg["users"].delete(name)
+        except web_store.StoreError as e:
+            return _err(400, str(e))
+        # 连带吊销他的令牌：删号却留着令牌等于「删了个寂寞」。
+        for t in self.cfg["tokens"].list(owner=name):
+            try:
+                self.cfg["tokens"].revoke(t["id"])
+            except web_store.StoreError:
+                pass
+        logger.info("用户已删除：%s（操作人=%s）", name, self._actor(request) or "open-mode")
+        return JSONResponse({"ok": True})
+
+    async def tokens_get(self, request: Request) -> Response:
+        """管理员看全部，其他人只看自己的。"""
+        if self._is_open_mode():
+            return JSONResponse({"ok": True, "tokens": self.cfg["tokens"].list(),
+                                 "self_only": False})
+        role = getattr(request.state, "auth_role", "") or ""
+        user = self._actor(request)
+        rows = self.cfg["tokens"].list() if role == "admin" else self.cfg["tokens"].list(owner=user)
+        return JSONResponse({"ok": True, "tokens": rows,
+                             "self_only": role != "admin",
+                             "max_expires": 365 * 86400})
+
+    async def tokens_post(self, request: Request) -> Response:
+        """建令牌。**明文只在这个响应里出现一次**，之后表里只有 sha256。"""
+        if self._is_open_mode():
+            pass                                     # 本地模式不限
+        else:
+            role = getattr(request.state, "auth_role", "") or ""
+            if role not in ("admin", "operator"):
+                return _err(403, "只读账号不能创建令牌。")
+        try:
+            body = await _json_body(request)
+        except WebConfigError as e:
+            return _err(400, str(e))
+
+        actor = self._actor(request) or "local"
+        actor_role = getattr(request.state, "auth_role", "") or "admin"
+        want_role = str(body.get("role") or "operator")
+        # 不能签出比自己更高的权限：operator 不能造 admin 令牌。
+        if (web_store.ROLE_RANK.get(want_role, 0)
+                > web_store.ROLE_RANK.get(actor_role, 0) and not self._is_open_mode()):
+            return _err(403, f"不能创建权限高于自己的令牌（{want_role} > {actor_role}）。")
+        expires_in = body.get("expires_in")
+        try:
+            plain, rec = self.cfg["tokens"].create(
+                name=str(body.get("name") or ""),
+                owner=actor,
+                role=want_role,
+                expires_in=(int(expires_in) if expires_in not in (None, "", 0) else None),
+                max_uses=int(body.get("max_uses") or 0))
+        except (web_store.StoreError, TypeError, ValueError) as e:
+            return _err(400, str(e))
+        logger.warning("令牌已签发：%s（owner=%s，role=%s，次数=%s，操作人=%s）",
+                       rec["name"], rec["owner"], rec["role"],
+                       rec["max_uses"] or "不限", actor)
+        return JSONResponse({"ok": True, "token": plain, "record": rec,
+                             "note": "这串明文只显示这一次，关闭后无法再取回；表里只存 sha256。"})
+
+    async def token_delete(self, request: Request) -> Response:
+        tid = str(request.path_params.get("tid") or "")
+        actor = self._actor(request)
+        role = getattr(request.state, "auth_role", "") or "admin"
+        try:
+            self.cfg["tokens"].revoke(tid, owner=(None if role == "admin" else actor))
+        except web_store.StoreError as e:
+            return _err(400, str(e))
+        logger.warning("令牌已吊销：%s（操作人=%s）", tid, actor or "open-mode")
+        return JSONResponse({"ok": True})
+
+    async def internal_verify(self, request: Request) -> Response:
+        """给 nginx ``auth_request`` 用：校验令牌 → 204，否则 401。
+
+        凭据是容器间的 ``X-Internal-Key``，不是用户会话 —— 网关手里没有 Cookie。
+        未配置该密钥时返回 **404**（功能关闭），而不是 401：这样「没启用」和
+        「密钥错」在日志里能分开，排查时不用猜。
+        """
+        cfg = self.cfg
+        key = cfg.get("internal_key") or ""
+        if not key:
+            return Response(status_code=404)
+        got = request.headers.get("X-Internal-Key", "")
+        if not got or not hmac.compare_digest(got, key):
+            return Response(status_code=401)
+        raw = request.headers.get("Authorization", "")
+        supplied = raw[7:].strip() if raw.lower().startswith("bearer ") else ""
+        hit = cfg["tokens"].verify(supplied) if supplied else None
+        if not hit:
+            return Response(status_code=401)
+        # header 值只能是 latin-1：中文令牌名直接塞会抛 UnicodeEncodeError。
+        q = quote
+        return Response(status_code=204, headers={
+            "X-Token-Owner": q(str(hit.get("owner") or ""), safe=""),
+            "X-Token-Name": q(str(hit.get("name") or ""), safe=""),
+            "X-Token-Role": q(str(hit.get("role") or ""), safe=""),
+        })
+
+    # -------- MCP 反代（2026-10-22，v1.7.0）-----------------------------
+    async def mcp_proxy(self, request: Request) -> Response:
+        """把 ``/mcp`` 流式转发到上游 MCP 端点。
+
+        为什么必须**流式**：MCP Streamable HTTP 的 POST 可能直接回
+        ``text/event-stream``（进度/通知），GET 则是一条长活的 SSE 通道。
+        任何「先读完整个 body 再回包」的写法都会把 SSE 变成「等服务器关闭才
+        吐第一帧」，客户端表现为**连接成功却永远收不到消息** —— 这是最难从
+        日志里看出来的一类故障，所以这里一律 stream。
+
+        为什么每个请求新建一个 ``httpx.AsyncClient``：流的存活期与请求同寿，
+        共享 client 就得在「最后一个流结束」时关闭它，生命周期管理比省下的
+        那点连接复用更贵；上游在回环，建连成本可忽略。
+
+        鉴权已经在 ``AuthMiddleware`` 里做完（``/mcp`` 与 ``/api/*`` 同一口径），
+        这里只负责转发；本控制台自己的凭据（Authorization / Cookie）**不往上游带**。
+        """
+        target = resolve_mcp(self.cfg)
+        # 我们自己认的 ?token= 不往上游带：它不该多传一跳。
+        params = [(k, v) for k, v in request.query_params.multi_items()
+                  if k != "token"]
+        url = target
+        if params:
+            url += ("&" if "?" in target else "?") + urlencode(params)
+
+        headers = {k: v for k, v in request.headers.items()
+                   if k.lower() not in _PROXY_DROP_REQ}
+        body = await request.body()
+
+        client = httpx.AsyncClient(timeout=None, follow_redirects=False)
+        upstream = client.build_request(request.method, url,
+                                        headers=headers, content=body)
+        try:
+            resp = await client.send(upstream, stream=True)
+        except httpx.HTTPError as e:
+            await client.aclose()
+            logger.warning("MCP 反代失败：%s %s -> %s（%s: %s）",
+                           request.method, target, url, type(e).__name__, e)
+            return _err(502, f"MCP 上游不可达：{type(e).__name__}: {e}")
+
+        out_headers = {k: v for k, v in resp.headers.items()
+                       if k.lower() not in _PROXY_DROP_RESP}
+
+        async def _close() -> None:
+            try:
+                await resp.aclose()
+            finally:
+                await client.aclose()
+
+        return StreamingResponse(resp.aiter_raw(), status_code=resp.status_code,
+                                 headers=out_headers,
+                                 background=BackgroundTask(_close))
+
     # -------- 静态页面 --------
     async def index(self, request: Request) -> Response:
         return FileResponse(self.cfg["static"] / "index.html",
@@ -1440,29 +2039,92 @@ class WebConsole:
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
-    """``/api/*`` 的 token 校验（静态资源不校验：里面没有秘密）。"""
+    """``/api/*`` 的鉴权：Bearer 令牌 **或** 登录会话 Cookie，任一有效即放行。
 
-    def __init__(self, app, token: str, header: str = "Authorization"):
+    两条通道并存是刻意的：
+      · **令牌走 header**，给脚本、curl、MCP 客户端用 —— 无状态、不依赖 Cookie；
+      · **会话走 Cookie**，给浏览器用 —— ``HttpOnly``，页面 JS 读不到，XSS 也偷不走
+        （这正是它比「把 token 放 sessionStorage」强的地方）。
+
+    ``/api/login``、``/api/logout``、``/api/session`` 不校验：前两个是登录入口本身，
+    第三个要能在**未登录时**回答「现在什么状态、该不该弹登录框」。
+
+    静态资源始终不校验（里面没有秘密）。任何人能打开界面，但未登录时只看得到
+    登录框 —— 数据一律在 ``/api/*`` 后面。
+    """
+
+#: 免鉴权的 API 路径。**精确匹配**而非前缀匹配 —— 否则 `/api/sessionXXX`
+#: 这类路径会白拿一张免死金牌。
+    PUBLIC = ("/api/login", "/api/logout", "/api/session")
+
+    def __init__(self, app, cfg: dict, header: str = "Authorization"):
         super().__init__(app)
-        self.token = token
+        self.cfg = cfg
         self.header = header
+
+    def _bearer(self, request: Request) -> str:
+        """兼容旧调用点：令牌的三个来源统一由模块级 ``token_from_request`` 决定。"""
+        return token_from_request(request)
 
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
-        if not path.startswith("/api/"):
+        # 内部端点（网关回调）不在 /api/ 前缀下，由处理器自己验 X-Internal-Key。
+        # 必须在这里直接放行，否则网关永远过不了鉴权 —— 它手里没有用户 Cookie。
+        if path == INTERNAL_VERIFY_PATH:
+            return await call_next(request)
+        # 2026-10-22：``/mcp`` 反代与 ``/api/*`` 同一口径 —— 它会把全部工具
+        # 暴露给调用方，宽松度不能比 API 更高。注意本中间件只在「有 token 或
+        # 开了账号登录」时才被挂上；本机回环无鉴权形态压根没有这一层。
+        if not (path.startswith("/api/") or path.rstrip("/") == MCP_PROXY_PATH):
             return await call_next(request)
         if request.method == "OPTIONS":
             return Response(status_code=204)
-        supplied = ""
-        raw = request.headers.get(self.header, "")
-        if raw.lower().startswith("bearer "):
-            supplied = raw[7:].strip()
-        if not supplied:
-            supplied = request.headers.get("X-Auth-Token", "").strip()
-        if not supplied or not hmac.compare_digest(supplied, self.token):
-            return _err(401, "未授权：请在页面上填入访问令牌。",
+        if path.rstrip("/") in self.PUBLIC:
+            return await call_next(request)
+
+        via, user, role = "", "", ""
+        supplied = self._bearer(request)
+        # 两条通道都走**恒定时间比较**：令牌在 TokenStore 里用 compare_digest 逐个比，
+        # 会话靠签名校验（read_session 内部同样是 compare_digest）。
+        if supplied:
+            hit = self.cfg["tokens"].verify(supplied)
+            if hit:
+                via = "token"
+                user = str(hit.get("owner") or "")
+                role = str(hit.get("role") or "viewer")
+        if not via and self.cfg["session_key"]:
+            sess = web_auth.read_session(
+                request.cookies.get(web_auth.COOKIE_NAME, ""), self.cfg["session_key"])
+            if sess:
+                live = self.cfg["users"].session_valid(
+                    str(sess.get("u") or ""), str(sess.get("e") or ""))
+                if live:
+                    via = "session"
+                    user = live["name"]
+                    role = live["role"]
+        if not via:
+            return _err(401, "未授权：请登录，或在请求头里带上访问令牌。",
                         auth_required=True)
+        request.state.auth_via = via
+        request.state.auth_user = user
+        request.state.auth_role = role
         return await call_next(request)
+
+
+class _NoCacheStatic(StaticFiles):
+    """静态资源强制回源校验。
+
+    `StaticFiles` 默认只发 ETag / Last-Modified，**不发 Cache-Control** ——
+    浏览器于是对 /assets 走「启发式缓存」，改了 js/css 后仍可能拿旧文件，
+    界面上看起来就是「新功能怎么没有？」（2026-10-20 主人踩过一次）。
+    这里统一补 `no-cache`：语义是「可以存，但每次必须回来验一下」——
+    没改就是 304（照样快），改了立刻生效，不牺牲任何性能。
+    """
+
+    async def get_response(self, path, scope):
+        resp = await super().get_response(path, scope)
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
 
 
 def create_app(cfg: dict | None = None) -> Starlette:
@@ -1470,6 +2132,10 @@ def create_app(cfg: dict | None = None) -> Starlette:
     console = WebConsole(cfg)
 
     routes = [
+        # 认证面（2026-10-21）：这三个在 AuthMiddleware 里免鉴权
+        Route("/api/session", console.session, methods=["GET"]),
+        Route("/api/login", console.login, methods=["POST"]),
+        Route("/api/logout", console.logout, methods=["POST"]),
         Route("/api/health", console.health, methods=["GET"]),
         Route("/api/tools", console.tools, methods=["GET"]),
         Route("/api/overview", console.overview, methods=["GET"]),
@@ -1483,7 +2149,23 @@ def create_app(cfg: dict | None = None) -> Starlette:
         Route("/api/update", console.update_get, methods=["GET"]),
         Route("/api/update", console.update_post, methods=["POST"]),
         Route("/api/update/restart", console.restart, methods=["POST"]),
-        Mount("/assets", app=StaticFiles(directory=str(cfg["static"])), name="assets"),
+        # 管理面（2026-10-22）：用户与令牌。
+        # 注意 /api/password 是「改自己的」，其余都要 admin。
+        Route("/api/password", console.password_post, methods=["POST"]),
+        Route("/api/users", console.users_get, methods=["GET"]),
+        Route("/api/users", console.users_post, methods=["POST"]),
+        Route("/api/users/{name}", console.user_patch, methods=["PATCH"]),
+        Route("/api/users/{name}", console.user_delete, methods=["DELETE"]),
+        Route("/api/tokens", console.tokens_get, methods=["GET"]),
+        Route("/api/tokens", console.tokens_post, methods=["POST"]),
+        Route("/api/tokens/{tid}", console.token_delete, methods=["DELETE"]),
+        # 网关回调（不在 /api/ 前缀，鉴权中间件直接放行，处理器自己验内部密钥）
+        Route(INTERNAL_VERIFY_PATH, console.internal_verify, methods=["GET"]),
+        # MCP 反代（2026-10-22）：**必须**排在最末那条 catch-all 之前，
+        # 否则 /mcp 会被前端 index.html 吃掉，表现为「MCP 客户端收到的是一坨 HTML」。
+        Route(MCP_PROXY_PATH, console.mcp_proxy,
+              methods=["GET", "POST", "DELETE", "OPTIONS"]),
+        Mount("/assets", app=_NoCacheStatic(directory=str(cfg["static"])), name="assets"),
         Route("/", console.index),
         Route("/{path:path}", console.index),      # 前端用 hash 路由，任何路径都回 index
     ]
@@ -1493,8 +2175,11 @@ def create_app(cfg: dict | None = None) -> Starlette:
         from starlette.middleware.trustedhost import TrustedHostMiddleware
         middleware.append(Middleware(TrustedHostMiddleware,
                                      allowed_hosts=cfg["allowed_hosts"]))
-    if cfg["auth_enabled"]:
-        middleware.append(Middleware(AuthMiddleware, token=cfg["token"]))
+    # 只要「配了 token」**或**「开了账号登录」，就必须挂鉴权中间件 ——
+    # 早期版本只看 token，导致「只开登录、不配 token」时中间件根本不装配，
+    # 会话 Cookie 也就没人校验（等于全放行）。
+    if cfg["auth_enabled"] or cfg["login_enabled"]:
+        middleware.append(Middleware(AuthMiddleware, cfg=cfg))
 
     return Starlette(routes=routes, middleware=middleware, debug=False)
 

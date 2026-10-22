@@ -6,7 +6,7 @@ import { loadThresholds } from "../features/settings.js";
 /* ======================================================================
  * 7. hash 路由
  * ==================================================================== */
-var PAGES = ["dashboard", "console", "library", "settings"];
+var PAGES = ["dashboard", "console", "library", "access", "settings"];
 function readHash() {
   var m = (location.hash || "").replace(/^#\/?/, "").split("?")[0];
   return PAGES.indexOf(m) >= 0 ? m : "dashboard";

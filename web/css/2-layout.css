@@ -22,8 +22,9 @@
   flex-direction: column;
   gap: 4px;
   padding: 16px 10px calc(16px + env(safe-area-inset-bottom));
-  background: var(--surface);
-  border-right: 1px solid var(--border);
+  /* 材质（半透明底 / 模糊 / 边界折射 / 右侧镜面边）已整体移交
+     3-components.css §18「侧栏液态玻璃」，这里只管几何。
+     放在 3-* 是因为它晚于 2-* 加载，且材质带运行期附加的 url(#lg-panel)。 */
   transition:
     transform var(--t) var(--ease),
     width var(--t) var(--ease);
@@ -133,10 +134,25 @@
   transform: scale(0.985);
 }
 
-.nav-item.active {
+/* 选中态两种来源，外观同一套（2026-10-20 主人令「这个 nav-item active 也跟随」）：
+ *   · .active    —— 真正的当前页，由路由决定，常态就在
+ *   · .lens-hit  —— 透镜滑到哪一项就挂到哪一项（core/lens.js 的命中检测），
+ *                   手一离开轨道立刻摘掉，于是「选中态」跟手走。
+ * 写成同一条选择器而不是抄一份：将来改选中配色只改这一处，
+ * 两边绝不会跑偏（同 .nav-ind 与 .cfg-ind 共用定义的做法）。 */
+.nav-item.active,
+.nav-item.lens-hit {
   background: var(--accent-soft);
   color: var(--text);
   border-color: color-mix(in srgb, var(--accent) 34%, transparent);
+}
+
+/* 手停在别的项上时，把**填充**从当前页让出去，只留 accent 边框：
+ * 于是口径变成「填充 = 手在哪、边框 + 白色滑块 = 你在哪一页」，
+ * 任一时刻只有一块填充，不会看成「两个都选中」。手一离开（.has-hit 摘掉）
+ * 当前页的填充立刻回来。 */
+.sidebar.has-hit .nav-item.active:not(.lens-hit) {
+  background: transparent;
 }
 
 /* 导航指示器：一个滑块在条目之间插值移动（2026-10-15 C 档交互动效）。

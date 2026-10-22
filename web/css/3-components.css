@@ -788,3 +788,478 @@
   align-items: center;
   gap: 7px;
 }
+
+/* ============================================================================
+ * 16. 日夜主题开关（WPF 控件 ToggleButtonStyles.xaml 矢量 1:1 移植，2026-10-20）
+ *
+ * 全部造型都在 components/ThemeSwitch.js 的内联 SVG 里（路径、坐标、渐变逐条
+ * 抄自 XAML），本段只负责**外壳**：缩放、收窄、裁切、聚焦环。
+ *
+ *   · 逻辑尺寸恒为 100×40，整体用 --tsw-s 缩放 —— 所有数值都能与 XAML 对照；
+ *   · 收窄是原控件的行为，不是我们发明的：未悬停时 frameBorder 宽 42（夜间 41）
+ *     且夜间 secondGrid.Margin = -59,0,0,0。这里用 width + left 复刻同一效果；
+ *   · .tsw-wrap 固定为**展开后**的宽度并右对齐 —— 否则一收窄再展开，胶囊会向
+ *     右长出去顶穿顶栏内边距，把右边元素挤走；
+ *   · 裁切交给 .tsw-box 的 border-radius，SVG 自己 overflow:visible，
+ *     这样护角描边（画在 -2..102 的画框外）才能露出四个角的弧段。
+ * ========================================================================== */
+.tsw-wrap {
+  --tsw-s: 0.72;
+  flex: 0 0 auto;
+  display: inline-flex;
+  justify-content: flex-end;
+  width: calc(100px * var(--tsw-s));
+  height: calc(40px * var(--tsw-s));
+}
+
+.tsw {
+  position: relative;
+  width: calc(42px * var(--tsw-s));
+  height: 100%;
+  padding: 0;
+  margin: 0;
+  border: 0;
+  background: none;
+  cursor: pointer;
+  /* 🔴 必须写死 20*s，不能写 var(--r-pill)：胶囊圆角 999px 在收窄到 30px 宽时
+     会被钳成 15px，过渡中间态就不是原控件的形状了。 */
+  border-radius: calc(20px * var(--tsw-s));
+  overflow: hidden;
+  /* 0.5s → 0.62s、ease-in-out → expo（2026-10-22）：原值在观感上「抽得太急」，
+     与 GSAP 切换（滑块 1.5s）的节奏差 3 倍，是「收纳和切换打架」的一半来源。
+     expo 起步快、尾段长，收窄时尾部有个自然的收势。 */
+  transition: width 0.62s var(--ease-expo);
+  -webkit-tap-highlight-color: transparent;
+}
+
+.tsw:hover,
+.tsw:focus-visible {
+  width: 100%;
+}
+
+.tsw:focus-visible {
+  outline: 2px solid var(--c-accent, #6aa9ff);
+  outline-offset: 2px;
+}
+
+.tsw-box {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100px;
+  height: 40px;
+  border-radius: 20px;
+  overflow: hidden;
+  transform: scale(var(--tsw-s));
+  /* 🔴 原点必须是 0 0。用 0 50%（绕中线缩放）会让 40 高的内容缩成 28.8 后
+     仍以「未缩放的 20」为中线 ⇒ 画出来整体比容器低 (40-28.8)/2 = 5.6px，
+     在顶栏里就是「感觉他有点歪」。实测：主轴中心 31 / 按钮中心 30.5 /
+     内容中心 36.1。改成 0 0 后缩放盒正好等于容器盒，中心回到 30.5。 */
+  transform-origin: 0 0;
+  transition: left 0.62s var(--ease-expo);
+}
+
+/* 夜间收窄必须把内容整体左移 59px：收窄窗口只有 30px 宽，而夜间滑块在 X=63，
+   不移的话那一小块里只有空天空，月亮完全在窗口外，看起来像「开关坏了」。
+   59 = 63(滑块位) - 4(左侧留白)，正对应 CheckedReduceSize 的 Margin=-59。 */
+.tsw.night .tsw-box {
+  left: calc(-59px * var(--tsw-s));
+}
+
+/* 悬停/聚焦 → 回到 0 并展开成完整天空（原控件 MouseOver → RestoreSize）。
+   ⚠️ 这条必须写在 .tsw.night .tsw-box 之后：特异性相同（各 3 个类），
+      靠源码顺序决定胜负。 */
+.tsw:hover .tsw-box,
+.tsw:focus-visible .tsw-box {
+  left: 0;
+}
+
+/* ----------------------------------------------------------------------------
+ * 门控串行（2026-10-22，方案 A）
+ *
+ * 症状：收窄（收纳）与点击切换同时起跑会打架 —— 月亮被切成一半再滑出来，
+ *       连点两次时错位叠加。
+ *
+ * 根因（不是「谁太快」）：两条时钟抢同一个视觉结果。
+ *   · 收窄 = CSS 过渡（width / left，0.62s）；
+ *   · 切换 = GSAP timeline（滑块 0→1.5s，云、星尾巴到 3.6s）；
+ *   · 而 `.tsw.night .tsw-box { left: -59s }` 是**类切换即生效**的终态值，
+ *     不看 GSAP 播到第几帧 ⇒ 窗口先左移 42.5px，滑块还在半路，
+ *     收窄后那 30.24px 窗口里只剩空天空。
+ *
+ * 解法：把并行窗口期归零。timeline 播放期间（JS 在 ThemeSwitch.lock() 里挂
+ * `data-anim="1"`，滑块落定 1.7s 后再延 350ms 摘掉）窗口锁定为「全展开」并
+ * 禁用过渡，先演完，再收窄。
+ *
+ * 🔴 为什么是 `[data-anim]` 而不是 `.animating` 类：这个 button 的 :class 由
+ *    Vue 管（`class="tsw" :class="{night: night}"`），watch(pre-flush) 加完类、
+ *    紧接着的 patch 会把整个 class 属性覆写回去，手动类被静默抹掉（实测：add
+ *    调用 1 次，60ms 后 classList 里已经没有它）。data- 属性不被 diff，才留得住。
+ *
+ * ⚠️ 这三条选择器的特异性都 ≥ 上面所有规则（各带 2–3 个类级），
+ *    所以不需要 !important；顺序放最后只是双保险。
+ * -------------------------------------------------------------------------- */
+.tsw[data-anim="1"],
+.tsw[data-anim="1"]:hover,
+.tsw[data-anim="1"]:focus-visible {
+  width: 100%;
+  transition: none;
+}
+
+.tsw[data-anim="1"] .tsw-box,
+.tsw[data-anim="1"]:hover .tsw-box,
+.tsw[data-anim="1"]:focus-visible .tsw-box {
+  left: 0;
+  transition: none;
+}
+
+.tsw-svg {
+  display: block;
+  width: 100px;
+  height: 40px;
+  /* 护角描边画在 -2..102，必须放出来；裁切由上层的 border-radius 完成 */
+  overflow: visible;
+  -webkit-user-select: none;
+  user-select: none;
+  pointer-events: none;
+}
+
+/* 减弱动效：GSAP 侧已经在 apply() 里判 reduced()，这里再兜一层 CSS 过渡
+   （收窄/展开那段 width、left 仍由 CSS 驱动）。 */
+@media (prefers-reduced-motion: reduce) {
+  .tsw,
+  .tsw-box {
+    transition: none !important;
+  }
+}
+
+/* ============================================================================
+ * 17. 命令面板（2026-10-20）
+ *
+ * 原本这里还有一块「液态玻璃快捷 Dock」。2026-10-20 主人定：Dock 撤掉，
+ * 液态玻璃改给侧栏用（见 §18）。Dock 的 3 个动作没有丢：
+ *   · 命令面板 / 刷新全部 / 复制端点 —— 前两个在面板里本来就有，
+ *     复制端点这次补进了面板的动作表，Ctrl/⌘+K 一样能到。
+ * 所以下面只剩面板本身的样式。
+ * ========================================================================== */
+/* ---- 命令面板 ---- */
+.pal-mask {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-modal);
+  background: var(--mask);
+  backdrop-filter: blur(3px);
+  -webkit-backdrop-filter: blur(3px);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 13vh 16px 16px;
+}
+
+.pal {
+  width: 100%;
+  max-width: 560px;
+  max-height: min(62vh, 520px);
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-3);
+  overflow: hidden;
+}
+
+.pal-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.pal-lead {
+  display: grid;
+  place-items: center;
+  color: var(--text-faint);
+}
+
+.pal-lead svg {
+  width: 16px;
+  height: 16px;
+}
+
+.pal-input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: none;
+  outline: none;
+  font-size: 14.5px;
+}
+
+.pal-esc {
+  flex: 0 0 auto;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-faint);
+  border: 1px solid var(--border);
+  border-radius: var(--r-xs);
+  padding: 1px 5px;
+}
+
+.pal-list {
+  overflow-y: auto;
+  padding: 6px;
+}
+
+.pal-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  background: none;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  text-align: left;
+  font-size: 13.5px;
+  color: var(--text-dim);
+}
+
+.pal-item.on {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+.pal-ico {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+}
+
+.pal-ico svg {
+  width: 16px;
+  height: 16px;
+}
+
+.pal-label {
+  font-weight: 560;
+  white-space: nowrap;
+}
+
+.pal-sub {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-faint);
+}
+
+.pal-g {
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  color: var(--text-faint);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-xs);
+  padding: 0 5px;
+}
+
+.pal-empty {
+  padding: 26px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--text-faint);
+}
+
+.pal-foot {
+  display: flex;
+  gap: 14px;
+  padding: 8px 14px;
+  border-top: 1px solid var(--border-soft);
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+/* ============================================================================
+ * 18. 侧栏液态玻璃（2026-10-20，主人选 A 档：轨道原地不动，只换材质）
+ *
+ * 材质口径见 core/lg.js 顶部。这里只解决三件事：
+ *
+ *   ① 让玻璃「有东西可折」。侧栏背后原本是纯色 --bg，折射没有对比度 ——
+ *      所以加一层 .rail-glass-bg（.sidebar 的兄弟、z-index 更低）打一道
+ *      柔光。它只占 --sidebar-w 那一列，不会污染内容区；抽屉态宽度为 0
+ *      自动消失。
+ *   ② 玻璃本体：半透明 + 模糊 +（JS 追加的）边界折射。
+ *      🔴 CSS 里**不许**写 url(#lg-panel)：滤镜缺失时整条 backdrop-filter
+ *         会被判无效 ⇒ 整块侧栏不可见（见 lg.js 约束 3）。这里只写兜底。
+ *   ③ 镜面边：右侧 1px 高光 + 内侧顶部一道细亮边 + 靠边的一点暗角，
+ *      这是「玻璃」与「半透明色块」的分界，缺了就不像玻璃。
+ *
+ * 为什么 A 档不做光标跟随透镜：轨道只有 64px 宽，透镜在里面没有位移空间，
+ * 且主人选的是「只换材质」。要透镜得走 B/C 档（骨架要动）。
+ * ========================================================================== */
+.rail-glass-bg {
+  position: fixed;
+  inset: 0 auto 0 0;
+  width: var(--sidebar-w);
+  z-index: calc(var(--z-drawer) - 1);
+  pointer-events: none;
+  overflow: hidden;
+  /* 白天是「上亮下暗」的冷光，夜里是「上白下无色」的月光；两者都只调
+     --text，不改色相 —— 这套 UI 是单色系，突然冒出一块彩色光晕会很跳。 */
+  background:
+    radial-gradient(
+      150% 30% at 50% 0%,
+      color-mix(in srgb, var(--text) 18%, transparent),
+      transparent 74%
+    ),
+    radial-gradient(
+      110% 22% at 50% 100%,
+      color-mix(in srgb, var(--text) 8%, transparent),
+      transparent 76%
+    ),
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--text) 7%, transparent) 0%,
+      transparent 36%
+    );
+  filter: blur(20px);
+}
+
+.sidebar {
+  /* ⚠️ 透明度不能太高：这套 token 里 --bg 与 --surface 本身就几乎同色
+     （暗 #0b0c0d / #101112，浅 #f6f7f8 / #ffffff），底越不透明、玻璃越
+     等于不存在。42% 是实测出来的平衡点 —— 再低图标对比度就不够了。 */
+  background: color-mix(in srgb, var(--surface) 42%, transparent);
+  border-right: 0;
+  /* 兜底（无 JS / 非 Chromium）：磨砂玻璃。JS 装好滤镜后会整体覆盖成
+     "saturate(150%) blur(16px) brightness(1.04) url(#lg-panel)"。 */
+  backdrop-filter: saturate(135%) blur(18px) brightness(1.02);
+  -webkit-backdrop-filter: saturate(135%) blur(18px) brightness(1.02);
+  /* 玻璃与内容之间的分离靠**外侧**阴影。⚠️ 别写成 inset：暗色主题下
+     --text 接近白色，inset 阴影会在右侧糊出一条 9px 宽的亮带（实测过，
+     看起来像「选中态边框」，一点不像玻璃）。 */
+  box-shadow: 10px 0 22px -18px rgba(0, 0, 0, 0.55);
+}
+
+/* 镜面边：贴在内容之上、不吃事件。只留两道高光，不再叠内阴影。 */
+.sidebar::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  border-right: 1px solid color-mix(in srgb, var(--text) 16%, transparent);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 9%, transparent);
+}
+
+/* 抽屉态（≤899）：侧栏滑到内容上，此时才真有内容从玻璃底下过 —— 玻璃保留，
+   光晕层去掉了也没意义（宽度为 0）。抽屉本来带 shadow-3，玻璃边上再加一层
+   硬阴影会显脏，故在窄屏把 ::after 的暗角收掉，只留 1px 高光线。 */
+@media (max-width: 899px) {
+  .sidebar {
+    /* 抽屉是全站唯一「内容真的从玻璃底下过」的场景，底可以放得更透让折射
+       有活干；桌面轨道反过来要更实，否则 64px 窄条上什么都看不出。 */
+    background: color-mix(in srgb, var(--surface) 64%, transparent);
+  }
+
+  .sidebar::after {
+    box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 10%, transparent);
+  }
+}
+
+/* ----------------------------------------------------------------------------
+ * 18b. 悬停跟随透镜（2026-10-20）
+ *
+ * 主人两条修正后的定稿：
+ *   · 「悬停跟随呢？」      → 玻璃片跟着手在轨道上滑（几何/手感见 core/lens.js）；
+ *   · 「玻璃大小要贴合 active」→ 尺寸**不是写死的**，由 lens.js 从 `.nav-item` 量出来，
+ *     与条目 1:1 等大、圆角同为 `--r-sm`，正好压住那一格。这里只管长相。
+ *
+ * 🔴 两条不能动的约束：
+ *   1. 不许写 url(#lg-lens)（约束 3）：滤镜由 JS 在装好后追加，静态 CSS 只留兜底霜化，
+ *      否则滤镜缺失时整条 backdrop-filter 失效 ⇒ 玻璃彻底不可见。
+ *   2. 不许写 will-change：带 backdrop-filter 的元素被提升成独立合成层后，Chromium
+ *      部分 GPU 路径会采到空 backdrop ⇒ 只剩一层底色，看起来就是「透镜没出现」
+ *      （headless + --disable-gpu 复现不出来，真机才看得到）。transform/opacity
+ *      本来就是合成器属性，不加提示也不掉帧。
+ *
+ * 为什么底色是**透明**、边圈用 accent：玻璃与条目等大后，两者的 border-box 完全重合，
+ * 玻璃若自带底色就会盖掉条目自己的 accent 填充，自带灰色边圈又会盖掉 accent 边框 ——
+ * 「选中态」就没了。所以底色交给条目，玻璃只贡献折射 + 一圈 accent 描边 + 顶光。
+ *
+ * 为什么分成「外层 .rail-lens + 内层 .rail-lens-glass」两层：
+ *   Chromium **不把 feDisplacementMap 的输出裁到 border-radius**，位移后的像素会溢出到
+ *   圆角外面那四小块矩形区域，而那里的 backdrop 是空的 ⇒ 四角糊出黑三角（玻璃与条目
+ *   等大后右下角特别明显）。所以圆角 + overflow:hidden 放外层，把内层的滤镜输出裁干净。
+ * -------------------------------------------------------------------------- */
+.rail-lens {
+  position: fixed;
+  left: 0;
+  top: 0;
+  z-index: calc(var(--z-drawer) + 1);
+  pointer-events: none;
+  opacity: 0;
+  border-radius: var(--r-sm); /* 与 .nav-item 同一个圆角，且 = lg.js LENS.r */
+  overflow: hidden; /* 见上：裁掉位移输出溢出的四角 */
+  /* 只留外侧一点点抬起感，不做内阴影（内阴影会盖住条目的 accent 底） */
+  box-shadow: 0 6px 16px -11px rgba(0, 0, 0, 0.55);
+}
+
+/* 内层：真玻璃。尺寸由 core/lens.js 从条目量出来内联写入（与位移贴图 1:1）。
+   兜底（非 Chromium / 脚本未跑到）退回毛玻璃。 */
+.rail-lens-glass {
+  position: absolute;
+  left: 0;
+  top: 0;
+  backdrop-filter: blur(8px) saturate(1.4);
+  -webkit-backdrop-filter: blur(8px) saturate(1.4);
+  background: transparent;
+}
+
+/* 边圈 + 顶光：玻璃的「厚度」全靠这两笔。
+   ⚠️ 高光用白色而不是 --text —— 高光永远是光源色，浅色主题下 --text 接近黑色，
+      用它画高光会变成一口黑井。 */
+.rail-lens::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  /* 边圈跟着 accent 走：条目自己的边框被玻璃压住，这层把它「续」回来 */
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  background: radial-gradient(
+    58% 46% at 27% 16%,
+    rgba(255, 255, 255, 0.16),
+    rgba(255, 255, 255, 0.03) 54%,
+    transparent 74%
+  );
+}
+
+/* 浅色主题：白玻璃压浅底，高光要更强、边圈要更深，否则整块玻璃看不见。 */
+html[data-theme="light"] .rail-lens {
+  box-shadow: 0 6px 16px -11px rgba(16, 18, 20, 0.3);
+}
+
+html[data-theme="light"] .rail-lens::after {
+  border-color: color-mix(in srgb, var(--accent) 26%, transparent);
+  background: radial-gradient(
+    58% 46% at 27% 16%,
+    rgba(255, 255, 255, 0.8),
+    rgba(255, 255, 255, 0.22) 54%,
+    transparent 76%
+  );
+}
+
+/* 窄屏抽屉（≤899）**不要**透镜：那时侧栏是 272px 宽、图标旁边就是文字，
+   一颗 38px 的玻璃珠跟在光标后面会浮在「调试台」这类标签正中，像贴了块脏东西
+   （实测截图确认）。而且抽屉背后是真实内容，面板那层折射本来就够了；
+   触屏也没有「悬停跟随」这回事。CSS 直接关掉，JS 照常算位置也无所谓。 */
+@media (max-width: 899px) {
+  .rail-lens {
+    display: none;
+  }
+}

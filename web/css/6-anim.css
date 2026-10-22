@@ -1299,3 +1299,87 @@
     transition-delay: 0ms !important;
   }
 }
+
+/* ============================================================================
+ * 主题过渡（2026-10-22 · 主人选的方案 A「圆形扩散」）
+ *
+ * 由 core/theme.js 驱动，两条路径**互斥**：
+ *   · 支持 View Transitions ⇒ 下面 ::view-transition-* 的圆形揭示；
+ *   · 不支持 ⇒ JS 给 <html> 挂 .theming，走末尾那组三层错峰（460ms 后摘类）。
+ *
+ * 🔴 三条边界：
+ *   1) 严禁把降级段写成 `html.theming *` —— 全站每个元素都跑过渡会让 hover /
+ *      焦点响应一起变慢（实测 120ms → 280ms），backdrop-filter 层还会掉帧；
+ *   2) 只过渡颜色与 box-shadow，不碰 transform / width 这类几何属性；
+ *   3) .theming 段不用 @supports 包 —— 支持 VT 的浏览器永远不会挂这个类，
+ *      所以两套不会同时生效（叠加会让新快照抓到中间色，比生硬更脏）。
+ * ========================================================================== */
+
+@supports (view-transition-name: none) {
+  /* 关掉浏览器默认的整页交叉淡入：要的是「新主题从圆心长出来」，
+     旧主题在揭示完成前保持原样。 */
+  ::view-transition-old(root),
+  ::view-transition-new(root) {
+    animation: none;
+    mix-blend-mode: normal;
+  }
+
+  ::view-transition-old(root) {
+    z-index: 1;
+  }
+
+  /* z-index 2 + clip-path 扩张 = 新快照盖在旧快照上向外揭示。
+     半径由 theme.js 按「圆心到四角最远距离」算好写进 --vt-r。
+     0.55s / --ease-in-out（2026-10-22 第二轮）：与开关滑块首段 0.45s 同频、
+     缓动同族（power2.inOut ≈ cubic-bezier(.65,0,.35,1)）。一快一慢会让
+     「页面已换完、开关还在爬」，这就是不融洽的来源。 */
+  ::view-transition-new(root) {
+    z-index: 2;
+    animation: theme-reveal 0.55s var(--ease-in-out) both;
+  }
+
+  @keyframes theme-reveal {
+    from {
+      clip-path: circle(0px at var(--vt-x, 50%) var(--vt-y, 50%));
+    }
+    to {
+      clip-path: circle(
+        var(--vt-r, 150vmax) at var(--vt-x, 50%) var(--vt-y, 50%)
+      );
+    }
+  }
+}
+
+/* ---- 降级：三层错峰（仅当浏览器不支持 View Transitions）---- */
+html.theming .topbar,
+html.theming .sidebar,
+html.theming .statusbar,
+html.theming .main,
+html.theming .card,
+html.theming .ide-panel,
+html.theming .term-wrap {
+  transition:
+    background-color 0.28s var(--ease),
+    border-color 0.28s var(--ease),
+    box-shadow 0.28s var(--ease),
+    color 0.22s var(--ease);
+}
+
+html.theming .topbar {
+  transition-delay: 0ms;
+}
+
+html.theming .sidebar {
+  transition-delay: 60ms;
+}
+
+html.theming .statusbar {
+  transition-delay: 80ms;
+}
+
+html.theming .main,
+html.theming .card,
+html.theming .ide-panel,
+html.theming .term-wrap {
+  transition-delay: 140ms;
+}

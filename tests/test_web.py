@@ -283,6 +283,22 @@ check("D5 静态资源不校验 token（GET / ⇒ 200）", _r.status_code == 200
 _r = asyncio.run(_req(_cfg_auth, "OPTIONS", "/api/config"))
 check("D6 OPTIONS 预检 ⇒ 204", _r.status_code == 204, f"status={_r.status_code}")
 
+# D7~D9：v1.7.0 的两个新面 —— ?token= 第三通道 与 /mcp 反代的鉴权口径。
+_r = asyncio.run(_req(_cfg_auth, "GET", "/api/config?token=s3cret"))
+check("D7 ?token= 查询参数亦被接受 ⇒ 200", _r.status_code == 200,
+      f"status={_r.status_code}")
+
+_r = asyncio.run(_req(_cfg_auth, "POST", "/mcp"))
+check("D8 /mcp 无凭据 ⇒ 401（与 /api/* 同一口径）", _r.status_code == 401,
+      f"status={_r.status_code} body={_r.text[:120]}")
+
+# 鉴权通过后失败点必须落在「上游不可达」（502），而不是继续 401 ——
+# 这条能区分「门没开」与「门开了但屋里没人」，是反代最常被写错的一处。
+_dead = dict(_cfg_auth, mcp=f"http://127.0.0.1:{free_port()}/mcp")
+_r = asyncio.run(_req(_dead, "POST", "/mcp", {"Authorization": "Bearer s3cret"}))
+check("D9 /mcp 凭据正确但上游不可达 ⇒ 502（不再 401）", _r.status_code == 502,
+      f"status={_r.status_code} body={_r.text[:140]}")
+
 # =====================================================================
 section("E 写保护（AI_MEMORY_WEB_CONFIG_WRITE=0）")
 _cfg_ro = web_console.config()
@@ -687,6 +703,27 @@ try:
     st, txt = _http("/some/deep/hash/route")
     check("F7 未知路径回落 index.html（hash 路由）",
           st == 200 and 'id="app"' in txt, f"status={st}")
+
+    # F12：v1.7.0 的 /mcp 反代 —— 真上游、真 SSE。裸 HTTP 直发 initialize，
+    # 断言拿到 ai-memory 的 serverInfo。这是「MCP 客户端只填一个 URL 就能连上」
+    # 最低限度的真实证据：不 mock、不进程内直调（v3 的两条判死项都守住）。
+    _req_mcp = urllib.request.Request(
+        base + "/mcp", method="POST",
+        data=json.dumps({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                       "clientInfo": {"name": "test", "version": "1"}},
+        }).encode("utf-8"))
+    _req_mcp.add_header("Content-Type", "application/json")
+    _req_mcp.add_header("Accept", "application/json, text/event-stream")
+    try:
+        with urllib.request.urlopen(_req_mcp, timeout=60) as _r_m:
+            st_m, txt_m = _r_m.status, _r_m.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as _e_m:
+        st_m, txt_m = _e_m.code, _e_m.read().decode("utf-8", "replace")
+    check("F12 POST /mcp 经反代完成 MCP initialize（真上游 + SSE）",
+          st_m == 200 and '"protocolVersion"' in txt_m and "ai-memory" in txt_m,
+          f"status={st_m} body={txt_m[:200]}")
 
     st, txt = _http("/api/call", "POST", {"tool": "memory_stats", "arguments": {}})
     j = json.loads(txt) if st == 200 else {}

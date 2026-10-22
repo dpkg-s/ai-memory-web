@@ -33,6 +33,25 @@ var S = reactive({
   theme: document.documentElement.getAttribute("data-theme") || "dark",
   authRequired: false,
   tokenInput: "",
+  /* 账号登录（2026-10-21，方案 A）。弹框有两条通道：
+     password = 账号密码 → 服务端下发 HttpOnly Cookie（JS 读不到）
+     token    = 访问令牌 → 存 sessionStorage 并随 header 发（给脚本/临时排障用）
+     两者由服务端 /api/session 的 login_enabled 决定是否可切换。 */
+  authMode: "password",
+  loginEnabled: false,
+  loginUser: "",
+  loginPassword: "",
+  loginError: "",
+  loginBusy: false,
+  sessionUser: "",
+  authVia: "none",
+  /* 多用户（2026-10-22，控制台 v1.6.0）。服务端 /api/session 一次给全：
+     role = admin / operator / viewer；canManage 只对 admin 为真。
+     前端拿 role 只做**界面裁剪**（藏掉入口），真正的拦截在服务端 —— 
+     藏 UI 不是权限，只是别让人点进一个必然 403 的页面。 */
+  role: "",
+  canManage: false,
+  multiUser: false,
 
   about: { resolved: {}, app: {} },
   health: {
@@ -149,6 +168,10 @@ var S = reactive({
     onOk: null,
     danger: false,
   },
+  /* 命令面板（2026-10-20，玻璃 Dock 的第一个按钮 / Ctrl·Cmd+K 唤出）。
+     只存「开着吗 + 当前输入 + 高亮项」，候选项由 CommandPalette 现算 ——
+     候选项依赖 S.page / S.tools / S.theme，存快照必然会与它们脱节。 */
+  palette: { open: false, q: "", idx: 0 },
   toasts: [],
 });
 S.theme = applyTheme(S.themePref);

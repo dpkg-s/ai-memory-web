@@ -93,6 +93,7 @@
 .skel.line {
   height: 13px;
   margin-bottom: 9px;
+  margin: 5px;
 }
 
 .skel.line.w60 {

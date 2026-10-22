@@ -1040,3 +1040,305 @@ svg.trend {
 .cal-rows .ide-row-p {
   color: var(--text-faint);
 }
+
+/* ===========================================================================
+ * 19. 访问控制页 —— 方案 A「双栏工作台」（2026-10-22）
+ *
+ *   左栏（.ac-main）= 只读清单：账号表 / 令牌表（含一次性明文横幅、行内重置）
+ *   右栏（.ac-side）= 写操作：新建账号 / 签发令牌 / 我的账号（改口令）
+ *
+ *   为什么双栏而不是单列流：
+ *     ① 本页的心智模型是「读一张表 + 往表里写一条」，读写并置后全流程一屏完成，
+ *        不必像旧版那样从列表底部滚到独立的新建卡；
+ *     ② 「修改我的口令」属于身份管理，必须贴着页头身份标签，而不是被 Tab 隔开
+ *        甩在页面最底部（旧版最刺眼的信息错位）。
+ *
+ *   为什么不用抽屉（方案 B）：
+ *     一次性令牌明文横幅与抽屉叠加会被遮住，且抽屉需要焦点陷阱 / ESC / 遮罩 /
+ *     移动端全屏四件套，工作量翻倍而收益只是「列表更宽」。
+ *
+ *   窄屏：≤899px 整块塌成单列；右栏取消 sticky 下沉到清单之后（与 §18 同断点）。
+ * ========================================================================= */
+
+.ac-seg {
+  display: inline-flex;
+  gap: 2px;
+  padding: 3px;
+  margin-bottom: 14px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+}
+
+.ac-seg > button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 16px;
+  border: 0;
+  border-radius: var(--r-xs);
+  background: transparent;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 12.5px;
+  line-height: 1;
+  cursor: pointer;
+  transition:
+    color var(--t-fast) var(--ease),
+    background var(--t-fast) var(--ease);
+}
+
+.ac-seg > button:hover {
+  color: var(--text);
+  background: var(--surface-hi);
+}
+
+/* 选中态用主色反转（同 .btn-primary），不用淡色底 —— 窄栏里 3px 的淡底
+   对比度不足，一眼看不出当前在哪个 Tab。 */
+.ac-seg > button.on {
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+
+.ac-seg > button svg {
+  width: 13px;
+  height: 13px;
+}
+
+.ac-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(300px, 344px);
+  gap: 14px;
+  align-items: start;
+}
+
+/* 管理员单栏（2026-10-22 主人选型 A）：右栏「我的账号」只对 operator/viewer
+   存在（他们看不到账号清单，那张卡是唯一的改口令入口）。管理员把它收掉后，
+   若仍保留两列定义，第一列只会占 1fr、右侧空出 344px —— 所以这里显式改成
+   单列，让清单独占整宽（列表行的动作按钮也随之靠到最右，间距更舒展）。 */
+.ac-grid.ac-solo {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.ac-main,
+.ac-side,
+.ac-col {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+}
+
+/* .card 基础规则带 height:100%（为等高的网格卡片服务），在纵向 flex 里必须
+   退回 auto，否则每张卡都试图吃满容器高度。 */
+.ac-main > .card,
+.ac-col > .card,
+.ac-side > .card {
+  height: auto;
+}
+
+/* sticky 只挂在右栏容器上：内部卡片再叠 sticky 会互相抢定位上下文。 */
+.ac-side {
+  position: sticky;
+  top: calc(var(--topbar-h) + 18px);
+}
+
+@media (max-width: 1099px) {
+  .ac-grid {
+    grid-template-columns: minmax(0, 1fr) minmax(268px, 300px);
+  }
+}
+
+@media (max-width: 899px) {
+  .ac-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .ac-side {
+    position: static;
+  }
+}
+
+/* 工具条：左「账号 / 令牌」分段，右当前身份标签（2026-10-22 第二次收窄）。
+   历史：1.6.0 是「标题在左、身份在右」的 `.page-head`；随后标题被删（面包屑
+   已写着「ai-memory › 访问控制」）；现在身份标签也并进分段控件这一行 ——
+   它本来独占一整行只为放两个 chip，纵向白吃约 40px。
+   `.ac-seg` 自带 margin-bottom（它原是独立一行），并进工具条后由 .ac-bar 统一
+   管底部间距，故在这里归零，避免双份外边距。 */
+.ac-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+
+.ac-bar .ac-seg {
+  margin-bottom: 0;
+}
+
+.ac-who {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+@media (max-width: 899px) {
+  /* 单列后右对齐会甩到第二行最右边，改成左对齐跟着分段控件走。 */
+  .ac-who {
+    justify-content: flex-start;
+  }
+}
+
+/* ============================================================================
+ * 20. 访问控制页 · 行内展开与连接串（2026-10-22，v1.7.0）
+ *
+ * 背景：本页第二轮改版把「新建账号 / 签发令牌」从右栏常驻表单改成清单底部
+ * 的一条「+」行，行按钮「改密码」也在该行正下方展开 —— 目的是让**操作出现
+ * 在触点旁边**，而不是出现在卡片尾部（旧版点第 1 行、输入框在第 8 行下面）。
+ *
+ * 三段结构：
+ *   .ac-add        虚线「+」行，语义是「往这张表里加一条」
+ *   .ac-inline     展开后的表单块，独占一行、不参与 .list-item 的横向布局
+ *   .ac-conn / .ac-conn-row  令牌连接串：URL 要能整段选中，长串必须 break-all
+ * ========================================================================== */
+
+/* 行内按钮组：账号行有 4 个控件（角色下拉 + 改密码 + 禁用 + 删除），
+   窄栏里必须允许折行，否则会顶出卡片右边界。 */
+.ac-acts {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  row-gap: 6px;
+}
+
+/* 行内动作组里的角色下拉：.select 默认 width:100%（那是表单列语义），
+   在 flex 行里会独占一行，把 4 个控件挤成上下两排、行高一倍。这里收回自动
+   宽度，并对齐 .btn-sm 的 31px 高与 12.5px 字。 */
+.ac-acts .select {
+  width: auto;
+  flex: 0 0 auto;
+  min-height: 31px;
+  padding: 5px 8px;
+  font-size: 12.5px;
+}
+
+/* 「改密码」的激活态：按钮处于展开中，需要与其它 ghost 按钮区分开。 */
+.btn.on {
+  background: var(--surface-3);
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+  color: var(--text);
+}
+
+.ac-add {
+  width: 100%;
+  margin-top: 8px;
+  padding: 8px 10px;
+  background: transparent;
+  border: 1px dashed var(--border);
+  border-radius: var(--r-sm);
+  color: var(--text-dim);
+  font-size: 12.5px;
+  font-family: inherit;
+  cursor: pointer;
+  transition:
+    color var(--t-fast),
+    border-color var(--t-fast),
+    background var(--t-fast);
+}
+
+.ac-add:hover {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+  background: var(--surface-2);
+}
+
+.ac-inline {
+  margin-top: 8px;
+  padding: 10px 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ac-inline-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.ac-inline-head .hint {
+  margin: 0;
+  font-size: 12px;
+}
+
+.ac-inline-body {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* 输入框按等分伸缩：既不让 3 个字段挤成一坨，也不让长用户名撑破容器。 */
+.ac-inline-body .input,
+.ac-inline-body .select {
+  flex: 1 1 160px;
+  min-width: 0;
+}
+
+.ac-sub {
+  margin: 14px 0 6px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.ac-conn-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+
+.ac-conn-row .input {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+
+/* 连接串本体：整块可点即复制，所以给 copy 光标 + user-select: all，
+   并且必须 break-all —— 一枚 47 字符的令牌加主机名，不折行会横向溢出。 */
+.ac-conn {
+  margin-top: 8px;
+  padding: 8px 10px;
+  background: var(--surface-3);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-2);
+  word-break: break-all;
+  user-select: all;
+  cursor: copy;
+}
+
+.ac-conn:hover {
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+@media (max-width: 899px) {
+  /* 单列后行内表单不再受右栏挤压，输入框直接占满整行更好点。 */
+  .ac-acts {
+    justify-content: flex-start;
+  }
+
+  .ac-inline-body .input,
+  .ac-inline-body .select {
+    flex: 1 1 100%;
+  }
+}

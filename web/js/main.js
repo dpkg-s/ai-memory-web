@@ -1,8 +1,10 @@
 import { createApp } from "../vendor/vue.esm-browser.prod.js";
 import { AnimatedNumber } from "./components/AnimatedNumber.js";
+import { CommandPalette } from "./components/CommandPalette.js";
 import { DistributionBars } from "./components/DistributionBars.js";
 import { JsonTree } from "./components/JsonTree.js";
 import { MarkdownBox } from "./components/MarkdownBox.js";
+import { ThemeSwitch } from "./components/ThemeSwitch.js";
 import { XBanner } from "./components/XBanner.js";
 import { XCard } from "./components/XCard.js";
 import { XEmpty } from "./components/XEmpty.js";
@@ -22,6 +24,7 @@ import { browseLibrary, openNote, searchLibrary } from "./features/library.js";
 import { ConsolePage } from "./views/ConsolePage.js";
 import { Dashboard } from "./views/Dashboard.js";
 import { LibraryPage } from "./views/LibraryPage.js";
+import { AccessPage } from "./views/AccessPage.js";
 import { Root } from "./views/Root.js";
 import { SettingsPage } from "./views/SettingsPage.js";
 
@@ -65,9 +68,12 @@ Object.assign(app.config.globalProperties, {
   ["x-banner", XBanner],
   ["x-stat", XStat],
   ["x-list-item", XListItem],
+  ["theme-switch", ThemeSwitch],
+  ["command-palette", CommandPalette],
   ["dashboard", Dashboard],
   ["console-page", ConsolePage],
   ["library-page", LibraryPage],
+  ["access-page", AccessPage],
   ["settings-page", SettingsPage],
 ].forEach(function (c) {
   app.component(c[0], c[1]);

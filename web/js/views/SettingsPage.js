@@ -249,6 +249,10 @@ var SettingsPage = {
     },
     updKind: function (d) {
       if (!d) return "";
+      /* 2026-10-21：容器部署是「形态不支持」，不是故障。
+         原来 !available 一律判 err（红色），把「设计如此」渲染成报错，
+         越看越像配错了路径 —— 用 warn 表达「你知道就行，不用修」。 */
+      if (d.unsupported) return "warn";
       if (!d.available || d.error) return "err";
       if (!d.is_repo) return "";
       if (d.untracked && d.untracked.length) return "warn";
@@ -259,7 +263,9 @@ var SettingsPage = {
     },
     updText: function (d) {
       if (!d) return "未读取";
-      if (!d.available) return "未找到目录";
+      /* 「找不到目录」和「目录在但本形态不更新」是两件事，不能共用一句文案 ——
+         前者要人去查路径配置，后者什么都不用做。 */
+      if (!d.available) return d.unsupported ? "不支持在线更新" : "未找到目录";
       if (!d.is_repo) return "不是 git 仓库";
       if (d.untracked && d.untracked.length)
         return "有 " + d.untracked.length + " 个文件未入库";
@@ -528,12 +534,12 @@ var SettingsPage = {
 '        <x-pill :kind="updKind(d)">{{ updText(d) }}</x-pill>' +
 '      </template>' +
 '      <template #actions>' +
-'        <button class="btn btn-sm" :class="{loading:S.update.loading}" @click="checkTarget(d.target, false)">只读本地</button>' +
-'        <button class="btn btn-sm btn-primary" :class="{loading:S.update.loading}" @click="checkTarget(d.target, true)">检查更新</button>' +
+'        <button class="btn btn-sm" :class="{loading:S.update.loading}" :disabled="d.unsupported" @click="checkTarget(d.target, false)">只读本地</button>' +
+'        <button class="btn btn-sm btn-primary" :class="{loading:S.update.loading}" :disabled="d.unsupported" @click="checkTarget(d.target, true)">检查更新</button>' +
 '      </template>' +
 
 '      <x-banner kind="warn" icon="alert" v-if="!d.available">' +
-'        <div><b>未定位到该目标的程序目录</b>' +
+'        <div><b>{{ d.unsupported ? "当前部署形态不支持在线更新" : "未定位到该目标的程序目录" }}</b>' +
 '          <div class="small">{{ d.error }}</div>' +
 '        </div></x-banner>' +
 

@@ -140,12 +140,23 @@ body {
   height: 100%;
 }
 
-/* 内联 SVG 不带 width/height 会退化成 300×150 —— 必须给基准尺寸，再让各组件覆盖。 */
+/* 内联 SVG 不带 width/height 会退化成 300×150 —— 必须给基准尺寸，再让各组件覆盖。
+ *
+ * 🔴 display 必须是 block，不能是 inline-block（2026-10-20 主人反馈「图标都有点歪歪的」）。
+ *    原因：inline-block 的 SVG 会**参与行盒**，父级继承的 `line-height: 23.2px`
+ *    （body 的 1.6 × 14.5px）在图标上下各摊一半行距，而 inline-block 又是按
+ *    **基线**对齐的 —— 于是每个图标都被往下顶了 (行高 − 图标高) 量级的一段。
+ *    实测（headless Chromium，svg 盒中心 − 父盒中心）：
+ *      · .nav-icon  19×19 图标 19 → dy +4.00
+ *      · .cfg-icon  17×17 图标 17 → dy +3.50
+ *      · .tab       15×20 图标 15 → dy +2.00
+ *    改成 block 之后全部归零（图标盒 1:1 填满父盒，居中交给父级的 grid/flex）。
+ *    ⚠️ 不要改回 inline-block 去「让图标跟文字并排」：需要并排的地方一律用
+ *       flex/grid 容器（现在全站都是），行内基线对齐只会引入不可控的亚像素偏移。 */
 svg {
   width: 1em;
   height: 1em;
-  display: inline-block;
-  vertical-align: middle;
+  display: block;
 }
 
 .nav-icon svg {

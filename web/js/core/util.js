@@ -105,6 +105,64 @@ var ARG_ZH = {
   content: "正文",
   expected_version: "期望版本",
 };
+/* ======================================================================
+ * 数据值汉化表（2026-10-20）
+ *
+ * 与上面的 TOOL_ZH / ARG_ZH 分工不同：那两张表译的是**接口元数据**
+ * （工具名、参数名）；这里译的是**记忆条目自身的枚举值**——
+ * `mem_type` / `tier` / `confidence` / `scope` / `status`。
+ *
+ * 🔴 为什么必须分开放：这些值是 **frontmatter 里的真实数据**，MCP 侧、
+ *    其它 AI 客户端、乃至 memory_stats 的统计口径全靠它们对齐。
+ *    汉化**只发生在展示层**（`typeZh()` 等），写回、过滤、查重仍用原文，
+ *    任何情况下都不能让中文串流进 `memory_write` 的 `mem_type` 参数。
+ *
+ * 概览页「记忆类型」卡（Dashboard.typeRows）与记忆库右栏 NODE INFO
+ * （LibraryPage.nodeMeta）共用这一份表 —— 两处表述必须一致，否则同一个
+ * `project` 在一页叫「项目」、另一页叫「工程」，观感直接崩。
+ * ==================================================================== */
+var TYPE_ZH = {
+  fact: "事实",
+  preference: "偏好",
+  decision: "决策",
+  experience: "经验",
+  episodic: "情景",
+  project: "项目",
+  constraint: "约束",
+  workflow: "流程",
+  reference: "参考",
+  insight: "洞察",
+  todo: "待办",
+  note: "笔记",
+};
+var TIER_ZH = { hot: "活跃", warm: "常温", cold: "归档" };
+var CONF_ZH = { high: "高", medium: "中", low: "低" };
+var SCOPE_ZH = { global: "全局", project: "项目", temporary: "临时" };
+var STATUS_ZH = { active: "有效", archived: "已归档", stub: "存根" };
+
+/* 查表 → 中文；查不到就原样返回（服务端将来加新枚举时不会显示空白，
+   也不会把未知值误标成某个已知类型）。空值统一给空串，由调用方决定占位。 */
+function mapZh(table, v) {
+  if (v === null || v === undefined || v === "") return "";
+  var k = String(v);
+  return table[k] || k;
+}
+function typeZh(v) {
+  return mapZh(TYPE_ZH, v);
+}
+function tierZh(v) {
+  return mapZh(TIER_ZH, v);
+}
+function confZh(v) {
+  return mapZh(CONF_ZH, v);
+}
+function scopeZh(v) {
+  return mapZh(SCOPE_ZH, v);
+}
+function statusZh(v) {
+  return mapZh(STATUS_ZH, v);
+}
+
 var KIND_ZH = {
   select: "单选",
   bool: "开关",
@@ -305,4 +363,4 @@ function parseSearch(text) {
   return items;
 }
 
-export { fmtNum, fmtBytes, relTime, TOOL_ZH, ARG_ZH, KIND_ZH, toolZhName, toolZhDesc, argZh, kindZh, dispWidth, cutWidth, shortDesc, tryJson, escapeHtml, mdReady, mdRender, grab, parseStats, sectionRows, parseSearch };
+export { fmtNum, fmtBytes, relTime, TOOL_ZH, ARG_ZH, KIND_ZH, TYPE_ZH, TIER_ZH, CONF_ZH, SCOPE_ZH, STATUS_ZH, mapZh, typeZh, tierZh, confZh, scopeZh, statusZh, toolZhName, toolZhDesc, argZh, kindZh, dispWidth, cutWidth, shortDesc, tryJson, escapeHtml, mdReady, mdRender, grab, parseStats, sectionRows, parseSearch };

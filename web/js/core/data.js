@@ -108,10 +108,8 @@ function loadRecentActivity(days) {
       if (e.status !== 401) toast("err", "加载更新日历失败", e.message);
     });
 }
-function boot() {
-  S.ready = true;
-  if (S.authRequired) return;
-  loadAbout().then(function () {
+function loadAll() {
+  return loadAbout().then(function () {
     loadHealth().then(function () {
       loadTools();
       loadOverview();
@@ -120,4 +118,36 @@ function boot() {
   });
 }
 
-export { loadAbout, loadHealth, loadTools, loadOverview, loadRecentActivity, RECENT_DAYS, boot };
+/* 启动：先问一句「我是谁」，再决定进界面还是弹登录框。
+   为什么要这一次额外往返：以前的路径是「先发业务请求，拿到 401 再弹框」，
+   于是界面先渲染一遍骨架、闪一下、再被弹框盖住；而且「没登录」与「刚被踢」
+   分不出来。/api/session 是免鉴权的，一次把三件事问清楚 —— 要不要登录、
+   开了哪种登录、现在是不是已经登录。 */
+function boot() {
+  S.ready = true;
+  return api
+    .session()
+    .then(function (s) {
+      S.loginEnabled = !!s.login_enabled;
+      S.authVia = s.mode || "none";
+      S.sessionUser = s.user || "";
+      S.role = s.role || "";
+      S.canManage = !!s.can_manage;
+      S.multiUser = !!s.multi_user;
+      if (s.auth_required) {
+        // 有账号登录就默认用密码框；没开登录则退回令牌框（旧行为）
+        S.authMode = s.login_enabled ? "password" : "token";
+        S.authRequired = true;
+        return null;      // 停在登录框，不预发业务请求（省掉一串必然的 401）
+      }
+      S.authRequired = false;
+      return loadAll();
+    })
+    .catch(function () {
+      /* 连 /api/session 都打不通（后端挂了 / 网络断）：退回旧路径，让业务请求
+         自己去触发 401 弹框 —— 总比把界面卡在空白上好。 */
+      return loadAll();
+    });
+}
+
+export { loadAbout, loadHealth, loadTools, loadOverview, loadRecentActivity, RECENT_DAYS, boot, loadAll };

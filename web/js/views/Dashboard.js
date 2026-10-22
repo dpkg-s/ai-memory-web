@@ -1,8 +1,9 @@
 import { computed, nextTick } from "../../vendor/vue.esm-browser.prod.js";
 import { RECENT_DAYS, loadTools } from "../core/data.js";
+import { breakpointFlip } from "../core/flip.js";
 import { go } from "../core/router.js";
 import { S } from "../core/store.js";
-import { sectionRows } from "../core/util.js";
+import { sectionRows, typeZh } from "../core/util.js";
 import { selectTool } from "../features/console.js";
 import { openNote } from "../features/library.js";
 
@@ -119,9 +120,18 @@ var Dashboard = {
       return (S.overview && S.overview.parsed.nums) || {};
     },
     typeRows: function () {
-      /* 降序渲染（见 byValueDesc）。段内 8 行全 > 0 ⇒ 排序只改顺序、不改行数，卡高不变。 */
+      /* 降序渲染（见 byValueDesc）。段内 8 行全 > 0 ⇒ 排序只改顺序、不改行数，卡高不变。
+         🆕 2026-10-20 主人令「记忆类型内容翻译」：`memory_stats` 回传的是英文枚举
+         （fact / preference / … / workflow），直接铺到条上就是中英混排的观感 ——
+         卡头写「记忆类型」、行里却念 fact。这里按 typeZh 表译成中文，
+         **原文仍挂在每行的 title 上**（数据值没变，只是不再当标签显示）；
+         未收录的新枚举自动回退原文，不会出现空行。 */
       return S.overview
-        ? byValueDesc(sectionRows(S.overview.parsed, "记忆类型分布"))
+        ? byValueDesc(sectionRows(S.overview.parsed, "记忆类型分布")).map(
+            function (r) {
+              return { label: typeZh(r.label), raw: r.label, value: r.value };
+            },
+          )
         : [];
     },
     confRows: function () {
@@ -369,6 +379,22 @@ var Dashboard = {
   },
   mounted: function () {
     if (this.act.total) this.calReset();
+    /* 断点跨越的布局 FLIP（2026-10-20，落地《GSAP 断点 Flip 施工手册》）。
+       目标 = 概览页三组会跨越断点换位的盒子：统计卡 / 分布卡组 / 右栏日历。
+       🔴 选择器必须只命中「断点前后同一批 DOM」：这三组都是 v-for / 静态节点，
+          不随断点增删；只有「骨架 ↔ 真卡」那一步是 v-if 换节点 ——
+          骨架态抓到 0 个目标，flip.js 会存 null 并退化成硬切，正是预期。
+       899 / 560 两个断点与 8-responsive.css 的 @media 逐字符一致。 */
+    this._flipOff = breakpointFlip(
+      ".grid.ov .grid.stats > *, .grid.ov .grid.two > *, .grid.ov > .ov-side",
+      ["(max-width: 899px)", "(max-width: 560px)"],
+    );
+  },
+  beforeUnmount: function () {
+    /* 组件卸载必须拆干净：sampler 的 interval、mq 监听、rAF、进行中的 tween
+       全在这里回收。漏一样就是一整套「切换到别的页面还在后台每 150ms 量 rect」。
+       （手册 §5-8 StrictMode 那条讲的就是这件事。） */
+    if (this._flipOff) this._flipOff();
   },
   methods: {
     /* 默认落点：先看今天；今天没更新就落到**最近有更新的一天**（keys 升序取末位），
