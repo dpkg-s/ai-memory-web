@@ -78,7 +78,8 @@ python -m http.server 8080 --directory web
 
 ## 下载什么
 
-每个 Release 页提供两个附件，各附同名 `.sha256`，可 `sha256sum -c` 校验：
+Release 提供控制台源码包与 Windows 安装器。v1.11.3 及更早版本尚无校验文件；下一次由新工作流发布的版本起，
+两个附件都会各自附同名 `.sha256`，可用 `sha256sum -c <文件名>.sha256` 校验：
 
 | 附件 | 用途 |
 | --- | --- |
