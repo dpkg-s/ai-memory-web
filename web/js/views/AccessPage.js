@@ -106,6 +106,62 @@ function usesZh(t) {
   return (t.uses || 0) + " / " + t.max_uses;
 }
 
+/* ---------------------------------------------------------------------------
+ * 访问日志的呈现（2026-10-27）
+ *
+ * 服务端只回结构化字段（kind / action / actor / target / t），中文一律在**前端**
+ * 映射：文案改动不该要求重启后端（Python 改动要重启，JS 保存即生效）。
+ * 映射表留兜底 —— 将来服务端多一个动作，界面上显示原始 action 而不是空白，
+ * 这比「静默丢一行」有用得多。
+ * ------------------------------------------------------------------------- */
+var AUDIT_ACTION_ZH = {
+  "login.ok": "登录",
+  "login.fail": "登录失败",
+  "logout": "登出",
+  "password.change": "修改口令",
+  "account.create": "创建账号",
+  "account.update": "修改账号",
+  "account.delete": "删除账号",
+  "token.issue": "签发令牌",
+  "token.revoke": "吊销令牌",
+  "config.write": "修改配置",
+  "config.thresholds": "修改阈值",
+  "tool.call": "调用工具",
+  "tool.denied": "调用被拒",
+  "mcp.connect": "MCP 接入",
+  "auth.denied": "鉴权拦截",
+  "audit.export": "导出日志",
+};
+
+/* 一条事件压成「谁 · 什么时候 · 干了什么」三段：
+   fact 段给人一眼认出动作，detail 段补充「哪个工具 / 什么角色 / 多久」。
+   2026-10-27 追加 ip：这是判断「同一个人 vs 同一枚令牌被两个人用」的关键旁证，
+   只放在 detail 里（服务端本来就有）等于白存 —— 界面上得看得见才算记录。 */
+function auditRow(e) {
+  var actor = String(e.actor || "").trim();
+  if (!actor || actor === "anonymous") actor = "匿名";
+  /* 令牌通道的主体是「哪枚令牌的 owner」+ 标记，否则同名的人与脚本会混成一列。 */
+  if (e.via === "token") actor += "（令牌）";
+  return {
+    id: (e.t || 0) + "-" + (e.action || "") + "-" + (e.target || ""),
+    kind: e.kind || "other",
+    actor: actor,
+    action: AUDIT_ACTION_ZH[e.action] || e.action || "—",
+    target: e.target || "",
+    detail: e.detail || "",
+    /* 回环地址单独标一下：它既可能是「本机直连」，也可能是 cloudflared
+       隧道没带 CF-Connecting-IP（服务端只信这个头）。混在公网 IP 里看是噪音。 */
+    ip: e.ip || "",
+    ipLocal: e.ip === "127.0.0.1" || e.ip === "::1" || e.ip === "::ffff:127.0.0.1",
+    time: fmtTs(e.t),
+    ok: e.ok !== false,
+    /* 类名在 JS 里拼好，模板里就只剩一个属性绑定 —— 在单引号字符串里再嵌
+       单引号（:'k-' + ...）既难读又极易被转义吃掉（2026-10-27 踩过）。 */
+    dot: "k-" + (e.kind || "other"),
+    bad: e.ok === false,
+  };
+}
+
 var AccessPage = {
   data: function () {
     return {
@@ -142,6 +198,17 @@ var AccessPage = {
       pwOpen: false,
       pw: { old: "", n1: "", n2: "" },
       pwBusy: false,
+      /* 访问日志（2026-10-27）：admin 专属，服务端 /api/audit 同步卡 admin。 */
+      auditEvents: [],
+      auditKinds: [],
+      auditKind: "",
+      auditTotal: 0,
+      auditBusy: false,
+      /* 首屏还没成功读过一次 ⇒ 显示骨架而不是「暂无记录」。两者长得像、
+         含义完全不同：一个是「在等」、一个是「真没有」。 */
+      auditLoaded: false,
+      /* 导出独立的忙标志：与「刷新」共用会让刷新按钮在导出时也转圈。 */
+      auditExporting: false,
     };
   },
   computed: {
@@ -263,6 +330,22 @@ var AccessPage = {
         return fmtTs(v);
       };
     },
+    /* 日志卡的副标题：条数 + 是否在筛。不用「共 N 条」这种话 —— 卡片里已有
+       筛选 chip，副标题只该回答「现在这一屏是多少」。 */
+    auditSub: function () {
+      if (this.auditBusy) return "读取中…";
+      if (!this.auditEvents.length) return this.auditKind ? "无匹配" : "暂无记录";
+      return this.auditEvents.length + " 条" +
+        (this.auditKind ? "（已筛）" : " / 库内 " + this.auditTotal);
+    },
+    /* 首屏骨架：只在「第一次读、还没结果」时出现。已有数据时再刷新不该把
+       列表换成骨架 —— 那会把正在看的那一行整页抽走，比转圈更烦人。 */
+    auditSkel: function () {
+      return this.auditBusy && !this.auditLoaded && !this.auditEvents.length;
+    },
+    auditRows: function () {
+      return (this.auditEvents || []).map(auditRow);
+    },
     expZh: function () {
       return function (t) {
         return expiresZh(t);
@@ -307,6 +390,132 @@ var AccessPage = {
     },
   },
   methods: {
+    /* 读访问日志。筛选切换也走这里 —— 服务端已支持 kind 过滤，
+       前端不再自己 filter 一遍（两处过滤迟早会不一致）。
+
+       `opts.silent`（2026-10-27）：静默轮询用。三条自我约束缺一条，这块就会
+       变成「每 8 秒闪一下」的东西：
+        1. **不置 auditBusy** ⇒ 不触发骨架、不给列表降透明度；
+        2. **用户已往下翻就整次跳过**（scrollTop > 4）—— 新事件插在顶部会把
+           正在读的那条顶走；
+        3. **失败不弹 toast**，否则后台每 8 秒一条错误能把屏幕糊满。 */
+    loadAudit: function (opts) {
+      var self = this;
+      var silent = !!(opts && opts.silent);
+      if (!self.isAdmin) {
+        self.auditEvents = [];
+        return;
+      }
+      if (silent) {
+        var box = self.$el && self.$el.querySelector
+          ? self.$el.querySelector(".audit-list")
+          : null;
+        if (box && box.scrollTop > 4) return;
+      } else {
+        self.auditBusy = true;
+      }
+      var q = { limit: 40 };
+      if (self.auditKind) q.kind = self.auditKind;
+      api
+        .audit(q)
+        .then(function (d) {
+          self.auditEvents = (d && d.events) || [];
+          self.auditKinds = (d && d.kinds) || [];
+          self.auditTotal = ((d && d.stats) || {}).total || 0;
+          self.auditLoaded = true;
+        })
+        .catch(function (e) {
+          if (!silent) toast("err", "读取访问日志失败", e.message || String(e));
+        })
+        .then(function () {
+          if (!silent) self.auditBusy = false;
+        });
+    },
+    /* ------------------------------------------------------------------
+     * 即时同步（2026-10-27 主人选型 C「先 A 再 B」的 A 档：轮询）
+     *
+     * 为什么先上轮询：这是纯前端改动，**保存即生效**；B 档（SSE）要后端新
+     * 端点 + 心跳 + 断线重连，非重启不可。先把「不用手点刷新」拿到手，
+     * B 档再来把延迟从 8 秒压到 1 秒内、并把这里降级为断线兜底。
+     *
+     * 8 秒的口径：审计日增几十条，8 秒足够「另开一个窗口改东西、回来就看见」；
+     * 再密就是拿请求换一个没人感知的差别。
+     * 切到别的标签页/最小化时**不发请求**（document.hidden）—— 后台轮询纯属
+     * 白烧电，回来时 visibilitychange 会立刻补一次。
+     * ------------------------------------------------------------------ */
+    startAuditWatch: function () {
+      var self = this;
+      self.stopAuditWatch();
+      self._auditTimer = setInterval(function () {
+        if (document.hidden) return;
+        if (!self.isAdmin) return;
+        self.loadAudit({ silent: true });
+      }, 8000);
+      /* 记在实例上而非 data：定时器 id 参与响应式毫无意义，只会让 Vue 追它。 */
+      self._auditVis = function () {
+        if (document.hidden || !self.isAdmin) return;
+        self.loadAudit({ silent: true });
+      };
+      document.addEventListener("visibilitychange", self._auditVis);
+    },
+    stopAuditWatch: function () {
+      if (this._auditTimer) {
+        clearInterval(this._auditTimer);
+        this._auditTimer = null;
+      }
+      if (this._auditVis) {
+        document.removeEventListener("visibilitychange", this._auditVis);
+        this._auditVis = null;
+      }
+    },
+    /* 导出（2026-10-27）：带当前筛选条件导**全量**，不是导出这一屏。
+       文件名带本地时间戳 —— 同一分钟导两次不该互相覆盖（浏览器默认会加
+       「(1)」，但那串括号在给别人发文件时很难看）。 */
+    exportAudit: function (fmt) {
+      var self = this;
+      if (self.auditExporting) return;
+      self.auditExporting = true;
+      var q = { format: fmt || "csv" };
+      if (self.auditKind) q.kind = self.auditKind;
+      api
+        .auditExport(q)
+        .then(function (blob) {
+          var d = new Date();
+          var p = function (n) {
+            return (n < 10 ? "0" : "") + n;
+          };
+          var stamp =
+            d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + "-" +
+            p(d.getHours()) + p(d.getMinutes());
+          var url = URL.createObjectURL(blob);
+          var a = document.createElement("a");
+          a.href = url;
+          a.download = "ai-memory-audit-" + stamp + "." + q.format;
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          /* 立刻 revoke 会让某些浏览器的下载拿到空文件；给 4 秒宽限。 */
+          setTimeout(function () {
+            URL.revokeObjectURL(url);
+          }, 4000);
+          toast("ok", "已导出", "整份日志（" + q.format.toUpperCase() + "）已开始下载");
+        })
+        .catch(function (e) {
+          toast("err", "导出失败", e.message || String(e));
+        })
+        .then(function () {
+          self.auditExporting = false;
+          /* 导出本身也进了审计流（服务端记 audit.export），顺手刷一次
+             让「我刚做的这件事」立刻出现在列表里 —— 否则用户会怀疑没记上。
+             走静默：这里只是补一条回读，不该让整列闪一下。 */
+          self.loadAudit({ silent: true });
+        });
+    },
+    setAuditKind: function (k) {
+      if (this.auditKind === k) return;
+      this.auditKind = k;
+      this.loadAudit();
+    },
     refresh: function () {
       var self = this;
       self.loading = true;
@@ -635,6 +844,15 @@ var AccessPage = {
   mounted: function () {
     this.baseUrl = location.origin;
     this.refresh();
+    this.loadAudit();
+    /* 轮询无条件启动，回调里再守 isAdmin —— 身份是异步到位的（见下方 watch
+       的注释），在这里判角色会永久判成 false。 */
+    this.startAuditWatch();
+  },
+  /* 切走本页必须拆定时器与 visibility 监听：hash 路由切页会销毁组件，
+     但 setInterval 不会自己停，留着就是「离开这一页还在后台打接口」。 */
+  beforeUnmount: function () {
+    this.stopAuditWatch();
   },
   template:
     '<div class="page">' +
@@ -661,7 +879,10 @@ var AccessPage = {
     "  </div>" +
 
     /* ---- 双栏骨架：左清单（含全部行内表单）/ 右身份 ---- */
-    '  <div class="ac-grid" :class="{\'ac-solo\': isAdmin}">' +
+    /* 双栏恒开（2026-10-27 主人选型 A）：右栏从「只对非管理员存在」改为
+       「管理员看访问日志、非管理员看我的账号」。原 ac-solo 单栏特例随之取消 ——
+       它的存在前提是「管理员右栏无可放」，现在不成立了。 */
+    '  <div class="ac-grid">' +
     '    <div class="ac-main">' +
 
     /* ===== 账号清单（仅管理员渲染）===== */
@@ -834,8 +1055,73 @@ var AccessPage = {
        身份又已经在工具条右侧标签里写着，留着它就是一张几乎空的卡。
        而 operator / viewer **看不到账号清单**（GET /api/users 是 admin 专属），
        行内「改密码」对他们根本不存在 ⇒ 这张卡是他们唯一的改口令入口，必须留。 */
-    '    <div class="ac-side" v-if="!isAdmin">' +
-    '      <x-card title="我的账号" :sub="myRoleZh">' +
+    /* ac-fill（2026-10-27 主人：「高也是顶满的」）：管理员右栏只有日志一张卡，
+       让它撑满可视区高度、列表内部滚动。非管理员的「我的账号」是一张短表单，
+       拉满整屏只会得到一大片空白，所以只对 isAdmin 挂这个类。 */
+    '    <div class="ac-side" :class="{\'ac-fill\': isAdmin}">' +
+    /* ===== 访问日志（仅管理员）=====
+       数据面是 audit.jsonl（append-only），接口 /api/audit 也只给 admin ——
+       与「账号」分段同一取向：权限不足时这一块**根本不存在**，而不是给一句
+       「你没权限」。 */
+    '      <x-card v-if="isAdmin" title="访问日志" :sub="auditSub">' +
+    "        <template #actions>" +
+    /* 导出与刷新并排：导出的是**当前筛选下的全量**，不是这一屏 40 条。
+       按钮用 CSV 作默认（绝大多数人要的是「丢进 Excel 看一眼」）；
+       JSON 走同一个接口的 format=json，留给脚本，不在 344px 的卡头再挤一个按钮。 */
+    '          <button class="btn btn-sm" @click="exportAudit(\'csv\')"' +
+    '                  :class="{loading:auditExporting}" title="导出当前筛选下的全部日志（CSV，Excel 可直接打开）">' +
+    "            导出</button>" +
+    '          <button class="btn btn-sm" @click="loadAudit" :class="{loading:auditBusy}">' +
+    "            刷新</button>" +
+    "        </template>" +
+    '        <div class="ac-audit-kinds" v-if="auditKinds.length">' +
+    '          <button class="ac-chip" :class="{on:!auditKind}" @click="setAuditKind(\'\')">' +
+    "            全部</button>" +
+    '          <button class="ac-chip" v-for="k in auditKinds" :key="k.key"' +
+    '                  :class="{on:auditKind===k.key}" @click="setAuditKind(k.key)">' +
+    "            {{ k.label }}</button>" +
+    "        </div>" +
+    /* 首屏骨架：6 行「圆点 + 两段线」，形状与真实条目一致 —— 用灰条而不是
+       转圈，是因为它同时告诉眼睛「这里将出现一列什么形状的东西」。
+       骨架行复用 .audit-item 的排布，高度对得上，替换时不跳。 */
+    '        <div class="audit-list audit-skel" v-if="auditSkel" aria-busy="true">' +
+    '          <div class="audit-item" v-for="i in 6" :key="i">' +
+    '            <span class="audit-dot skel-dot"></span>' +
+    '            <div class="audit-main">' +
+    '              <div class="skel line skel-l1"></div>' +
+    '              <div class="skel line w40"></div>' +
+    "            </div>" +
+    "          </div>" +
+    "        </div>" +
+    /* 已有数据时的刷新：整列降透明度 + 卡头按钮转圈。不换成骨架 ——
+       那会把用户正在看的那一行整页抽走。 */
+    '        <div class="audit-list" v-else-if="auditRows.length" :class="{stale:auditBusy}">' +
+    '          <div class="audit-item" v-for="e in auditRows" :key="e.id">' +
+    '            <span class="audit-dot" :class="e.dot" :data-bad="e.bad"></span>' +
+    '            <div class="audit-main">' +
+    '              <div class="audit-line"><b>{{ e.actor }}</b> {{ e.action }}' +
+    '                <code class="audit-target" v-if="e.target">{{ e.target }}</code></div>' +
+    '              <div class="audit-sub"><span>{{ e.time }}</span>' +
+    '                <span class="audit-ip" :class="{local:e.ipLocal}" v-if="e.ip"' +
+    '                      :title="e.ipLocal ? \'本机直连或隧道未带真实来源\' : \'来源 IP\'">' +
+    "                  · {{ e.ip }}</span>" +
+    '                <span v-if="e.detail"> · {{ e.detail }}</span></div>' +
+    "            </div>" +
+    "          </div>" +
+    "        </div>" +
+    '        <x-empty v-else-if="!auditBusy" icon="clock"' +
+    '                  :title="auditKind ? \'没有匹配记录\' : \'还没有记录\'"' +
+    '                  text="登录、令牌、配置与工具调用都会记在这里。"></x-empty>' +
+    /* 采集面边界（2026-10-27 主人要求写明，放在卡底而不是标题旁：
+       它是「读日志之前该知道的一条口径」，不是警告，不该抢视线）。
+       写清这一句是为了避免日后误判 —— 直连 8700 的调用**不会**出现在
+       这里，别把「没记录」当成「没发生」。 */
+    '        <div class="audit-foot">只统计经过本控制台的调用' +
+    "          （<code>/mcp</code> 反代与 <code>/api/*</code>）；客户端直连 MCP 端口" +
+    "          （默认 8700）的请求不在此列。每 8 秒静默同步一次。</div>" +
+    "      </x-card>" +
+    /* ===== 我的账号（仅非管理员，2026-10-22 主人选型 A 保留）===== */
+    '      <x-card v-if="!isAdmin" title="我的账号" :sub="myRoleZh">' +
     "        <template #actions>" +
     '          <button class="btn btn-sm" @click="pwOpen=!pwOpen">' +
     '            {{ pwOpen ? "收起" : "修改口令" }}</button>' +

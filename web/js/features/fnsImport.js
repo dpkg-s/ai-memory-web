@@ -11,7 +11,7 @@
  * -------------------------------------------------------------------- */
 var FNS_FIELD_LABEL = {
   server: "服务器地址",
-  account: "账号",
+  client_type: "客户端类型",
   vault: "Vault 名",
   token: "口令 / Token",
   exclude: "排除规则",
@@ -19,9 +19,12 @@ var FNS_FIELD_LABEL = {
 var FNS_IMPORT_ALIAS = {
   server: ["server", "api", "url", "baseurl", "base_url", "endpoint", "apiurl",
            "api_url", "address", "addr", "host", "origin", "domain"],
-  account: ["account", "user", "username", "userid", "login", "loginname",
-            "email", "mail", "client", "clientname", "client_name", "device",
-            "devicename", "device_name", "uid", "nickname"],
+  /* FNS 没有「账号」维度：这组别名收的是**客户端标识**（令牌的 c: 维度），
+     旧 JSON 里它叫 client / clientName / deviceName，新 JSON 里叫 client_type。 */
+  client_type: ["clienttype", "client", "clientname", "client_name",
+                "device", "devicename", "device_name", "account", "user",
+                "username", "userid", "login", "loginname", "email", "mail",
+                "uid", "nickname"],
   vault: ["vault", "vaultname", "vault_name", "bucket", "space", "spacename",
           "repo", "repository", "notebook", "collection"],
   token: ["token", "apitoken", "api_token", "accesstoken", "access_token",

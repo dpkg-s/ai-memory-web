@@ -99,7 +99,9 @@ _ENV_KEYS = ["AI_MEMORY_WEB_HOST", "AI_MEMORY_WEB_PORT", "AI_MEMORY_WEB_MCP",
              # 把 A3「裸奔 ⇒ 拒绝启动」测成放行。
              "AI_MEMORY_WEB_USER", "AI_MEMORY_WEB_PASSWORD",
              "AI_MEMORY_WEB_PASSWORD_HASH",
-             "AI_MEMORY_WEB_USERS", "AI_MEMORY_WEB_TOKENS"]
+             "AI_MEMORY_WEB_USERS", "AI_MEMORY_WEB_TOKENS",
+             # 审计（2026-10-27）：不净化就会写进宿主机的 ~/.ai-memory-web。
+             "AI_MEMORY_WEB_AUDIT"]
 _BASELINE = {k: os.environ.get(k) for k in _ENV_KEYS}
 
 
@@ -298,7 +300,16 @@ async def _req(cfg, method, path, headers=None, json_body=None):
 
 
 _cfg_auth = None
+# 2026-10-27：进程内 config() 的落盘位置必须钉到临时目录。此前这段只设了
+# TOKEN，其余走默认 ⇒ 写进宿主机 ~/.ai-memory-web（B1 凭据盘点里那枚
+# s3cret 就是这么进去的）。审计文件是新增的第四个落盘点，一并钉住。
+_WEBCFG = _TMP / "webcfg-d"
+_WEBCFG.mkdir(exist_ok=True)
 os.environ["AI_MEMORY_WEB_TOKEN"] = "s3cret"
+os.environ["AI_MEMORY_WEB_CONFIG"] = str(_WEBCFG / "config.json")
+os.environ["AI_MEMORY_WEB_USERS"] = str(_WEBCFG / "users.json")
+os.environ["AI_MEMORY_WEB_TOKENS"] = str(_WEBCFG / "tokens.json")
+os.environ["AI_MEMORY_WEB_AUDIT"] = str(_WEBCFG / "audit.jsonl")
 _cfg_auth = web_console.config()
 check("D0 设 token 后 auth_enabled=True", _cfg_auth["auth_enabled"], "")
 
@@ -344,6 +355,182 @@ _dead = dict(_cfg_auth, mcp=f"http://127.0.0.1:{free_port()}/mcp")
 _r = asyncio.run(_req(_dead, "POST", "/mcp", {"Authorization": "Bearer s3cret"}))
 check("D9 /mcp 凭据正确但上游不可达 ⇒ 502（不再 401）", _r.status_code == 502,
       f"status={_r.status_code} body={_r.text[:140]}")
+
+# D10~D14（2026-10-27）：``/mcp`` 的「人类探测」降级。
+# 在浏览器 / 网页读取工具里打开 ``/mcp?token=…``，上游按 MCP 协议回 406
+# 「Client must accept text/event-stream」—— 那是**协议协商**，不是令牌失效，
+# 但在浏览器里读起来就是「这链接取不到值」。现在 GET + Accept 没点名 MCP 两种
+# 类型 ⇒ 回 200 自证报文；真客户端（POST / 带 event-stream 的 GET）行为不变。
+# 全部跑在 ``_dead``（上游不可达）上：能回 200 就证明降级发生在转发之前。
+_BROWSER = {"Authorization": "Bearer s3cret",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
+_r = asyncio.run(_req(_dead, "GET", "/mcp", _BROWSER))
+_card = json.loads(_r.text) if _r.text else {}
+check("D10 GET /mcp（浏览器 Accept）⇒ 200 自证报文，不再 406/502",
+      _r.status_code == 200 and _card.get("kind") == "mcp-streamable-http",
+      f"status={_r.status_code} body={_r.text[:160]}")
+check("D11 自证报文含 auth 身份与 how_to 接法",
+      isinstance(_card.get("auth"), dict) and bool(_card["auth"].get("role"))
+      and "headers" in (_card.get("how_to") or {}),
+      f"body={_r.text[:200]}")
+check("D12 自证报文不回显令牌明文", "s3cret" not in _r.text,
+      "令牌明文出现在降级报文里")
+
+_r = asyncio.run(_req(_dead, "POST", "/mcp", {"Authorization": "Bearer s3cret",
+                                              "Accept": "*/*"}))
+check("D13 POST /mcp 不降级（照旧转发上游）⇒ 502", _r.status_code == 502,
+      f"status={_r.status_code} body={_r.text[:140]}")
+
+_r = asyncio.run(_req(_dead, "GET", "/mcp", {"Authorization": "Bearer s3cret",
+                                             "Accept": "text/event-stream"}))
+check("D14 GET /mcp 带 event-stream ⇒ 不降级（照旧转发上游）⇒ 502",
+      _r.status_code == 502, f"status={_r.status_code} body={_r.text[:140]}")
+
+# D15~D19（2026-10-27）：GET 版**只读**调用（地址栏传参查库）。
+# 安全契约只有一条 —— 写操作永远不开放 GET，所以白名单是硬边界而不是过滤。
+check("D15 GET 只读白名单与写工具集不相交",
+      not (web_console.GET_READONLY_TOOLS & web_console.WRITE_TOOLS),
+      f"交集={sorted(web_console.GET_READONLY_TOOLS & web_console.WRITE_TOOLS)}")
+check("D16 白名单里的工具名都已登记功能分组（防手滑写错名）",
+      all(n in web_console._TOOL_GROUP_OF for n in web_console.GET_READONLY_TOOLS),
+      f"未登记={sorted(n for n in web_console.GET_READONLY_TOOLS if n not in web_console._TOOL_GROUP_OF)}")
+
+_r = asyncio.run(_req(_dead, "GET", "/mcp?tool=memory_write&title=x",
+                      {"Authorization": "Bearer s3cret", "Accept": "*/*"}))
+check("D17 GET 调写工具 ⇒ 403（白名单在转发前就挡住）", _r.status_code == 403,
+      f"status={_r.status_code} body={_r.text[:160]}")
+
+_r = asyncio.run(_req(_dead, "GET", "/mcp?tool=memory_search&args=not-json",
+                      {"Authorization": "Bearer s3cret", "Accept": "*/*"}))
+check("D18 GET args 不是 JSON ⇒ 400（不静默当空参数跑）",
+      _r.status_code == 400, f"status={_r.status_code} body={_r.text[:160]}")
+
+_r = asyncio.run(_req(_dead, "GET", "/mcp?tool=memory_search&keyword=x",
+                      {"Authorization": "Bearer s3cret", "Accept": "*/*"}))
+check("D19 白名单内的只读工具 ⇒ 真转发上游（此处不可达 ⇒ 502）",
+      _r.status_code == 502, f"status={_r.status_code} body={_r.text[:140]}")
+
+# =====================================================================
+section("T 访问日志（audit.jsonl + /api/audit）")
+import web_audit  # noqa: E402
+
+_ap = _TMP / "unit-audit.jsonl"
+_alog = web_audit.AuditLog(_ap, max_bytes=4096, keep_entries=5)
+_alog.append({"kind": "auth", "action": "login.ok", "actor": "dpkg"})
+_alog.append({"kind": "tool", "action": "tool.call", "actor": "dpkg",
+              "target": "memory_search"})
+_alog.append({"kind": "tool", "action": "tool.call", "actor": "bot",
+              "target": "memory_write", "ok": False})
+_rows = _alog.tail(limit=10)
+check("T1 append 自动补时间且新→旧", len(_rows) == 3
+      and all(isinstance(r.get("t"), float) for r in _rows)
+      and _rows[0].get("target") == "memory_write",
+      f"rows={_rows}")
+check("T2 按 kind 过滤", len(_alog.tail(kind="tool")) == 2
+      and len(_alog.tail(kind="auth")) == 1, "")
+check("T3 按 actor 过滤", len(_alog.tail(actor="bot")) == 1, "")
+check("T4 按 action 前缀过滤", len(_alog.tail(action="tool.")) == 2, "")
+
+# 凭据类字段必须**在入库前**被丢掉 —— 这是这张卡敢展示给别人看的前提。
+_alog.append({"kind": "auth", "action": "login.ok", "actor": "x",
+              "token": "amt_LEAK", "password": "pw-LEAK", "detail": "正常"})
+_raw = _ap.read_text(encoding="utf-8")
+check("T5 令牌与口令字段不入库", "amt_LEAK" not in _raw and "pw-LEAK" not in _raw,
+      "凭据写进了审计文件")
+
+# 坏行（半截 JSON）只能让**那条**消失，不能整段读取失败。
+with _ap.open("a", encoding="utf-8") as _fh:
+    _fh.write("{半截坏行\n")
+check("T6 坏行被跳过而不是整段失败", len(_alog.tail(limit=10)) == 4, "")
+
+# 有界：写满就压缩，不能无限增长。
+for _i in range(300):
+    _alog.append({"kind": "tool", "action": "tool.call", "actor": "x",
+                  "target": f"t{_i}" + "y" * 20})
+_size = _ap.stat().st_size
+_total = len(_alog.tail(limit=500))
+check("T7 超过大小上限自动压缩（保持有界）",
+      0 < _total < 300 and _size < 4096 * 3,
+      f"entries={_total} size={_size}")
+
+# -- 接口：admin 专属 --------------------------------------------------
+_r = asyncio.run(_req(_cfg_auth, "GET", "/api/audit"))
+check("T8 /api/audit 无凭据 ⇒ 401", _r.status_code == 401,
+      f"status={_r.status_code}")
+
+_r = asyncio.run(_req(_cfg_auth, "GET", "/api/audit",
+                      {"Authorization": "Bearer s3cret"}))
+_j = json.loads(_r.text) if _r.text.startswith("{") else {}
+check("T9 /api/audit 管理员 ⇒ 200 且带 events/kinds/stats",
+      _r.status_code == 200 and isinstance(_j.get("events"), list)
+      and {k["key"] for k in (_j.get("kinds") or [])} >= {"auth", "tool", "access"}
+      and isinstance(_j.get("stats"), dict),
+      f"status={_r.status_code} body={_r.text[:200]}")
+
+_viewer_plain, _viewer_rec = _cfg_auth["tokens"].create(
+    name="t-viewer", owner="probe", role="viewer")
+_r = asyncio.run(_req(_cfg_auth, "GET", "/api/audit",
+                      {"Authorization": f"Bearer {_viewer_plain}"}))
+check("T10 /api/audit 只读账号 ⇒ 403（日志本身是侦察地图）",
+      _r.status_code == 403, f"status={_r.status_code} body={_r.text[:160]}")
+
+# T8 那次 401 必须自己也被记进来 —— 这是「拒绝也审计」的端到端证据。
+_ev = _cfg_auth["audit"].tail(limit=30)
+check("T11 鉴权失败被记入审计（auth.denied）",
+      any(e.get("action") == "auth.denied" for e in _ev),
+      f"actions={[e.get('action') for e in _ev][:8]}")
+check("T12 审计文件里没有令牌明文",
+      "s3cret" not in Path(_cfg_auth["audit_path"]).read_text(encoding="utf-8"),
+      "令牌明文出现在审计文件里")
+
+# -- 导出（2026-10-27）--------------------------------------------------
+# 三个判据缺一不可：能下（200 + 附件头）、能读（BOM + 表头 + 行数对得上）、
+# 权限同口径（viewer 403）。少第三条就是一个「谁都能把整份日志带走」的洞。
+# 行数基准必须**在导出前**取：导出会先读、后记 ``audit.export``，于是导出的
+# 那份快照天然不含「导出自己」这一条 —— 事后再取 stats() 就会多 1（T14 首版
+# 就是在这儿对不上：6 行 vs 库内 6 条）。
+_total_before = _cfg_auth["audit"].stats()["total"]
+_r = asyncio.run(_req(_cfg_auth, "GET", "/api/audit/export",
+                      {"Authorization": "Bearer s3cret"}))
+_txt = _r.text
+_lines = [ln for ln in _txt.splitlines() if ln.strip()]
+check("T13 导出 CSV ⇒ 200 + 附件头 + UTF-8 BOM",
+      _r.status_code == 200
+      and "attachment;" in _r.headers.get("content-disposition", "")
+      and _r.headers.get("content-disposition", "").endswith('.csv"')
+      and _txt.startswith("\ufeff"),
+      f"status={_r.status_code} cd={_r.headers.get('content-disposition')!r} "
+      f"head={_txt[:40]!r}")
+check("T14 CSV 表头含 IP 与操作人列，且行数 = 导出前库内条数 + 1",
+      _lines
+      and all(k in _lines[0] for k in ("时间", "操作人", "IP", "对象", "结果"))
+      and len(_lines) == _total_before + 1,
+      f"表头={_lines[0] if _lines else None} 行数={len(_lines)} "
+      f"导出前={_total_before}")
+
+_r = asyncio.run(_req(_cfg_auth, "GET", "/api/audit/export?format=json",
+                      {"Authorization": "Bearer s3cret"}))
+_j = json.loads(_r.text)
+check("T15 导出 JSON ⇒ 结构与 /api/audit 的 events 一致",
+      _r.status_code == 200 and isinstance(_j.get("events"), list)
+      and _j.get("count") == len(_j["events"]) and _j["count"] > 0,
+      f"status={_r.status_code} keys={list(_j)[:6]} count={_j.get('count')}")
+
+_r = asyncio.run(_req(_cfg_auth, "GET", "/api/audit/export",
+                      {"Authorization": f"Bearer {_viewer_plain}"}))
+check("T16 导出 只读账号 ⇒ 403（能导出等于能整份带走）",
+      _r.status_code == 403, f"status={_r.status_code} body={_r.text[:160]}")
+
+_r = asyncio.run(_req(_cfg_auth, "GET", "/api/audit/export?format=xlsx",
+                      {"Authorization": "Bearer s3cret"}))
+check("T17 未知格式 ⇒ 400（不猜、不静默回落到 csv）", _r.status_code == 400,
+      f"status={_r.status_code} body={_r.text[:160]}")
+
+# 导出**这件事本身**必须留痕：谁把整份清单带走过，是这份日志里最该被记的动作。
+_ev = _cfg_auth["audit"].tail(limit=40, action="audit.export")
+check("T18 导出动作被记入审计（audit.export）",
+      any(e.get("action") == "audit.export" for e in _ev),
+      f"actions={[e.get('action') for e in _ev][:8]}")
 
 # =====================================================================
 section("E 写保护（AI_MEMORY_WEB_CONFIG_WRITE=0）")
@@ -750,6 +937,29 @@ try:
     check("F7 未知路径回落 index.html（hash 路由）",
           st == 200 and 'id="app"' in txt, f"status={st}")
 
+    # F7b（2026-10-26 故障回归锁）：机器接口命名空间下的未知路径必须 404 JSON。
+    # 当时这四个 GET 全部返回 200 + 5013 B HTML —— 对浏览器无害，对 MCP / OAuth
+    # 客户端是「状态码成功、解析失败」的哑火，现场只表现为「网页 AI 连不上」。
+    for _p in ("/api/nope", "/.well-known/nope", "/oauth/nope", "/mcp/reader"):
+        st_x, txt_x = _http(_p)
+        check(f"F7b 未知机器接口 {_p} ⇒ 404 JSON（不回 index.html）",
+              st_x == 404 and txt_x.lstrip().startswith("{")
+              and "<!doctype" not in txt_x.lower(),
+              f"status={st_x} body={txt_x[:120]}")
+
+    # F7c：同一路径的 POST 仍是 405（catch-all 默认只 GET）。这是**基线锁**：
+    # 若将来把 catch-all 放开成全方法，F7c 会红，提醒复核「未知路径是否会写盘」。
+    st_p, _ = _http("/mcp/reader", "POST", {})
+    check("F7c 未知档位路径的 POST ⇒ 405（catch-all 未被放开成全方法）",
+          st_p == 405, f"status={st_p}")
+
+    # F7f：非机器前缀的深路径**必须仍然回落首页** —— 与 F7b 成对，防止改过头，
+    # 把 hash 路由的「刷新不 404」一并改坏。用 /console 这种「像页面但不存在」
+    # 的路径，贴近「用户收藏了一个早已改名的页面」的真实场景。
+    st_f, txt_f = _http("/console")
+    check("F7f 非机器前缀深路径仍回落 index.html（hash 路由不回归）",
+          st_f == 200 and 'id="app"' in txt_f, f"status={st_f}")
+
     # F12：v1.7.0 的 /mcp 反代 —— 真上游、真 SSE。裸 HTTP 直发 initialize，
     # 断言拿到 ai-memory 的 serverInfo。这是「MCP 客户端只填一个 URL 就能连上」
     # 最低限度的真实证据：不 mock、不进程内直调（v3 的两条判死项都守住）。
@@ -771,11 +981,55 @@ try:
           st_m == 200 and '"protocolVersion"' in txt_m and "ai-memory" in txt_m,
           f"status={st_m} body={txt_m[:200]}")
 
+    # F12b~F12d（2026-10-27）：GET 版只读调用**真往返**。D15~D19 只证明边界，
+    # 这里证明「地址栏传参」真的能拿到工具结果 —— 两者缺一：只有边界会变成
+    # 「安全但不可用」，只有往返会变成「能用但没边界」。
+    import urllib.parse as _up
+    st_g, txt_g = _http("/mcp?tool=memory_stats")
+    jg = json.loads(txt_g) if st_g == 200 else {}
+    check("F12b GET /mcp?tool=memory_stats 真往返（只读调用可用）",
+          st_g == 200 and jg.get("ok") is True and jg.get("tool") == "memory_stats"
+          and bool(str(jg.get("text") or "").strip()),
+          f"status={st_g} body={txt_g[:200]}")
+
+    st_t, txt_t = _http("/mcp?tool=memory_stats&format=text")
+    _want_text = str(jg.get("text") or "").strip()
+    check("F12c GET &format=text 与 JSON 里的 text 字段逐字一致（纯文本出口）",
+          st_t == 200 and bool(_want_text) and txt_t.strip() == _want_text,
+          f"status={st_t} 长度={len(txt_t)} 期望={len(_want_text)}")
+
+    _args = _up.quote(json.dumps({"keyword": "测试", "limit": 1}, ensure_ascii=False))
+    st_a, txt_a = _http(f"/mcp?tool=memory_search&args={_args}")
+    ja = json.loads(txt_a) if st_a == 200 else {}
+    check("F12d GET args=<JSON> 传类型化参数（search 真往返）",
+          st_a == 200 and ja.get("ok") is True
+          and ja.get("arguments") == {"keyword": "测试", "limit": 1},
+          f"status={st_a} body={txt_a[:200]}")
+
+    # F13b（2026-10-27）：访问日志真跑一轮 —— 先调一次工具，再确认它被记下来。
+    # 这条不能只靠 D/T 段：那两段用的是假上游，只能证明「写入路径对」，
+    # 证明不了「真实调用真的落进 audit.jsonl」。
+    st_l, txt_l = _http("/api/audit?limit=50")
+    jl = json.loads(txt_l) if st_l == 200 else {}
+    check("F13b /api/audit 在真实例上可用且返回结构化事件",
+          st_l == 200 and jl.get("ok") is True
+          and isinstance(jl.get("events"), list) and bool(jl.get("kinds")),
+          f"status={st_l} body={txt_l[:200]}")
+
     st, txt = _http("/api/call", "POST", {"tool": "memory_stats", "arguments": {}})
     j = json.loads(txt) if st == 200 else {}
     check("F8 POST /api/call 真往返 memory_stats",
           st == 200 and j.get("ok") is True and j.get("tool") == "memory_stats",
           f"status={st} body={txt[:160]}")
+
+    st_l2, txt_l2 = _http("/api/audit?limit=50&kind=tool")
+    jl2 = json.loads(txt_l2) if st_l2 == 200 else {}
+    _tool_ev = [e for e in (jl2.get("events") or [])
+                if e.get("target") == "memory_stats" and e.get("action") == "tool.call"]
+    check("F13c 刚才那次 /api/call 被记进审计（谁·何时·干了什么）",
+          st_l2 == 200 and bool(_tool_ev)
+          and bool(_tool_ev[0].get("actor")) and bool(_tool_ev[0].get("t")),
+          f"status={st_l2} events={[e.get('action') for e in (jl2.get('events') or [])][:5]}")
 
     # 契约：阈值是**整状态写**（前端 saveThresholds 也把 draft 的全部键一起提交）。
     # 因此「只给一个键」必须被明确拒绝，而不是静默写半份配置。

@@ -338,7 +338,10 @@
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: var(--warn);
+  /* 与侧栏 .nav-dot 同一套「小尺寸实心标记」配色（2026-10-26）：
+     6px 的点用 --warn（浅色下是 #87620f 暗橄榄金）同样会发褐发脏，
+     统一改 --dot-warn（高饱和琥珀）。宽条形的 .bar-fill.warn 仍用 --warn。 */
+  background: var(--dot-warn);
   flex: 0 0 auto;
 }
 
@@ -1112,13 +1115,8 @@ svg.trend {
   align-items: start;
 }
 
-/* 管理员单栏（2026-10-22 主人选型 A）：右栏「我的账号」只对 operator/viewer
-   存在（他们看不到账号清单，那张卡是唯一的改口令入口）。管理员把它收掉后，
-   若仍保留两列定义，第一列只会占 1fr、右侧空出 344px —— 所以这里显式改成
-   单列，让清单独占整宽（列表行的动作按钮也随之靠到最右，间距更舒展）。 */
-.ac-grid.ac-solo {
-  grid-template-columns: minmax(0, 1fr);
-}
+/* 2026-10-27：原 .ac-grid.ac-solo（管理员单栏）已删除 —— 它的存在前提是
+   「管理员右栏无可放」，现在管理员右栏放「访问日志」，前提不成立了。 */
 
 .ac-main,
 .ac-side,
@@ -1137,16 +1135,36 @@ svg.trend {
   height: auto;
 }
 
-/* sticky 只挂在右栏容器上：内部卡片再叠 sticky 会互相抢定位上下文。 */
+/* sticky 只挂在右栏容器上：内部卡片再叠 sticky 会互相抢定位上下文。
+   `top` 必须把面包屑的 26px 算进去：这里原来写的是「顶栏 + 18」，而面包屑
+   sticky 在「顶栏 → 顶栏+26」这一条上，于是右栏滚动时会**钻到面包屑底下**
+   8px、卡头被切掉一截（z-index 上海拔也更低，遮不住）。满高模式（下方
+   `.ac-fill`）又把它改成「顶栏 + 面包屑 + 47」，让卡片就地钉住不动。 */
 .ac-side {
   position: sticky;
-  top: calc(var(--topbar-h) + 18px);
+  top: calc(var(--topbar-h) + var(--crumbs-h) + 14px);
 }
 
 @media (max-width: 1099px) {
   .ac-grid {
     grid-template-columns: minmax(0, 1fr) minmax(268px, 300px);
   }
+}
+
+/* 右栏卡头：标题与副标题一律不折行（2026-10-27 实测 1024 视口）。
+   300px 栏宽下卡头被压，「访问日志」被折成「访问日 / 志」、「12 条 / 库内 128」
+   折成三行 —— 加一个「导出」按钮就把原来刚好够的余量吃掉了。
+   这里把两段都钉成 nowrap，副标题再加 ellipsis 兜底：宁可省掉后半句，
+   也不要一个字一行。 */
+.ac-side > .card > .card-head h3,
+.ac-side > .card > .card-head .sub {
+  white-space: nowrap;
+}
+
+.ac-side > .card > .card-head .sub {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 @media (max-width: 899px) {
@@ -1156,6 +1174,65 @@ svg.trend {
 
   .ac-side {
     position: static;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * 17x. 右栏「访问日志」撑满可视区（2026-10-27 主人：「高也是顶满的」）
+ *
+ * 契约：管理员右栏只有这一张卡 ⇒ 它固定占据「工具条以下、状态栏以上」的整块
+ * 高度，日志列表吃满剩余空间并**内部滚动**；页面滚动时卡片原地不动。
+ *
+ * 为什么不给 `.ac-grid` 定高再让 side stretch：网格行高取两栏 max-content，
+ * 左侧令牌清单一旦超过一屏，行高就被它撑开，右栏跟着变成两千像素高（与
+ * 调试台 `--con-h` 那条注释里记录的坑是同一个）。所以高度钉在**右栏自己身上**。
+ *
+ * 算式里的 61px = 工具条 47 + 底部留白 14，47 = `.ac-bar` 自身 33 + 它与网格
+ * 之间的 14px 间距 —— 全是**实测值**不是估值（CDP 1440×940 量得），且不会漂：
+ * 本段只在 ≥900px 启用，那个宽度下「账号 / 令牌」两枚分段与身份标签恒在同一行。
+ *   847(vh) − 62(顶栏) − 26(面包屑) − 47(工具条) − 30(状态栏) − 14(留白) = 668
+ *   实测卡片高 518 → 668，bottom 652 → 803（= 817 − 14），误差 0。
+ *
+ * sticky 的 top 在这里再加到「顶栏 + 面包屑 + 47」= 卡片在未滚动时的天然位置
+ * ⇒ 滚动过程中它**一动不动**，只有列表内部在滚。若沿用基线的「+14」，
+ * 页面一滚动卡片就会上移 33px 再被钉住，卡头那截动画看着像在抽搐。
+ * ------------------------------------------------------------------------- */
+@media (min-width: 900px) {
+  .ac-side.ac-fill {
+    /* max() 兜住极矮视口算出的负值（本文件 §17c-2 同一写法）。 */
+    height: max(
+      0px,
+      calc(
+        100vh - var(--topbar-h) - var(--crumbs-h) - var(--statusbar-h) - 61px
+      )
+    );
+    top: calc(var(--topbar-h) + var(--crumbs-h) + 47px);
+  }
+
+  /* 卡片自己变成纵向 flex 容器 —— 这是 `.card-body { flex: 1 1 auto;
+     min-height: 0 }` 真正生效的前提（它一直写着，但全局 .card 是 block，
+     详见 3-components.css 里 ④ 那段注释）。
+     `height: 100%` 必须显式写回：上面 `.ac-side > .card { height: auto }`
+     是为「卡片随内容长高」服务的，而在满高模式里 auto 会让卡片按内容长到
+     814px、冲出 668px 的容器（实测：整页多出 102px 滚动条，卡头被推到视口外）。 */
+  .ac-side.ac-fill > .card {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    min-height: 0;
+  }
+
+  .ac-side.ac-fill > .card > .card-body {
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* 列表：由 46vh 的「窗口」变成「剩余空间」。max-height:none 必须显式写，
+     否则上面那条 46vh 仍会封顶，卡片下半截又是空白。 */
+  .ac-side.ac-fill .audit-list {
+    flex: 1 1 auto;
+    min-height: 0;
+    max-height: none;
   }
 }
 
@@ -1312,6 +1389,238 @@ svg.trend {
 
 /* 连接串本体：整块可点即复制，所以给 copy 光标 + user-select: all，
    并且必须 break-all —— 一枚 47 字符的令牌加主机名，不折行会横向溢出。 */
+/* ---------------------------------------------------------------
+ * 访问日志卡（2026-10-27）
+ *
+ * 右栏只有 344px，所以这一块刻意不用表格：每条压成「一行事实 + 一行旁证」，
+ * 时间与详情在同一行的第二层，靠缩进而非分栏来区分层级。
+ * 类型用圆点编码（不占宽度），失败项加红边 —— 一屏 40 条里，眼睛先抓异常。
+ * ------------------------------------------------------------- */
+.ac-audit-kinds {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  margin-bottom: 10px;
+}
+
+.ac-chip {
+  /* 尺寸按「344px 右栏里 7 个 chip 排成一行」倒推：2 字 + 内距 14 + 边 2
+     ≈ 38px/个，7 个连 gap 约 284px，留得出余量。放到 11.5px 会溢出成两行，
+     第二行只剩「拒绝」一个 —— 视觉上像漏了一格。 */
+  padding: 2px 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.5;
+  cursor: pointer;
+  transition:
+    color var(--t-fast) var(--ease),
+    border-color var(--t-fast) var(--ease),
+    background var(--t-fast) var(--ease);
+}
+
+.ac-chip:hover {
+  color: var(--text);
+  border-color: var(--text-faint);
+}
+
+.ac-chip.on {
+  color: var(--accent-ink);
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+/* chip 在窄栏里同步收一档：300px 栏（chip 容器内宽 262）要放下 7 枚 chip，
+   344px 那套 11px / 7px 内距实测 7×38 + 6×3 = 284 ⇒ 溢出成两行（第二行只剩
+   「拒绝」一个，看着像漏了一格）。收到 10.5px / 5px 后 7×33 + 18 = 249 ✓。
+   🔴 这段必须写在 `.ac-chip` 基础规则**之后**：同权重同属性，靠后即胜。
+   第一版写在 .ac-grid 那一带（文件更前面），被这里的基础规则压掉，
+   CDP 量出来仍是 38px —— 位置即优先级，别只看选择器够不够具体。 */
+@media (min-width: 900px) and (max-width: 1099px) {
+  .ac-chip {
+    padding: 2px 5px;
+    font-size: 10.5px;
+  }
+}
+
+.audit-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 46vh;
+  overflow-y: auto;
+  margin: 0 -6px;
+  padding: 0 6px;
+}
+
+.audit-item {
+  display: flex;
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.audit-item:last-child {
+  border-bottom: 0;
+}
+
+/* 圆点用 currentColor 派生：六类各一个色相，失败项换成红并加描边。 */
+.audit-dot {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  margin-top: 6px;
+  border-radius: 50%;
+  background: var(--text-faint);
+}
+
+.audit-dot.k-auth {
+  background: var(--ok);
+}
+
+.audit-dot.k-token {
+  background: var(--accent);
+}
+
+.audit-dot.k-account {
+  background: var(--warn);
+}
+
+.audit-dot.k-config {
+  background: var(--text-2);
+}
+
+/* 工具类是最高频的一类，用 --text-faint 会淡到看不见，整列圆点显不出层次；
+   换成 info 蓝后六类各有色相，扫一眼就能分出「身份/令牌/账号/配置/工具/拒绝」。 */
+.audit-dot.k-tool {
+  background: var(--info);
+}
+
+.audit-dot.k-access,
+.audit-dot[data-bad="1"] {
+  background: var(--err);
+}
+
+.audit-main {
+  min-width: 0;
+  flex: 1;
+}
+
+.audit-line {
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text-2);
+  word-break: break-word;
+}
+
+.audit-line b {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.audit-target {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-faint);
+  word-break: break-all;
+}
+
+.audit-sub {
+  margin-top: 1px;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--text-faint);
+  word-break: break-word;
+}
+
+/* 来源 IP（2026-10-27 主人：「再添加个 ip 显示」）。
+   mono + 略深一档：它是**事实**（从哪儿来），比 detail 那句人写的旁证更硬，
+   所以不跟 detail 同色。IPv6 最长 39 字符，窄栏里允许断行而不是截断 ——
+   截断的 IP 等于没有 IP。 */
+.audit-ip {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  word-break: break-all;
+}
+
+/* 回环地址（本机直连 / 隧道没带 CF-Connecting-IP）压回最弱的灰：
+   它占了列表里的大多数，跟着公网 IP 一样显眼会淹掉真正的来源。 */
+.audit-ip.local {
+  color: var(--text-faint);
+}
+
+/* 已有数据时刷新：整列降透明度。不换骨架 —— 那会把用户正在看的那一行
+   整页抽走；也不只是按钮转圈 —— 40 条列表里那点变化太远，看不见。 */
+/* 卡底「采集面口径」说明（2026-10-27）。刻意比其他 hint 更轻：它只在
+   第一次读这篇日志时被读一遍，之后就是背景。上边框把它与列表分开，
+   免得最后一屏日志看起来像「多了一条没圆点的记录」。 */
+.audit-foot {
+  flex: 0 0 auto;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-faint);
+}
+
+.audit-foot code {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-dim);
+  background: var(--surface-3);
+  border-radius: var(--r-xs);
+  padding: 0 3px;
+}
+
+/* 已有数据时刷新：整列降透明度。不换骨架 —— 那会把用户正在看的那一行
+   整页抽走；也不只是按钮转圈 —— 40 条列表里那点变化太远，看不见。
+   注意 8 秒静默轮询**不**走这条路（不置 auditBusy），否则会变成周期性闪烁。 */
+.audit-list.stale {
+  opacity: 0.45;
+  transition: opacity var(--t-fast) var(--ease);
+  pointer-events: none;
+}
+
+/* 首屏骨架（2026-10-27 主人：「加载动画也给一手」）。
+   6 行，每行复刻真实条目的「圆点 + 两行文字」排布 —— 骨架的价值不只是
+   「在动」，更是预告**将要出现的东西长什么形状**，这样替换时高度不跳。
+   行的分隔线由 .audit-item 自带，不额外画。 */
+.audit-skel .audit-item {
+  align-items: flex-start;
+}
+
+.audit-skel .audit-dot.skel-dot {
+  background: var(--surface-3);
+  animation: auditDotPulse 1.6s var(--ease) infinite;
+}
+
+/* .skel.line 自带 margin:5px（为列表页的密集占位服务），在 344px 窄栏里
+   那 5px 会把两行推得太开、行高比真实条目高出一截 ⇒ 这里归零重设。 */
+.audit-skel .skel.line {
+  height: 11px;
+  margin: 0 0 5px;
+}
+
+.audit-skel .skel-l1 {
+  width: 74%;
+}
+
+@keyframes auditDotPulse {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+
+  50% {
+    opacity: 1;
+  }
+}
+
 .ac-conn {
   margin-top: 8px;
   padding: 8px 10px;

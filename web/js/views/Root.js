@@ -1,8 +1,8 @@
 import { computed, nextTick, watch } from "../../vendor/vue.esm-browser.prod.js";
 import { api } from "../core/api.js";
 import { boot, loadTools } from "../core/data.js";
-import { go, readHash, syncNavInd, syncTabInd } from "../core/router.js";
-import { S, closeConfirm, dismiss } from "../core/store.js";
+import { go, pageAllowed, readHash, syncNavInd, syncTabInd } from "../core/router.js";
+import { S, closeConfirm, dismiss, toast } from "../core/store.js";
 import { loadThresholds } from "../features/settings.js";
 import { autoCheckUpdates, pendingCount } from "../features/update.js";
 import { dressPanel } from "../core/lg.js";
@@ -79,12 +79,36 @@ var Root = {
   data: function () {
     return {
       S: S,
-      nav: NAV,
       titles: PAGE_TITLES,
       subs: PAGE_SUBS,
     };
   },
   computed: {
+    /* 可见页面 id 列表 —— 判据全部来自 core/router.js#PAGE_ROLES（唯一事实源）。
+       2026-10-26 主人先要求「只读也不许进访问控制」，随后又指出「调试台在只读
+       怎么也在」。两次都是同一个问题的两面：入口散落在三处（侧栏、命令面板、
+       hash 直达）。所以这里不再为某一页写一个 canSeeXxx，而是统一产出
+       visiblePages，让侧栏、路由守卫、命令面板都读同一份。
+
+       ⚠️ 角色是**异步到位**的：首帧 S.role 为空串。空值必须视为「不裁剪」
+       （pageAllowed 已内建该口径），否则管理员入口会在首帧被藏掉，之后 role
+       到了也未必补得回来（这正是 2026-10-22「账号 0 个」那个坑的同源问题）。 */
+    visiblePages: function () {
+      var role = S.role;
+      return NAV.filter(function (n) {
+        return pageAllowed(role, n.id);
+      }).map(function (n) {
+        return n.id;
+      });
+    },
+    /* 侧栏条目改为按可见性裁剪。data 里原本是静态 NAV，现在必须走 computed ——
+       静态数组无法随角色变化重算。 */
+    nav: function () {
+      var ids = this.visiblePages;
+      return NAV.filter(function (n) {
+        return ids.indexOf(n.id) >= 0;
+      });
+    },
     pageTitle: function () {
       return this.titles[S.page] || "";
     },
@@ -134,10 +158,39 @@ var Root = {
       if (S.sessionUser) return S.sessionUser;
       return S.authVia === "token" ? "令牌" : "";
     },
+    /* 「注销」按钮的显隐（2026-10-23）：只在**确实有可注销的登录态**时出现。
+       三个来源任一成立即可 ——
+         · sessionUser      会话登录（Cookie）
+         · authVia==="token" 令牌通道（凭据在 sessionStorage）
+         · role             服务端认过身份（降级兜底，防止会话里 user 为空）
+       回环免鉴权 / 已经弹着登录框时不显示 —— 前者没有登录态可退，后者按钮
+       本来就被登录浮层盖住，多画一个只会显得界面没收干净。 */
+    canLogout: function () {
+      if (S.authRequired) return false;
+      return !!(S.sessionUser || S.authVia === "token" || S.role);
+    },
+  },
+  /* 路由守卫（2026-10-26）：把「入口藏起来」升级成「进不去」。
+     只藏侧栏是不够的 —— hash 可以直接编辑、书签会留着旧地址、刷新后还会
+     还原上次的 #console / #access。两种触发都要覆盖：进来时角色已知、
+     以及角色后到（visiblePages 依赖 S.role，role 一变它就重算 ⇒ 第二个
+     watch 会被点着）。 */
+  watch: {
+    "S.page": function (p) {
+      if (!this.canSee(p)) go("dashboard");
+    },
+    visiblePages: function () {
+      if (!this.canSee(S.page)) go("dashboard");
+    },
   },
   methods: {
     dismiss: dismiss,
     closeConfirm: closeConfirm,
+    /* 某一页当前角色能不能看。模板与守卫共用同一处口径，避免
+       「守卫放过去了、模板却画不出来」这种一半对一半错的状态。 */
+    canSee: function (id) {
+      return this.visiblePages.indexOf(id) >= 0;
+    },
     /* 「有可用更新」的导航圆点判据（2026-10-19）。方法而非 computed：
        S.update 是普通响应式对象，模板渲染时读到 targets 就能正常追踪。 */
     pendingCount: pendingCount,
@@ -219,6 +272,9 @@ var Root = {
           S.loginError = "";
           S.authRequired = true;
           S.authMode = S.loginEnabled ? "password" : "token";
+          /* 2026-10-23：给一个明确回执。原来点了「登出」界面只是静悄悄
+             弹回登录框 —— 分不清是注销成功、还是会话过期被踢。 */
+          toast("ok", "已注销", "本地令牌与登录会话已清除。");
         });
     },
     onKey: function (e) {
@@ -228,7 +284,9 @@ var Root = {
         closeConfirm();
         return;
       }
-      var hit = NAV.filter(function (n) {
+      /* 快捷键 1–5 也必须走**可见**清单：写死 NAV 的话，只读账号按「2」
+         照样跳进已经藏起来的调试台，等于给了一条隐形入口。 */
+      var hit = this.nav.filter(function (n) {
         return n.key === e.key;
       })[0];
       if (hit) go(hit.id);
@@ -302,8 +360,20 @@ var Root = {
     '      <div class="foot-line mt-sm"><span>状态</span>' +
     "        <b :style=\"{color: S.health.ok ? 'var(--ok)' : 'var(--err)'}\">{{ S.health.ok ? '在线' : '离线' }}</b></div>" +
     '      <div class="foot-line mt-sm" v-if="authWho"><span>账号</span>' +
-    '        <b class="mono" style="margin-left:auto">{{ authWho }}</b>' +
-    '        <a class="small" href="#" style="opacity:.75" @click.prevent="logout">登出</a></div>' +
+    '        <b class="mono" style="margin-left:auto">{{ authWho }}</b></div>' +
+    "    </div>" +
+    /* 注销按钮（2026-10-23，主人令「web 添加个注销按钮取消登录」→「放到左栏下面」）。
+       位置：.sidebar-foot 之后、侧栏最底。
+       · ≥900px 左栏是 64px 窄图标条（.sidebar-foot 整体 display:none）⇒ 这里是
+         一个 36×38 的纯图标按钮，语义靠 :title / aria-label，与 .nav-item 同口径；
+       · ≤899px 左栏是 272px 抽屉（footer 恢复显示）⇒ .lo-label 恢复，变成
+         图标+文字的整行按钮，紧接在 footer 下方。
+       margin-top:auto 只在桌面档给 —— 抽屉档 footer 自己已是 auto，两个 auto 会
+       平分剩余空间、把 footer 悬在半空。 */
+    '    <div class="side-logout" v-if="canLogout">' +
+    "      <button class=\"lo-btn\" @click=\"logout\" title=\"注销并返回登录框\" aria-label=\"注销\">" +
+    "        <span v-html=\"svg('logout')\"></span>" +
+    '        <span class="lo-label">注销</span></button>' +
     "    </div>" +
     "  </aside>" +
     /* 悬停跟随透镜（2026-10-20，主人问「悬停跟随呢？」）：
@@ -346,9 +416,11 @@ var Root = {
        pageIn animation（改用 §17c 的过渡类），不加 appear 首屏就没有入场。 */
     '      <transition name="page" mode="out-in" appear>' +
     "      <dashboard v-if=\"S.page==='dashboard'\"></dashboard>" +
-    "      <console-page v-else-if=\"S.page==='console'\"></console-page>" +
+    "      <console-page v-else-if=\"S.page==='console' && canSee('console')\"></console-page>" +
     "      <library-page v-else-if=\"S.page==='library'\"></library-page>" +
-    "      <access-page v-else-if=\"S.page==='access'\"></access-page>" +
+    /* 多一道 canSee：watch 的重定向要等一拍才生效，这一帧不该把整页画出来
+       （哪怕只有一帧，也不该让只读账号看见「调试台」「账号」这些字样）。 */
+    "      <access-page v-else-if=\"S.page==='access' && canSee('access')\"></access-page>" +
     "      <settings-page v-else-if=\"S.page==='settings'\"></settings-page>" +
     '      </transition>' +
     "    </main>" +

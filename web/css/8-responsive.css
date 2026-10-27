@@ -39,8 +39,20 @@
   .nav-label,
   .nav-kbd,
   .nav-sec,
-  .sidebar-foot {
+  .sidebar-foot,
+  .lo-label {
     display: revert;
+  }
+
+  /* 抽屉态（272px）里注销按钮不能沿用图标条的「居中」「无框」：
+     内容是整行宽的，文字居中会显得像页脚又多了一行孤零零的字。
+     改为左对齐 + 极细描边，与 footer 那几行左对齐的标签同列，
+     同时靠描边把「这是按钮」和「这是读数」分开（底色保持透明，
+     只有 hover/focus 才浮现 --err）。 */
+  .lo-btn {
+    justify-content: flex-start;
+    padding: 0 10px;
+    border-color: var(--border-soft);
   }
 
   .brand {
@@ -168,9 +180,7 @@
     width: 104px;
   }
 
-  .page-title {
-    font-size: 20px;
-  }
+  /* .page-title 的窄屏字号覆盖已随页头整组删除（2026-10-23，见 3-components.css 顶部）。 */
 }
 
 @media (max-width: 560px) {

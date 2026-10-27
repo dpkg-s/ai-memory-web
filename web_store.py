@@ -116,6 +116,11 @@ def clearance_of(role: str, clearance: str | None = None) -> str:
 #: 令牌明文前缀。带上它才能在日志/界面上与口令一眼区分开，也便于密钥扫描器识别。
 TOKEN_PREFIX = "amt_"
 
+#: 入库时保留的明文字符数（``prefix``）。**对外只在这个长度达标时才回显** ——
+#: 短于此说明明文本身就不足 12 字符，前缀等于明文（2026-10-27 由 ``/mcp``
+#: 自证报文的测试 D12 抓到：``s3cret`` 这枚老 .env 令牌的 prefix 就是它自己）。
+PREFIX_KEEP = 12
+
 
 class StoreError(Exception):
     """配置层错误：凭据文件损坏、参数非法等。调用方通常映射成 400。"""
@@ -409,10 +414,13 @@ class TokenStore:
     @staticmethod
     def _public(t: dict) -> dict:
         """对外视图：带 prefix（便于认人），**绝不带 hash**。"""
+        raw_prefix = str(t.get("prefix") or "")
         return {
             "id": t.get("id", ""),
             "name": t.get("name", ""),
-            "prefix": t.get("prefix", ""),
+            # 前缀短于 PREFIX_KEEP ⇒ 这枚令牌的明文本身就很短，前缀等于明文。
+            # 对外只回空串：宁可少一个辨认位，也不能把凭据回显出去。
+            "prefix": raw_prefix if len(raw_prefix) >= PREFIX_KEEP else "",
             "owner": t.get("owner", ""),
             "role": t.get("role", "operator"),
             "clearance": clearance_of(t.get("role", "operator"), t.get("clearance")),
@@ -433,6 +441,18 @@ class TokenStore:
                 rows = [t for t in rows if t.get("owner") == owner]
             return [self._public(t) for t in sorted(rows, key=lambda x: x.get("created_at") or 0,
                                                     reverse=True)]
+
+    def describe(self, tid: str) -> dict | None:
+        """按 id 回一条**对外视图**（含 prefix / 过期 / 次数），找不到 ``None``。
+
+        用途（2026-10-27）：``/mcp`` 的浏览器降级报文要自证「这枚令牌是谁、
+        还能用几次、什么时候过期」—— 这是 ``verify()`` 的返回值里**没有**的
+        那一半信息（它只回答「这张票能不能进」）。明文仍然拿不到（表里只有
+        sha256），这里给的只是元数据。
+        """
+        with self._lock:
+            t = self._find(tid)
+            return self._public(t) if t else None
 
     # -- 写 -----------------------------------------------------------------
     def create(self, *, name: str, owner: str, role: str = "operator",

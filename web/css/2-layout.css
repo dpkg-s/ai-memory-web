@@ -187,7 +187,18 @@
 /* 「有可用更新」的持久标记（2026-10-19）：导航项右上角的小圆点。
    与 toast 的分工 —— toast 只报一次（9s 后消失），圆点留到更新完成或
    下次检测为最新；pointer-events:none 保证它不挡住点击。
-   窄图标条（桌面默认态）与手机抽屉（文字态）都能看见。 */
+   窄图标条（桌面默认态）与手机抽屉（文字态）都能看见。
+
+   🔴 2026-10-26「亮色下有点脏」的三条成因与对策：
+     ① 颜色：原用 var(--warn)，而浅色主题的 --warn 是 #87620f（暗橄榄金，
+        为文字对比度压深的），拿它填 7px 圆点就是一粒褐黄茶渍。
+        ⇒ 改用 --dot-warn（高饱和琥珀，只在两主题里各给一个值）。
+     ② 晕染：原来是 `0 0 0 3px` 22% 的同色环，在白底上摊成一圈米黄，
+        且 box-shadow 是**实心环**不是柔光，边界硬、像色块。
+        ⇒ 收窄到 3px 且浓度 16%，同时内圈加 1.5px 底色环把它切开。
+     ③ 混色：圆点压在图标右上角，半透明黄叠在深灰线条上混出污色。
+        ⇒ 那 1.5px 底色环就是隔离带，点与图标之间隔一层侧栏底色，
+           看起来是「浮在上面的徽章」而不是「糊在图标上的色块」。 */
 .nav-dot {
   position: absolute;
   top: 8px;
@@ -195,8 +206,10 @@
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: var(--warn);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 22%, transparent);
+  background: var(--dot-warn);
+  box-shadow:
+    0 0 0 1.5px var(--bg),
+    0 0 0 3px color-mix(in srgb, var(--dot-warn) 16%, transparent);
   pointer-events: none;
 }
 
@@ -217,6 +230,72 @@
 .foot-line b {
   color: var(--text-dim);
   font-weight: 600;
+}
+
+/* ---------- 侧栏底部「注销」（2026-10-23，主人令「放到左栏下面」） ----------
+
+   两档形态共用同一个 .lo-btn，差别只在「文不文字」与「谁负责贴底」：
+
+     · ≥900px 左栏是 64px 窄图标条，.sidebar-foot 整块 display:none ⇒ 这里只剩
+       36×38 的纯图标按钮，语义靠 :title / aria-label，与 .nav-item 同口径。
+       贴底由本块的 margin-top:auto 承担（footer 不生成盒子，不会跟它抢）。
+     · ≤899px 左栏是 272px 抽屉，footer 恢复显示且它自己已是 margin-top:auto
+       ⇒ 本块**不能**再给 auto，否则两个 auto 平分剩余空间、把 footer 悬在半空。
+       文字由 8-responsive.css 的 .lo-label 恢复。
+
+   为什么不复用 .btn-sm：它是常驻浅底的「动作按钮」，摆在 64px 玻璃条底部会凭空
+   多出一块亮底，跟整条无底图标打架。这里默认透明，只在 hover / focus 浮现，
+   destructive 语义靠 --err 而不是加粗底色。 */
+.side-logout {
+  padding: 10px 4px 0;
+}
+
+.lo-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 38px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 560;
+  cursor: pointer;
+  transition:
+    color var(--t-fast),
+    background var(--t-fast),
+    border-color var(--t-fast);
+}
+
+.lo-btn:hover,
+.lo-btn:focus-visible {
+  color: var(--err);
+  background: var(--err-soft);
+  border-color: color-mix(in srgb, var(--err) 24%, transparent);
+}
+
+.lo-btn svg {
+  width: 17px;
+  height: 17px;
+  flex: 0 0 auto;
+}
+
+/* 窄图标条不显示文字 —— .nav-label 的同款处理在 §「窄图标条」分组里
+   （.brand-text / .nav-label / .nav-kbd / .nav-sec / .sidebar-foot），本类
+   不在那个分组内，单独声明；抽屉档的恢复见 8-responsive.css。 */
+.lo-label {
+  display: none;
+}
+
+@media (min-width: 900px) {
+  .side-logout {
+    margin-top: auto;
+  }
 }
 
 .shell-main {

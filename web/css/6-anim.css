@@ -1301,23 +1301,34 @@
 }
 
 /* ============================================================================
- * 主题过渡（2026-10-22 · 方案 A″「底片挖孔」）
+ * 主题过渡（2026-10-23 · 方案 A‴「方向化黑盘」）
  *
  * 时序由 core/theme.js 编排，**两件事同一帧起跑**：
  *   t=0      数据层切主题、底片盖上来（旧外观）、开关的 GSAP timeline 起播
- *   0–0.45s  底片在开关圆心挖一个半径 0→外接圆 的孔，透出底下**实时**的页面
- *            ⇒ 扩散扫到哪里，那里的开关就在演
- *   0.45s    孔已盖满视口，底片移除
+ *   0–0.45s  遮罩按方向动（见下）
+ *   0.45s    遮罩走完，底片移除；回昼顺带把顶栏 z-index 放回 50
  *   0.95s    开关 timeline 主段结束，再 0.3s 摘门控 ⇒ 1.25s 收窄
  *
- * 🔴 为什么不用 ::view-transition-*（2.x 版用它的教训）：
- *   VT 的快照是位图且**冻结**，页面内元素在那 0.5s 里不可见也不可动。
- *   要做到「扩散与开关同时」，底层必须是活页面 —— 所以旧外观只能自己造一层。
+ * 🔴 两个方向的遮罩**不是同一个渐变**（主人 2026-10-23 定调）：
+ *   toDark （进夜，data-vt-dir="toDark"）
+ *     圆心透明、圆外不透明，--vt-r 从 0 长到外接圆
+ *     ⇒ 露出底下的实时新深色页面 = **黑色从开关扩出去**
+ *     ⇒ 同时开关就在圆心，孔扫过去它也在演
+ *   toLight（回昼，data-vt-dir="toLight"）
+ *     圆心**不透明**、圆外透明，--vt-r 从外接圆收到 0
+ *     ⇒ 旧深色底片是一块「黑盘」，从四周收回到开关 = **黑色收回来**
+ *     ⇒ t=0 黑盘满屏且它就是旧外观，第一帧零跳变
  *
- * 底片（.vt-plate）：
+ * 🔴 底片（.vt-plate）：
  *   · position:fixed 盖满视口，z-index 拉满，pointer-events:none，inert；
- *   · mask 用 radial-gradient，在圆心留透明孔，半径读 --vt-r（theme.js 逐帧写）；
- *   · 底片内部是克隆体，theme.js 已把旧主题的 CSS 变量写成行内样式。
+ *   · 半径读 --vt-r（theme.js 逐帧写），圆心读 --vt-x/--vt-y（写在 :root）；
+ *   · 底片内部是 body 克隆体，theme.js 已把旧主题的 CSS 变量写成行内样式。
+ *   · 克隆体里的 .topbar 必须藏掉：它是 position:sticky + 自带 z-index，
+ *     留在克隆里会跟真实顶栏抢层级（回昼时两者 z-index 相同，靠后的克隆会赢）。
+ *
+ * 🔴 html.vt-lift：回昼期间把真实顶栏抬到底片之上（2147483001 > 2147483000）。
+ *   否则开关被压在静态快照里「冻住」，看不到「变成太阳」。抬高只在回昼发生，
+ *   底片一撤就摘（见 theme.js 的 startReveal / cancel）。
  *
  * 降级（底片造不出来 / prefers-reduced-motion）：整页颜色渐变 0.45s。
  * 🔴 用 `html.theming *` 是因为只过渡容器的话，文字色会先在旧底色上跳到新色，
@@ -1328,24 +1339,206 @@
  *    而它只是「跟着背景一起暗」，肉眼几乎分不出。
  * ========================================================================== */
 
+/* 🔴 §羽化 = 两向对称的「内容层硬边 + 独立纯色羽化层」
+ *    （2026-10-26 第三版，取代「两向都单层渐变」与「只给回昼拆层」两版）
+ *
+ * 旧做法：给底片自己的 mask 写一条 radial-gradient，从 `r - 90px` 淡到 `r`。
+ * 问题：底片里装的是**整张旧页面的内容** —— 白卡片、进度条、文字、边框。
+ * alpha 渐变意味着「同一圈里 alpha 相同、内容不同」，半透明一混，这些内容
+ * 就变成灰影透出来，边缘一圈看着又脏又花。这就是主人反复说的
+ * 「蒙版颜色不统一 / 两个蒙版颜色不一样」。两向都中招，只是深色页更刺眼。
+ *
+ * 现在的结构，两向完全对称，只差硬边让位方向：
+ *   · `.vt-plate`（内容层，z 2147483000）—— **硬边**裁剪，只负责「看得见什么」。
+ *     快照颜色原样保留，永不被半透明污染。
+ *   · `.vt-halo`（羽化层，z 2147482999）—— 一块**纯色**全屏层，只负责
+ *     「边缘怎么过渡」。颜色取旧主题 --bg，所以它天然就是旧页面的边色。
+ *   羽化带永远位于「底片没有覆盖的那一侧」，于是层在下面也露得出来：
+ *     回昼 底片在盘**内**（不透明区 = 半径 < r）→ 硬边缩到 r - feather，
+ *          羽化带落在 [r - feather, r]（盘的外侧）；
+ *     进夜 底片在孔**外**（不透明区 = 半径 > r）→ 硬边放到 r + feather，
+ *          羽化带落在 [r, r + feather]（孔的内侧）。
+ *   ⇒ 带子里只有**一种颜色**在降 alpha，没有内容可糊，物理上不可能斑驳。
+ *
+ * 🔴 停靠点写法（四处各不同，别互相照抄）：
+ *   · 回昼 · 内容层末段写 `calc(... - feather + 1px)`，保证 r - feather ≤ 0 时
+ *     仍有 1px 差，渐变不会退化成「三个停靠点全落 0 ⇒ 用末色填充整屏」。
+ *     附带好处：r < feather 时内容层自动全透明，只剩羽化层的柔光圆 ——
+ *     正是「收进开关」的最后一段，不需要额外判断。
+ *   · 进夜 · 内容层末段写 `calc(... + feather + 1px)`，同理防退化。
+ *   · 回昼 · 羽化层末段直接写 `var(--vt-r)`：r=0 → 三停靠点全 0，末色透明 =
+ *     整层消失，正是终态。
+ *   · 进夜 · 羽化层末段写 `calc(... + feather)`：r=0 → 羽化带是 [0, 90]，
+ *     把「孔还没开」的那 90px 填满，与满屏旧亮色严丝合缝。
+ *
+ * ⚠️ 别再把进夜的羽化改回「底片自身 alpha 渐变」：那正是这次要修的病灶。
+ * ========================================================================== */
+
+.vt-plate,
+.vt-halo {
+  /* 羽化宽度：进夜与回昼对称取同一个值，改这里一处即可。 */
+  --vt-feather: 90px;
+}
+
 .vt-plate {
   position: fixed;
   inset: 0;
   z-index: 2147483000;
   overflow: hidden;
   pointer-events: none;
+  /* 兜底底色：buildPlate 正常会写 inline 的 html/body 底色，这里只防万一。 */
+  background: var(--bg);
+}
+
+/* 内容层 · 进夜：孔内透明（露出实时的新深色页面），孔外不透明（旧亮色底片）。
+   🔴 硬边要落在 `r + feather`，**故意比孔大一圈**：让出来的那一圈交给羽化层。
+      落成 `r + feather + 1px` 的理由同回昼 —— 不能让停靠点退化到 0。
+      早先这里是 alpha 渐变，结果底片里的白卡片/进度条跟着半透明混成灰影，
+      就是「两个蒙版颜色不一样」的来源。 */
+.vt-plate[data-vt-dir="toDark"] {
+  -webkit-mask-image: radial-gradient(
+    circle at var(--vt-x, 50%) var(--vt-y, 50%),
+    rgba(0, 0, 0, 0) 0,
+    rgba(0, 0, 0, 0) max(0px, calc(var(--vt-r, 0px) + var(--vt-feather, 90px))),
+    #000 calc(var(--vt-r, 0px) + var(--vt-feather, 90px) + 1px)
+  );
+  mask-image: radial-gradient(
+    circle at var(--vt-x, 50%) var(--vt-y, 50%),
+    rgba(0, 0, 0, 0) 0,
+    rgba(0, 0, 0, 0) max(0px, calc(var(--vt-r, 0px) + var(--vt-feather, 90px))),
+    #000 calc(var(--vt-r, 0px) + var(--vt-feather, 90px) + 1px)
+  );
+}
+
+/* 内容层 · 回昼：盘内不透明（旧深色底片的原色快照，**不做提亮** —— 2026-10-26
+   停用 PLATE_LIFT：提亮会让盘内卡片比进夜孔内亮 15~30 灰阶，两次圆动画的黑色
+   不一致，见 theme.js 顶部说明），盘外透明。
+   半径收缩即「黑色收回去」。 */
+.vt-plate[data-vt-dir="toLight"] {
+  -webkit-mask-image: radial-gradient(
+    circle at var(--vt-x, 50%) var(--vt-y, 50%),
+    #000 0,
+    #000 max(0px, calc(var(--vt-r, 0px) - var(--vt-feather, 90px))),
+    rgba(0, 0, 0, 0) calc(var(--vt-r, 0px) - var(--vt-feather, 90px) + 1px)
+  );
+  mask-image: radial-gradient(
+    circle at var(--vt-x, 50%) var(--vt-y, 50%),
+    #000 0,
+    #000 max(0px, calc(var(--vt-r, 0px) - var(--vt-feather, 90px))),
+    rgba(0, 0, 0, 0) calc(var(--vt-r, 0px) - var(--vt-feather, 90px) + 1px)
+  );
+}
+
+/* 羽化层：纯色（颜色由 theme.js 按旧主题 --bg 写在行内），只有 alpha 在变。
+   两向都建，结构对称，只有硬边让位的方向相反 —— 见上方 §羽化 总说明。 */
+.vt-halo {
+  position: fixed;
+  inset: 0;
+  z-index: 2147482999;
+  pointer-events: none;
+}
+
+/* 进夜：羽化带在孔的**内侧** [r, r + feather]。
+   r 处透明（孔心是纯新页面），r + feather 处不透明（正好接住底片的硬边）。 */
+.vt-halo[data-vt-dir="toDark"] {
   -webkit-mask-image: radial-gradient(
     circle at var(--vt-x, 50%) var(--vt-y, 50%),
     rgba(0, 0, 0, 0) 0,
     rgba(0, 0, 0, 0) var(--vt-r, 0px),
-    #000 calc(var(--vt-r, 0px) + 1px)
+    #000 calc(var(--vt-r, 0px) + var(--vt-feather, 90px))
   );
   mask-image: radial-gradient(
     circle at var(--vt-x, 50%) var(--vt-y, 50%),
     rgba(0, 0, 0, 0) 0,
     rgba(0, 0, 0, 0) var(--vt-r, 0px),
-    #000 calc(var(--vt-r, 0px) + 1px)
+    #000 calc(var(--vt-r, 0px) + var(--vt-feather, 90px))
   );
+}
+
+/* 回昼：羽化带在盘的**外侧** [r - feather, r]。
+   r - feather 处不透明（接住底片硬边），r 处透明（外面已是新亮色页面）。 */
+.vt-halo[data-vt-dir="toLight"] {
+  -webkit-mask-image: radial-gradient(
+    circle at var(--vt-x, 50%) var(--vt-y, 50%),
+    #000 0,
+    #000 max(0px, calc(var(--vt-r, 0px) - var(--vt-feather, 90px))),
+    rgba(0, 0, 0, 0) var(--vt-r, 0px)
+  );
+  mask-image: radial-gradient(
+    circle at var(--vt-x, 50%) var(--vt-y, 50%),
+    #000 0,
+    #000 max(0px, calc(var(--vt-r, 0px) - var(--vt-feather, 90px))),
+    rgba(0, 0, 0, 0) var(--vt-r, 0px)
+  );
+}
+
+/* 🔴 底片必须自己重新声明 color（2026-10-23 实测踩到）：
+ *   `color` 是**继承属性**，body 上的 `color: var(--text)` 早就被算成具体颜色了，
+ *   子元素继承的是这个**计算结果**。theme.js 只把旧主题的 --* 写到 .vt-plate 上，
+ *   克隆体里没声明 color 的元素（标题、正文、用 currentColor 的图标）仍然用
+ *   新主题的色 —— 进夜时看到「浅底 + 新主题浅字」，整张底片糊成一片。
+ *   这里显式声明一次，浏览器才会用 .vt-plate 上的旧 --text 重新解析。 */
+.vt-plate {
+  color: var(--text);
+}
+
+/* 🔴 克隆体里不许重播动画与过渡（同一次实测）：
+ *   cloneNode 会把元素带着的 CSS animation 一起复制，插入即**从头重播**。
+ *   实测进夜 120ms 时底片内 .card 的 opacity 只有 0.558 —— 卡片正在重演入场
+ *   淡入，底片于是半透明，扩散时看到的是「若隐若现的旧页面」。
+ *   底片是一张静态照片，动画/过渡一律掐掉。 */
+.vt-plate *,
+.vt-plate *::before,
+.vt-plate *::after {
+  animation: none !important;
+  transition: none !important;
+}
+
+/* 克隆体里的顶栏：
+ *   · 默认**保留可见** —— 进夜和回昼的底片都是「旧页面」，顶栏也得在原位，
+ *     否则克隆体会少掉 --topbar-h 那段高度，整片内容上移，扩散一圈扫过去
+ *     会看到内容突然错位（2026-10-23 实测：display:none 的副作用）。
+ *   · 回昼也不再隐藏它：顶栏现在**跟着黑盘一起回收**，底片里必须是完整的
+ *     旧深色顶栏，否则黑盘扫过顶栏时会露出空白。 */
+
+/* 🔴 回昼：顶栏**不抬**，而是压回普通层叠位置，让黑盘连它一起收（主人
+ *    2026-10-23 第二次指正：「顶栏提前白了，没有被蒙版覆盖到」）。
+ *
+ *    要同时满足两件事，只能这么拆：
+ *      a) 顶栏本身必须被底片（z-index 2147483000）盖住 —— 所以不能再给
+ *         它 2147483001；
+ *      b) 开关又要浮在黑盘之上，「变成太阳」才看得见 —— 所以单独抬 .tsw-wrap。
+ *
+ *    a 的实现有两个坑：
+ *      · `z-index: auto` —— sticky 元素只有 z-index 非 auto 时才创建层叠上下文；
+ *        归 auto 之后它不再自成一「层」，底片才盖得住。
+ *      · `backdrop-filter: none` —— **这个属性自己就会创建层叠上下文**。只把
+ *        z-index 归 auto 而留着 backdrop-filter，.tsw-wrap 的 z-index 仍被锁在
+ *        topbar 内部，永远压不过底片。
+ *        代价是这 0.45s 内顶栏失去玻璃模糊；但此刻顶栏正被底片盖住，看不见，
+ *        没有副作用。底片一撤，html.vt-lift 摘掉，玻璃立刻回来。
+ *
+ *    🔴 2026-10-26 第七轮：b 靠下面这条 `z-index: 2147483001` **抬不起来**。
+ *    不是「链条干净」的问题 —— 规范里 `position: sticky` **无条件创建层叠
+ *    上下文**（与 z-index 是否 auto 无关），.tsw-wrap 的层级只在这个上下文
+ *    内部比较，对挂在 body 上的 .vt-plate 完全无效。
+ *    实测（同实例 screencast 逐帧量胶囊像素宽）：回昼 0–450ms 画面宽度恒定
+ *    在「收窄档」，只在黑盘收完那一刻跳一次；把 topbar 临时改成 position:
+ *    static 后同样的量测立刻变成 16→25→32→38→42 逐帧增长。
+ *    ⇒ 真正的解法在 theme.js 的 liftSwitch()：回昼期间把开关节点搬到 body
+ *    顶层 + fixed 钉住原屏幕坐标，层叠上下文才是 root。
+ *    下面两条规则退化为**搬家失败时的兜底**（例如拿不到 .tsw-wrap），别删。 */
+html.vt-lift .topbar {
+  z-index: auto;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+/* 兜底（正常路径由 theme.js 搬家完成）：保留定位与层级，搬家没能执行时也能
+   抬一点是一点 —— 但如上所述，受 sticky 上下文所限，单靠这条不生效。 */
+html.vt-lift .tsw-wrap {
+  position: relative;
+  z-index: 2147483001;
 }
 
 .vt-plate-inner {

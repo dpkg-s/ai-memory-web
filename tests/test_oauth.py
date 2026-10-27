@@ -5,7 +5,8 @@
 覆盖：
   A  元数据：RFC 9728 受保护资源 / RFC 8414 授权服务器（含 registration_endpoint）
   B  401 挑战头：无凭据访问 /mcp 必须带 WWW-Authenticate: Bearer resource_metadata
-  C  动态注册（RFC 7591）：正常注册 / 拒绝公网 http 回调 / 拒绝空回调
+  C  动态注册（RFC 7591）：正常注册 / 拒绝公网 http 回调 / 拒绝空回调 /
+     拒绝声明 client_secret_post（本 AS 不签发也不校验 secret）
   D  授权页：未登录渲染登录表单；非法 client_id / redirect_uri / 缺 PKCE 就地报错
      （**绝不重定向**）
   E  端到端：账号口令 + 同意 → 授权码 → PKCE 换令牌 → 该令牌能访问 /api/config
@@ -101,6 +102,12 @@ check("A5 只声明 S256 作为 PKCE 方法",
 check("A6 grant_type 只含 authorization_code",
       _as.get("grant_types_supported") == ["authorization_code"],
       str(_as.get("grant_types_supported")))
+# A7（2026-10-27 增补）：这个字段是 RFC 8414 §2 的**承诺**，不是能力清单。
+# 声明了 client_secret_post 就必须能签发并校验 secret；做不到就不要声明，
+# 否则符合规范的客户端会照它去带 secret，带不上再在别处以看不懂的方式失败。
+check("A7 令牌端点认证方式只声明 none（无 secret 可发，就不许承诺）",
+      _as.get("token_endpoint_auth_methods_supported") == ["none"],
+      str(_as.get("token_endpoint_auth_methods_supported")))
 
 # =====================================================================
 section("B 401 挑战头")
@@ -172,6 +179,34 @@ _r = call("POST", "/oauth/register",
                 "client_name": "本地调试"})
 check("C5 接受回环 http 回调（本机客户端场景）", _r.status_code == 201,
       f"status={_r.status_code} body={_r.text[:160]}")
+
+# C6~C7（2026-10-27 增补）：A7 把声明收窄到 none 之后，这两条锁住「收窄」的
+# 两个方向 —— 声明外的值必须在**注册口**就拒掉（否则声明与行为各说各话），
+# 默认路径必须干净成功且**不发 secret**。C6 同时核三处计数：内存中的客户端表、
+# 重新从磁盘读出来的客户端表。拒得干净的标准是「连一行都不落盘」。
+_clients_before = len(_CFG["oauth_clients"].list())
+_r = call("POST", "/oauth/register",
+          json={"redirect_uris": [_CB], "client_name": "要 secret 的客户端",
+                "token_endpoint_auth_method": "client_secret_post"})
+_clients_after = len(_CFG["oauth_clients"].list())
+_clients_on_disk = len(
+    web_oauth.ClientStore(os.environ["AI_MEMORY_WEB_OAUTH_CLIENTS"]).list())
+check("C6 注册声明 client_secret_post ⇒ 400 invalid_client_metadata 且不落盘",
+      _r.status_code == 400
+      and _r.json().get("error") == "invalid_client_metadata"
+      and _clients_after == _clients_before
+      and _clients_on_disk == _clients_before,
+      f"status={_r.status_code} before={_clients_before} "
+      f"after={_clients_after} disk={_clients_on_disk} body={_r.text[:160]}")
+
+_r = call("POST", "/oauth/register",
+          json={"redirect_uris": [_CB], "client_name": "默认注册"})
+_reg_default = _r.json() if _r.status_code == 201 else {}
+check("C7 默认注册 ⇒ 201、认证方式回落 none、响应不含 client_secret",
+      _r.status_code == 201
+      and _reg_default.get("token_endpoint_auth_method") == "none"
+      and "client_secret" not in _reg_default,
+      f"status={_r.status_code} keys={sorted(_reg_default)} body={_r.text[:160]}")
 
 # =====================================================================
 section("D 授权页与入参校验")
@@ -259,6 +294,22 @@ _rows = [t for t in _CFG["tokens"].list() if str(t.get("name", "")).startswith("
 check("E6 令牌出现在令牌表里且名字带 oauth: 前缀（可在面板吊销）",
       bool(_rows) and _rows[0]["role"] == "admin" and _rows[0].get("owner") == "admin",
       str(_rows)[:200])
+
+# E7（2026-10-27 增补）：RFC 6749 §3.2 要求令牌端点**忽略**未识别的参数。
+# 声明收窄到 none 之后，老客户端仍可能惯性带上 client_secret —— 它必须被
+# 忽略而不是被拒，否则「收紧声明」会顺带变成一次可用性回归。
+# 断言里先核 payload 确实带了该键，避免这条测试退化成一个纯 200 检查。
+_code_extra, _ = _get_code()
+_payload_extra = {"grant_type": "authorization_code", "code": _code_extra,
+                  "client_id": CID, "redirect_uri": _CB,
+                  "code_verifier": _VERIFIER, "client_secret": "probe-value"}
+_r = call("POST", "/oauth/token", data=_payload_extra)
+_tok_extra = _r.json() if _r.status_code == 200 else {}
+check("E7 换码多带 client_secret ⇒ 被忽略且仍 200（RFC 6749 §3.2）",
+      "client_secret" in _payload_extra
+      and _r.status_code == 200
+      and str(_tok_extra.get("access_token", "")).startswith("amt_"),
+      f"status={_r.status_code} body={_r.text[:160]}")
 
 # =====================================================================
 section("F 失败路径")

@@ -106,6 +106,53 @@ var api = {
   tokenDelete: function (id) {
     return this.req("/api/tokens/" + encodeURIComponent(id), { method: "DELETE" });
   },
+  /* 访问日志（2026-10-27）。参数全部可选：limit / kind / actor / since。
+     服务端对非 admin 回 403 —— 这里不做前端判断，让权限只有一处事实源。 */
+  audit: function (params) {
+    var qs = [];
+    var p = params || {};
+    Object.keys(p).forEach(function (k) {
+      if (p[k] !== "" && p[k] !== null && p[k] !== undefined) {
+        qs.push(encodeURIComponent(k) + "=" + encodeURIComponent(p[k]));
+      }
+    });
+    return this.req("/api/audit" + (qs.length ? "?" + qs.join("&") : ""));
+  },
+  /* 导出访问日志（2026-10-27）——**唯一一个不走 req() 的接口**。
+     为什么不用 `<a download>` 直接指过去：会话过期时浏览器会把那段 JSON
+     错误原样存成 .csv，使用者拿到一个打不开的文件，却看不到「你掉线了」。
+     这里先用 fetch 取回正文，成功才转 Blob 下载，失败就能照常弹 toast。
+     返回值是 Blob（不是解析后的对象）—— CSV 不是 JSON，req() 的解析会把它
+     拆成 {error: "时间,类型,..."}，等于当场毁掉数据。 */
+  auditExport: function (params) {
+    var qs = [];
+    var p = params || {};
+    Object.keys(p).forEach(function (k) {
+      if (p[k] !== "" && p[k] !== null && p[k] !== undefined) {
+        qs.push(encodeURIComponent(k) + "=" + encodeURIComponent(p[k]));
+      }
+    });
+    var headers = {};
+    if (this.token) headers.Authorization = "Bearer " + this.token;
+    return fetch("/api/audit/export" + (qs.length ? "?" + qs.join("&") : ""), {
+      headers: headers,
+      credentials: "same-origin",
+      cache: "no-store",
+    }).then(function (res) {
+      if (!res.ok) {
+        return res.text().then(function (txt) {
+          var msg = "HTTP " + res.status;
+          try {
+            msg = JSON.parse(txt).error || msg;
+          } catch (e) {
+            /* 非 JSON 正文：保留状态码，别把 HTML 错误页塞进 toast */
+          }
+          throw Object.assign(new Error(msg), { status: res.status });
+        });
+      }
+      return res.blob();
+    });
+  },
   passwordChange: function (oldPw, newPw) {
     return this.req("/api/password", {
       method: "POST",

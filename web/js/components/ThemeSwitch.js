@@ -350,7 +350,16 @@ var ThemeSwitch = {
          这个延迟就是「动画演完 → 停一拍 → 胶囊收窄」里那一拍。 */
       var self = this;
       this._unlock = setTimeout(function () {
+        /* 🔴 交接顺序必须是这样（2026-10-26 第六轮）：
+           先摘 data-anim（恢复基类的 0.62s expo 过渡），再撤掉 GSAP 留下的
+           行内 width / left。两件事在同一个任务里完成 ⇒ 浏览器只算一次样式，
+           「前景 = 行内 72px + transition:none」「后景 = 基类 30.24px + 0.62s」
+           正好构成一次合法过渡，收窄才滑得出来。
+           反过来先撤行内再摘属性的话，中间那一帧会用 transition:none 把宽度
+           硬拽到 30.24，收窄就变成瞬跳。 */
         btn.removeAttribute("data-anim");
+        btn.style.width = "";
+        if (self._m && self._m.box) self._m.box.style.left = "";
         self._unlock = null;
       }, 300);
     },
@@ -375,19 +384,50 @@ var ThemeSwitch = {
          inline 值（属性形式它也会解析），替它预置终态只会让首切瞬跳、动画白播。
          上一版在这里有过一次 _primed 预置，实测「第一次切换不演」就是它造成的。 */
 
-      /* 门控：从这一刻起窗口锁定为全展开，直到滑块落定后再解禁。 */
-      this.lock(true);
-      /* 互斥窗口：动画期间 toggle / followSystem 直接早返回，连点不再互相 kill。 */
+      /* 门控不在这里加（2026-10-26 第五轮）：加锁会同时把 width 从当前值推向
+         100%，那是一条 CSS 过渡 —— 而 CSS 过渡的 startTime 是「下一帧」，
+         GSAP 用的却是**真实时间**。底片（克隆整棵 body）要花几十到上百毫秒，
+         这一帧被拖到 150ms 之后才来，于是：
+           滑块按真实时间已经走到 50%~90%（月亮早滑走了），窗口却刚从头开始涨。
+         主人看到的「月亮变太阳没了」「提前收纳」，有一半就出在这里 ——
+         那一段运动**从来没被画出来过**。
+         现在改成 paused:true，等底片这一帧真的画上去（两次 rAF）再同时起播：
+         GSAP 的 onStart、滑块第一帧、data-anim 加锁、CSS 过渡的 startTime
+         全部落在同一帧，进度都从 0 开始。 */
       this._busy = true;
 
       var self = this;
+      /* 🔴 胶囊宽度与内容层 left 也交给这条 timeline（2026-10-26 第六轮）：
+         它们原本是 CSS 过渡 —— 而 CSS 过渡的 startTime 是「下一帧」、缓动是基类
+         的 0.62s expo；GSAP 用的却是真实时间 + power2.inOut。两者叠在一起的结果
+         在暗切亮时最明显：left 在头 85ms 就冲掉 61%（expo 前段极快），滑块还没
+         起步，内容已经滑到位 —— 观感就是「tsw-box 的切换动画没生效」。
+         现在三个量（滑块 / 胶囊宽 / 内容层 left）同一个 tween 组、同一帧起点、
+         同一条曲线，物理上不可能错位。 */
+      var boxEl = m.box;
+      var startLeft = 0;
+      if (boxEl) {
+        startLeft = parseFloat(getComputedStyle(boxEl).left);
+        if (!isFinite(startLeft)) startLeft = 0;
+        /* 先钉住：Vue 换 night 类那一帧会把 left 算成 0，不钉就瞬跳一下再回来说不清。 */
+        boxEl.style.left = startLeft + "px";
+      }
+      var startW = this._btn ? this._btn.getBoundingClientRect().width : 0;
+      if (this._btn) this._btn.style.width = startW + "px";
+      var endW = this.$el ? this.$el.getBoundingClientRect().width : startW;
+
+      /* data-anim 同步加上：它现在**只**负责「停用 CSS 过渡」，不再写 width/left，
+         所以不会在首帧把值拽走，只是把话语权交给 GSAP。必须同步加 ——
+         等两次 rAF 再加就晚了，Vue 的类补丁会先按基类 expo 跑一段。 */
+      this.lock(true);
       /* 🔴 单时钟（2026-10-22 第三轮，主人定案 B）：View Transition 期间整页是
          静态快照，开关被冻在快照里 —— 等扩散结束再放行，就成了「页面先换完、
          开关 0.55s 后才补演」（实测错位 671ms）。撤掉 VT 后页面改走 0.45s 整页
          渐变，与本 timeline 同帧起跑，这里不需要任何等待。 */
       /* 圆孔在 timeline 的 onStart 里才开始扩 —— 那一 tick 正是滑块被画到
-         第一帧的时刻，两者物理同帧。theme.js 已把旧主题底片盖好（孔半径 0）等着。 */
-      var t = (this._tl = g.timeline({ onStart: startReveal }));
+         第一帧的时刻，两者物理同帧。theme.js 已把旧主题底片盖好（孔半径 0）等着。
+         paused:true ⇒ 下面排两次 rAF 后才从 0 起播，见上面对 CSS/GSAP 双时钟的说明。 */
+      var t = (this._tl = g.timeline({ onStart: startReveal, paused: true }));
       /* 0.95s = 滑块**回弹段**结束（0→66 用 0.45s，66→63 用 0.5s）——
          也就是肉眼上「开关演完了」的时刻。此后 300ms 摘锁 ⇒ 动画结束 + 0.3s 才开始收窄。
          为什么不等星星闪烁的尾巴（到 2.55s，见 TWINKLE）：星星在画面上方、滑块在
@@ -397,6 +437,14 @@ var ThemeSwitch = {
         self._busy = false;
         self.lock(false);
       }, null, 0.95);
+      /* 外壳两个量：与滑块首段等长（0.45s）、同一条曲线。
+         暗切亮 left 是 -42.48 → 0（内容随窗口一起滑），昼切夜本来就是 0 → 0（空转）。 */
+      if (m.btn) {
+        t.to(m.btn, { width: endW, duration: 0.45, ease: "power2.inOut" }, 0);
+      }
+      if (boxEl) {
+        t.to(boxEl, { left: 0, duration: 0.45, ease: "power2.inOut" }, 0);
+      }
       if (night) {
         t.to(m.thumb, { x: 66, duration: 0.45, ease: "power2.inOut" }, 0).to(
           m.thumb,
@@ -448,6 +496,41 @@ var ThemeSwitch = {
         t.to(m.moon, { x: 34, duration: 0.45, ease: "power2.inOut" }, 0);
         for (var j = 0; j < m.tw.length; j++) t.set(m.tw[j], { scaleX: 1 }, 0);
       }
+
+      /* 起播排期（2026-10-26 第五轮）：两次 rAF 才 play。
+         第一次 rAF 落在「底片已插入但还没画」的那一帧，它里面再挂一次，
+         第二次 rAF 才在底片已经上屏之后跑 —— 此时起播，进度从 0 开始。
+         加锁已经在上面同步做过了，这里只负责「什么时候开始走」。 */
+      var that = this;
+      var begun = false;
+      var arm = function () {
+        if (that._tl !== t) return;
+        begun = true;
+        if (that._guard) {
+          clearTimeout(that._guard);
+          that._guard = null;
+        }
+        t.play(0);
+      };
+      requestAnimationFrame(function () {
+        requestAnimationFrame(arm);
+      });
+      /* 🔴 兜底：rAF 在窗口被遮挡 / 切后台时会挂起，arm 就永远不会执行。
+         此时 _busy 一直为 true ⇒ 开关彻底按不动；行内 width/left 与 data-anim
+         也会一直挂着（transition:none 下连 hover 都不再展开）。所以要收干净：
+         放弃这条 timeline，走 lock(false) 让它 300ms 后自动复位。 */
+      if (this._guard) clearTimeout(this._guard);
+      this._guard = setTimeout(function () {
+        that._guard = null;
+        if (begun || that._tl !== t) return;
+        /* rAF 被挂起，起播永远不会来。干脆放弃这条 timeline：
+           lock(false) 会在 300ms 后摘 data-anim 并撤掉行内 width/left，
+           把开关交还给 CSS，别让它锁在「transition:none + 行内宽度」里。 */
+        that._busy = false;
+        that._tl = null;
+        t.kill();
+        that.lock(false);
+      }, 1000);
     },
 
     /* 光晕是「冲到过冲位、再微收回」两段，日月两向共用。
@@ -465,6 +548,10 @@ var ThemeSwitch = {
     var root = this.$el;
     this._btn = root.querySelector(".tsw");
     this._m = {
+      /* 外壳本体与内容层：胶囊的宽度、内容层的 left 现在也由 timeline 驱动
+         （2026-10-26 第六轮），所以一并收进节点表。 */
+      btn: this._btn,
+      box: root.querySelector(".tsw-box"),
       sky: root.querySelector(".tsw-sky"),
       stars: root.querySelector(".tsw-stars"),
       c1: root.querySelector(".tsw-c1"),
@@ -495,6 +582,10 @@ var ThemeSwitch = {
     if (this._unlock) {
       clearTimeout(this._unlock);
       this._unlock = null;
+    }
+    if (this._guard) {
+      clearTimeout(this._guard);
+      this._guard = null;
     }
   },
   template:

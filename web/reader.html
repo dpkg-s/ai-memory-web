@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>记忆库阅读器</title>
+<!--
+  记忆库只读阅读器（2026-10-27）
+  ----------------------------------------------------------------
+  为什么放在这里而不是本地双击打开：
+    服务端 /api/* 不返回 CORS 头（实测无 Access-Control-Allow-Origin），
+    file:// 页面 fetch 公网 API 必被浏览器拦。放在静态目录（挂载点 /assets）
+    与 API 同源，fetch 不需要任何 CORS 协商，也不用改后端、不用重启。
+
+  权限边界（这枚 viewer 令牌）：
+    可用组 = search / graph / health
+    ⇒ memory_search / smart_search / list / recent / context
+      memory_graph / orphans
+      memory_stats / doctor / audit / schema_diff
+    memory_read 属 content 组，viewer 直接 403（前端不提供入口，避免误导）。
+
+  令牌处理：URL ?token= → sessionStorage → 立刻从地址栏抹掉（不进浏览器历史），
+  页面只显示前缀，不显示明文。
+-->
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2330; --line:#30363d;
+    --text:#e6edf3; --muted:#8b949e; --accent:#58a6ff; --ok:#3fb950;
+    --warn:#d29922; --err:#f85149; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+    font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif}
+  header{position:sticky;top:0;z-index:9;background:rgba(13,17,23,.92);
+    backdrop-filter:blur(8px);border-bottom:1px solid var(--line);padding:10px 16px}
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  h1{margin:0;font-size:15px;font-weight:600;letter-spacing:.2px}
+  .badge{font:12px/1 var(--mono);padding:3px 7px;border-radius:999px;
+    border:1px solid var(--line);color:var(--muted);white-space:nowrap}
+  .badge.ok{color:var(--ok);border-color:#238636}
+  .badge.err{color:var(--err);border-color:#8b2c26}
+  .badge.warn{color:var(--warn);border-color:#6b4d0f}
+  main{max-width:1020px;margin:0 auto;padding:16px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+    padding:14px;margin-bottom:14px}
+  .card h2{margin:0 0 10px;font-size:13px;font-weight:600;color:var(--muted);
+    text-transform:uppercase;letter-spacing:.08em}
+  input,select,button,textarea{font:inherit;color:var(--text);background:var(--panel2);
+    border:1px solid var(--line);border-radius:7px;padding:8px 10px;outline:none}
+  input:focus,select:focus{border-color:var(--accent)}
+  input[type=search]{flex:1;min-width:180px}
+  button{cursor:pointer;background:var(--panel2);transition:.15s}
+  button:hover{border-color:var(--accent);color:var(--accent)}
+  button.primary{background:#1f6feb;border-color:#1f6feb;color:#fff;font-weight:600}
+  button.primary:hover{background:#388bfd;color:#fff}
+  button.ghost{background:transparent;color:var(--muted)}
+  .chips{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}
+  .chip{font-size:12px;padding:5px 9px;border-radius:999px;border:1px solid var(--line);
+    background:transparent;color:var(--muted);cursor:pointer}
+  .chip:hover{color:var(--accent);border-color:var(--accent)}
+  .meta{font:12px/1.5 var(--mono);color:var(--muted);margin-top:8px}
+  .out{white-space:pre-wrap;word-break:break-word;font:13px/1.65 var(--mono);
+    background:#0b0f14;border:1px solid var(--line);border-radius:8px;
+    padding:12px;margin:0;max-height:60vh;overflow:auto}
+  .out b{color:#ffd580;font-weight:600}
+  .err{color:var(--err)}
+  details{margin-top:10px}
+  summary{cursor:pointer;color:var(--muted);font-size:12px;user-select:none}
+  summary:hover{color:var(--accent)}
+  .hint{font-size:12px;color:var(--muted)}
+  .hide{display:none}
+  .spin{display:inline-block;width:12px;height:12px;border:2px solid var(--line);
+    border-top-color:var(--accent);border-radius:50%;animation:s .7s linear infinite}
+  @keyframes s{to{transform:rotate(360deg)}}
+  @media (max-width:560px){ main{padding:10px} .card{padding:11px} }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="row">
+    <h1>记忆库阅读器</h1>
+    <span class="badge" id="bTok">令牌 · 未载入</span>
+    <span class="badge" id="bRole">角色 · ?</span>
+    <span class="badge" id="bView">视野 · ?</span>
+    <span style="flex:1"></span>
+    <button class="ghost" id="btnForget" title="清除本机保存的令牌">退出</button>
+  </div>
+</header>
+
+<main>
+  <!-- 令牌缺失时才出现 -->
+  <div class="card hide" id="gate">
+    <h2>需要令牌</h2>
+    <div class="row">
+      <input id="tokIn" type="password" placeholder="amt_… 粘贴只读令牌" style="flex:1">
+      <button class="primary" id="btnTok">使用</button>
+    </div>
+    <div class="meta">也可以直接带参数打开：<code id="usage"></code></div>
+  </div>
+
+  <div class="card">
+    <h2>检索</h2>
+    <div class="row">
+      <input id="kw" type="search" placeholder="关键词（标题 / 标签 / 正文），回车即搜">
+      <select id="mt" title="记忆类型">
+        <option value="">全部类型</option>
+        <option>fact</option><option>decision</option><option>experience</option>
+        <option>project</option><option>preference</option><option>workflow</option>
+        <option>constraint</option><option>episodic</option><option>temporary</option>
+      </select>
+      <select id="lim" title="返回条数">
+        <option>5</option><option selected>10</option><option>20</option><option>50</option>
+      </select>
+      <button class="primary" id="btnSearch">搜索</button>
+    </div>
+    <div class="chips">
+      <button class="chip" data-act="recent">最近 7 天</button>
+      <button class="chip" data-act="stats">库统计</button>
+      <button class="chip" data-act="orphans">孤立笔记</button>
+      <button class="chip" data-act="graph">当前词条 → 图谱</button>
+      <button class="chip" data-act="health">体检</button>
+    </div>
+    <div class="meta" id="meta">就绪</div>
+  </div>
+
+  <div class="card">
+    <h2>结果</h2>
+    <pre class="out" id="out">输入关键词后按回车开始。<b>粗体</b> 是命中词的高亮。</pre>
+    <details id="rawBox" class="hide">
+      <summary>原始 JSON</summary>
+      <pre class="out" id="raw"></pre>
+    </details>
+  </div>
+
+  <div class="card">
+    <h2>说明</h2>
+    <div class="hint">
+      本页走 <code>POST /api/call</code>（单次调用，不需要维护 MCP 会话）。<br>
+      这枚令牌是 <b>viewer</b> 角色，只能调 <code>search</code> / <code>graph</code> / <code>health</code> 三组工具：
+      <code>memory_search</code>、<code>memory_smart_search</code>、<code>memory_list</code>、<code>memory_recent</code>、
+      <code>memory_context</code>、<code>memory_graph</code>、<code>memory_orphans</code>、<code>memory_stats</code>、
+      <code>memory_doctor</code>、<code>memory_audit</code>、<code>memory_schema_diff</code>。<br>
+      <code>memory_read</code> 属「内容读写」组，viewer 会被 403 —— 要读单条正文请换 operator / admin 令牌。
+    </div>
+  </div>
+</main>
+
+<script>
+(function(){
+  'use strict';
+  const API = '/api/call';
+  const SS  = 'aim_reader_token';
+  const $   = id => document.getElementById(id);
+
+  // ---- 令牌：URL → sessionStorage → 抹掉地址栏 -------------------------
+  const qs = new URLSearchParams(location.search);
+  let TOKEN = (qs.get('token') || '').trim();
+  if (TOKEN) {
+    sessionStorage.setItem(SS, TOKEN);
+    qs.delete('token');
+    const q = qs.toString();
+    history.replaceState(null, '', location.pathname + (q ? '?' + q : ''));
+  } else {
+    TOKEN = (sessionStorage.getItem(SS) || '').trim();
+  }
+  let prefix = TOKEN ? TOKEN.slice(0, 12) + '…' : '';
+
+  $('usage').textContent = location.origin + location.pathname + '?token=amt_…';
+
+  function paintToken(){
+    const b = $('bTok');
+    if (TOKEN){ b.textContent = '令牌 · ' + (prefix || '已载入'); b.className = 'badge ok'; }
+    else { b.textContent = '令牌 · 未载入'; b.className = 'badge err'; $('gate').classList.remove('hide'); }
+  }
+  paintToken();
+
+  $('btnTok').onclick = () => {
+    const v = ($('tokIn').value || '').trim();
+    if (!v) return;
+    TOKEN = v; prefix = v.slice(0,12) + '…';
+    sessionStorage.setItem(SS, v); $('tokIn').value = '';
+    paintToken(); $('gate').classList.add('hide'); boot();
+  };
+  $('btnForget').onclick = () => {
+    sessionStorage.removeItem(SS); TOKEN = ''; prefix = '';
+    location.href = location.pathname;
+  };
+
+  // ---- 调用封装 --------------------------------------------------------
+  async function call(tool, args){
+    const t0 = performance.now();
+    const r = await fetch(API, {
+      method:'POST',
+      headers:{ 'Content-Type':'application/json', 'Authorization':'Bearer ' + TOKEN },
+      body: JSON.stringify({ tool, arguments: args || {} })
+    });
+    const dt = Math.round(performance.now() - t0);
+    let j;
+    try { j = await r.json(); }
+    catch(e){ throw new Error('返回不是 JSON（HTTP ' + r.status + '）'); }
+    if (!r.ok || j.ok === false || j.error){
+      throw new Error((j && j.error) ? j.error : ('HTTP ' + r.status));
+    }
+    const txt = (j.content || []).filter(c => c && c.type === 'text')
+                                .map(c => c.text).join('\n');
+    return { text: txt, raw: j, ms: (j.elapsed_ms || dt) };
+  }
+
+  // ---- 渲染：先转义，再把 **命中** 变粗体 ------------------------------
+  function esc(s){ return String(s).replace(/[&<>]/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[m])); }
+  function md(s){ return esc(s).replace(/\*\*([^*\n]{1,80})\*\*/g, '<b>$1</b>'); }
+
+  let busy = false;
+  function status(msg, cls){
+    $('meta').innerHTML = (cls === 'err' ? '<span class="err">' + esc(msg) + '</span>' : esc(msg));
+  }
+  async function run(label, tool, args){
+    if (!TOKEN){ $('gate').classList.remove('hide'); status('请先填令牌', 'err'); return; }
+    if (busy) return;
+    busy = true;
+    $('btnSearch').disabled = true;
+    status(label + ' · 调用中…');
+    $('out').innerHTML = '<span class="spin"></span>';
+    try {
+      const r = await call(tool, args);
+      $('out').innerHTML = r.text ? md(r.text) : '（空）';
+      $('raw').textContent = JSON.stringify({ tool, arguments: args, elapsed_ms: r.ms,
+                                              result: r.raw }, null, 2);
+      $('rawBox').classList.remove('hide');
+      status(label + ' · ' + r.ms + ' ms · ' + (r.text ? r.text.length : 0) + ' 字符');
+    } catch (e){
+      $('out').innerHTML = '<span class="err">调用失败：' + esc(e.message) + '</span>';
+      $('rawBox').classList.add('hide');
+      status('失败', 'err');
+    } finally {
+      busy = false; $('btnSearch').disabled = false;
+    }
+  }
+
+  // ---- 动作 ------------------------------------------------------------
+  const act = {
+    search(){
+      const kw = ($('kw').value || '').trim();
+      if (!kw) { status('先输入关键词', 'err'); $('kw').focus(); return; }
+      const args = { keyword: kw, limit: Number($('lim').value) || 10 };
+      const mt = $('mt').value; if (mt) args.mem_type = mt;
+      run('检索「' + kw + '」', 'memory_search', args);
+    },
+    recent(){ run('最近 7 天', 'memory_recent', { days: 7, limit: Number($('lim').value) || 10 }); },
+    stats(){ run('库统计', 'memory_stats', {}); },
+    orphans(){ run('孤立笔记', 'memory_orphans', {}); },
+    graph(){
+      const t = ($('kw').value || '').trim();
+      if (!t){ status('先在检索框里填条目名', 'err'); return; }
+      run('图谱「' + t + '」', 'memory_graph', { title: t });
+    },
+    health(){ run('体检', 'memory_doctor', {}); }
+  };
+
+  $('btnSearch').onclick = act.search;
+  $('kw').addEventListener('keydown', e => { if (e.key === 'Enter') act.search(); });
+  document.addEventListener('keydown', e => {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k'){ e.preventDefault(); $('kw').focus(); }
+  });
+  document.querySelectorAll('.chip').forEach(b => {
+    b.onclick = () => { const f = act[b.dataset.act]; if (f) f(); };
+  });
+
+  // ---- 启动：拿身份 + 库概况 -------------------------------------------
+  async function boot(){
+    if (!TOKEN) return;
+    // GET /mcp 带 ?token= 且无 MCP Accept 头 ⇒ 服务端回「令牌自证报文」（含 role/clearance）
+    try {
+      const r = await fetch('/mcp?token=' + encodeURIComponent(TOKEN), { headers:{ 'Accept':'*/*' } });
+      const j = await r.json();
+      const a = j.auth || {}, t = j.token || {};
+      if (t.name) $('bTok').textContent = '令牌 · ' + (t.name || prefix);
+      if (a.role) $('bRole').textContent = '角色 · ' + a.role;
+      if (a.clearance) $('bView').textContent = '视野 · ' + a.clearance + ' / ' + (a.access || '?');
+      $('bRole').className = 'badge ' + (a.role === 'viewer' ? 'warn' : 'ok');
+      $('bView').className = 'badge ok';
+    } catch (e){ /* 身份卡是非关键路径，失败不阻塞 */ }
+    act.stats();
+  }
+  boot();
+  if (TOKEN) $('kw').focus();
+})();
+</script>
+</body>
+</html>

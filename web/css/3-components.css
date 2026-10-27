@@ -13,20 +13,11 @@
    ⚠️ CSS animation 的优先级高于 transition —— 两者同时存在于同一元素时，
    过渡会被 keyframes 整段盖住，离场更是完全没有动作（.page 上实测踩过）。
    所以规则整体撤掉，只保留类名：各页根元素仍带 .page，别处 :has() 依赖它。 */
-.page-head {
-  margin-bottom: 20px;
-}
-
-.page-title {
-  font-size: 23px;
-  margin-bottom: 4px;
-}
-
-.page-sub {
-  color: var(--text-dim);
-  font-size: 13.5px;
-  max-width: 74ch;
-}
+/* 页头三件套（.page-head / .page-title / .page-sub）已于 2026-10-23 随配置页
+   （最后一个使用者）摘除页头而整组删除：概览、调试台、记忆库三页更早即不再用，
+   配置页是最后残留。若日后需要页头，按 `.page-head{margin-bottom:20px}` +
+   `.page-title{font-size:23px;margin-bottom:4px}` +
+   `.page-sub{color:var(--text-dim);font-size:13.5px;max-width:74ch}` 重建即可。 */
 
 .grid {
   display: grid;
@@ -902,14 +893,30 @@
 .tsw[data-anim="1"],
 .tsw[data-anim="1"]:hover,
 .tsw[data-anim="1"]:focus-visible {
-  width: 100%;
+  /* 🔴 2026-10-26 第六轮：这里只**关掉过渡**，不再写 width / left。
+   *
+   * 演进（三次都踩在同一个坑上，记全了别再走）：
+   *   ① 最初 `transition: none` + `width: 100%`：加锁瞬间把宽度从当前值硬拽到
+   *      满宽，展开那半段消失（主人报「一半动画没了」）。
+   *   ② 改成 `transition: width 0.45s`：展开回来了，但它跟 GSAP 是两条时钟 ——
+   *      CSS 过渡的 startTime 是「下一帧」，被底片构建拖到 ~179ms 才赋值；
+   *      缓动也是这里的 ease-in-out，与滑块的 power2.inOut 不同族。
+   *   ③ 今天主人报「暗切亮时 tsw-box 的切换动画没生效」：left 走的是**基类**
+   *      0.62s expo（因为 Vue 换 night 类早于加锁），expo 前段极快 —— 85ms 就
+   *      冲掉 61%，滑块还没起步内容已经到位，看起来就是没有动画。
+   *
+   * 结论：**同一视觉结果只能有一个驱动者**。宽度与 left 现在由 ThemeSwitch 的
+   * GSAP timeline 驱动（与滑块同一个 tween 组、同一帧起点、同一条曲线），
+   * CSS 这边唯一的职责就是把过渡停掉，否则每一帧的行内写入都会被过渡再补一次，
+   * 反而拖成两条影子。 */
   transition: none;
 }
 
 .tsw[data-anim="1"] .tsw-box,
 .tsw[data-anim="1"]:hover .tsw-box,
 .tsw[data-anim="1"]:focus-visible .tsw-box {
-  left: 0;
+  /* 同上：left 交给 GSAP。这里若写 `left: 0` 会把「起始位移」这一信息抹掉，
+     滑块的第一步就没有内容可滑了。 */
   transition: none;
 }
 

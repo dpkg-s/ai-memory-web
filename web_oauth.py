@@ -63,8 +63,13 @@ CLIENT_PREFIX = "amc_"
 #: 支持的授权类型 / 响应类型。刻意只列这两项：多列一个就多一条未测代码路径。
 GRANT_TYPES = ("authorization_code",)
 RESPONSE_TYPES = ("code",)
-#: 令牌端点认证方式。ChatGPT 这类公共客户端没有 secret，必须允许 ``none``。
-TOKEN_AUTH_METHODS = ("none", "client_secret_post")
+#: 令牌端点认证方式。**只列 ``none``**：本 AS 面向的是网页型公共客户端
+#: （ChatGPT 这类），它们没有、也不该有 ``client_secret``。此前这里还列了
+#: ``client_secret_post``，但注册既不签发 secret、换令牌也不校验 secret ——
+#: 等于对外承诺一条并不存在的认证通道。而 RFC 8414 §2 里这个字段是**承诺**
+#: 而非建议：客户端会照它决定要不要带 secret，带不上就在注册/换码阶段以
+#: 看不懂的方式失败。少一条声明 = 少一条未测路径（同 GRANT_TYPES 的理由）。
+TOKEN_AUTH_METHODS = ("none",)
 
 
 class OAuthError(Exception):

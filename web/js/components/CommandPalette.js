@@ -1,6 +1,6 @@
 import { nextTick } from "../../vendor/vue.esm-browser.prod.js";
 import { S, toast } from "../core/store.js";
-import { go } from "../core/router.js";
+import { go, pageAllowed } from "../core/router.js";
 import { applyTheme } from "../core/theme.js";
 import { loadHealth, loadOverview, loadRecentActivity, loadTools } from "../core/data.js";
 import { selectTool } from "../features/console.js";
@@ -45,7 +45,11 @@ var CommandPalette = {
     },
     all: function () {
       var out = [];
+      /* 页面候选按角色裁剪（2026-10-26）：面板是第二个入口，藏着侧栏却留着
+         面板里的「调试台 / 访问控制」，等于换了个地方把门打开。
+         判据与侧栏同源 —— core/router.js#PAGE_ROLES。 */
       PAGES.forEach(function (p) {
+        if (!pageAllowed(S.role, p.id)) return;
         out.push({
           key: "page:" + p.id,
           group: "页面",
@@ -142,22 +146,25 @@ var CommandPalette = {
           }
         },
       });
-      (S.tools || []).forEach(function (t) {
-        out.push({
-          key: "tool:" + t.name,
-          group: "工具",
-          label: toolZhName(t.name) || t.name,
-          sub: t.name,
-          icon: "terminal",
-          hit: t.name + " " + (toolZhName(t.name) || "") + " " + (t.description || ""),
-          run: function () {
-            go("console");
-            nextTick(function () {
-              selectTool(t);
-            });
-          },
+      /* 工具候选的目标是调试台 —— 那一页不可见时整段不产候选，
+         否则「搜了个工具名、回车却掉进空页面」。 */
+      if (pageAllowed(S.role, "console"))
+        (S.tools || []).forEach(function (t) {
+          out.push({
+            key: "tool:" + t.name,
+            group: "工具",
+            label: toolZhName(t.name) || t.name,
+            sub: t.name,
+            icon: "terminal",
+            hit: t.name + " " + (toolZhName(t.name) || "") + " " + (t.description || ""),
+            run: function () {
+              go("console");
+              nextTick(function () {
+                selectTool(t);
+              });
+            },
+          });
         });
-      });
       return out;
     },
     items: function () {

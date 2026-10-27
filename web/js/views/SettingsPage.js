@@ -25,22 +25,52 @@ var SettingsPage = {
   data: function () {
     return {
       S: S,
-      tabs: SETTINGS_TABS,
       endpointDraft: "",
       fnsDraft: null,
       showToken: false,
       importText: "",
       importReport: null,
+      /* FNS 连通性体检结果（POST /api/fns/probe）。null = 还没测过。 */
+      probe: null,
+      probing: false,
     };
   },
   computed: {
+    /* 左栏页签按角色裁剪（2026-10-26 主人：「FNS 同步也不应该」）。
+       FNS 页签整块是**配置下发面**（服务器地址 / 令牌 / 排除规则），
+       非管理员连看都不该看到 —— 早前只把输入框 disabled 是半成品：
+       掩码口令旁边摆着「显示」按钮、再摆一颗「测试连接」，该看的还是能看。
+
+       ⚠️ 只从 data 里摘掉 tabs、改成 computed 是必须的：同名键同时出现在
+       data 与 computed 时 data 优先，页签会变成永远不裁剪的静态数组
+       （本文件末尾那段注释记的正是同一个坑的另一次发作）。 */
+    tabs: function () {
+      if (this.canEdit) return SETTINGS_TABS;
+      return SETTINGS_TABS.filter(function (t) {
+        return t.id !== "fns";
+      });
+    },
     /* 配置页当前页签**直接派生**自 S.settingsTab —— 页面内 cfg-nav 是唯一入口。
        （2026-10-13：顶端标签条已整块摘除，原来与它共用的真值源只剩 cfg-nav。）
        早前用本地 data + watch("S.settingsTab") 做同步，
        实测那个 watcher **根本不触发**（S.settingsTab 变了、页面不动），
-       改成 computed 后这类同步问题从根上消失。 */
+       改成 computed 后这类同步问题从根上消失。
+
+       2026-10-26 补一道**深链兜底**：Root.mounted 会把 `#/settings?tab=fns`
+       直接写进 S.settingsTab（那时还不知道角色），所以这里必须把不可见的页签
+       映射回 conn —— 否则页签没了、内容区还照画，等于留了个后门。 */
     tab: function () {
-      return S.settingsTab || "conn";
+      var t = S.settingsTab || "conn";
+      if (!this.canEdit && t === "fns") return "conn";
+      return t;
+    },
+    /* 可修改性（2026-10-26 主人指令：可修改的配置也要按角色隐藏）。
+       口径与后端 `ADMIN_ONLY` 完全一致 —— admin 之外一律不给编辑面。
+       空 role（本地回环免鉴权 / 首帧）按**可编辑**处理：那是主人本机形态，
+       裁掉等于把自己锁在外面。 */
+    canEdit: function () {
+      if (!S.role) return true;
+      return S.role === "admin";
     },
     R: function () {
       return S.about.resolved || {};
@@ -116,6 +146,46 @@ var SettingsPage = {
         false,
       );
     },
+    /* 测试 FNS 连接（2026-10-23）：把**当前草稿值**（未保存也算）送到后端的探针，
+       由服务端真去问 FNS：/api/health 判可达、/api/vault 判令牌与库白名单。
+       为什么不在前端直接 fetch —— 控制台可能跑在容器里（h29k 中心），
+       浏览器能通的地址 ≠ 容器能通的地址，测出来的是假阳性。 */
+    probeFns: function () {
+      var self = this;
+      var f = self.fnsDraft || {};
+      self.probing = true;
+      self.probe = null;
+      api
+        .post("/api/fns/probe", {
+          server: f.server || "",
+          client_type: f.client_type || "",
+          vault: f.vault || "",
+          token: f.token || "",
+        })
+        .then(function (res) {
+          var p = (self.probe = (res && res.probe) || null);
+          if (!p) return;
+          if (p.code === 1) {
+            toast("ok", "FNS 连接正常",
+              (p.version ? "服务端 v" + p.version + " · " : "") +
+                (p.vault_found ? "库内有 " + (p.note_count || 0) + " 篇笔记"
+                               : "令牌可用，但看不到该库"));
+          } else if (!p.reachable) {
+            toast("err", "连不上 FNS", p.message);
+          } else {
+            toast("err", "FNS 拒绝了请求",
+              p.details || p.message || ("code " + p.code));
+          }
+        })
+        .catch(function (e) {
+          self.probe = { reachable: false, code: null, message: e.message,
+                         hint: "" };
+          toast("err", "测试失败", e.message);
+        })
+        .then(function () {
+          self.probing = false;
+        });
+    },
     saveFns: function () {
       var self = this;
       var fns = self.fnsDraft || {};
@@ -125,7 +195,7 @@ var SettingsPage = {
           vault_dir: (S.about.app || {}).vault_dir || "",
           fns: {
             server: fns.server,
-            account: fns.account,
+            client_type: fns.client_type,
             vault: fns.vault,
             token: fns.token,
             exclude: fns.exclude,
@@ -161,7 +231,7 @@ var SettingsPage = {
       var d = self.fnsDraft || (self.fnsDraft = {});
       var filled = [];
       var overwritten = 0;
-      ["server", "account", "vault", "token", "exclude"].forEach(function (f) {
+      ["server", "client_type", "vault", "token", "exclude"].forEach(function (f) {
         if (!(f in res.fields)) return;
         var v = res.fields[f];
         if (f === "exclude") {
@@ -342,7 +412,9 @@ var SettingsPage = {
           var f = (v.app && v.app.fns) || {};
           this.fnsDraft = {
             server: f.server || "",
-            account: f.account || "",
+            /* 兼容旧配置：1.11.x 之前这个键叫 account（当时的标签还误写作「账号」）。
+               后端 _FNS_LEGACY 已在读盘时迁移，这里再兜一层是为了「页面先于保存」。 */
+            client_type: f.client_type || f.account || "",
             vault: f.vault || "",
             token: f.token || "",
             exclude: Array.isArray(f.exclude) ? f.exclude.slice() : [],
@@ -372,8 +444,9 @@ var SettingsPage = {
   },
   template:
     '<div class="page">' +
-    '  <div class="page-head"><h1 class="page-title">配置</h1>' +
-    '    <p class="page-sub">连接、运行时阈值与 FNS 同步配置。FNS 凭据存放在 vault <b>之外</b>，不会被同步出去。</p></div>' +
+    /* 页头（.page-head）已摘除（2026-10-23 主人令）：与概览/调试台/记忆库三页同口径，
+       标题信息由左栏 .cfg-sec 的 CONFIGURATION 段与各卡 card-head 承担。
+       page-sub 那句「凭据存在 vault 之外」已由 FNS 卡内的 x-banner 重复表达。 */
     '  <div class="settings-grid">' +
     '    <nav class="cfg-nav">' +
     /* 拖尾残影 + 指示条是 .cfg-nav 的**头两个**子元素：两者都是绝对定位 ⇒
@@ -397,9 +470,10 @@ var SettingsPage = {
     "        <span class=\"dot\" :class=\"S.health.ok ? 'ok' : 'err'\"></span>{{ S.health.ok ? '已连接' : '未连接' }}</x-pill></template>" +
     '      <x-field label="端点 URL">' +
     '        <template #hint>留空则用环境变量默认值 <code>{{ R.mcp_default }}</code>。保存后立即生效，无需重启控制台。</template>' +
-    '        <div class="input-group"><input class="input mono" v-model="endpointDraft" :placeholder="R.mcp_default">' +
+    '        <div class="input-group" v-if="canEdit"><input class="input mono" v-model="endpointDraft" :placeholder="R.mcp_default">' +
     '          <button class="btn" @click="connTest" :class="{loading:S.health.checking}">测试</button>' +
     "          <button class=\"btn btn-primary\" @click=\"saveEndpoint\"><span v-html=\"svg('save')\"></span>保存</button></div>" +
+    '        <div class="mono small" v-else>{{ endpointDraft || R.mcp_default }}</div>' +
     '      </x-field>' +
     '      <x-kv class="cfg-stagger">' +
     "        <x-kv-row label=\"server\" :value=\"S.health.server ? (S.health.server.name+' '+(S.health.server.version||'')) : ''\"></x-kv-row>" +
@@ -436,14 +510,15 @@ var SettingsPage = {
     '          <x-field v-for="k in thKeys" :key="k" :label="k">' +
     '            <template #label><x-pill :kind="srcPill(th.data.keys[k].source)">{{ srcLabel(th.data.keys[k].source) }}</x-pill>' +
     '              <x-pill mono>默认 {{ th.data.keys[k].default }}</x-pill></template>' +
-    '            <input class="input mono" type="number" step="any" v-model="th.draft[k]" @input="watchTh()">' +
+    '            <input class="input mono" type="number" step="any" v-model="th.draft[k]" @input="watchTh()" v-if="canEdit">' +
+    '            <div class="mono" v-else>{{ th.draft[k] }}</div>' +
     '            <template #hint>' +
     '              <div class="hint" v-if="thDesc(k)">{{ thDesc(k) }}</div>' +
     "              <div class=\"hint mono\" v-if=\"th.data.keys[k].source==='env'\">被环境变量 {{ th.data.keys[k].env }} 覆盖 —— 保存进 memory.toml 也不会生效</div>" +
     '            </template>' +
     '          </x-field>' +
     '        </div>' +
-    '        <div class="center wrap mt">' +
+    '        <div class="center wrap mt" v-if="canEdit">' +
     "          <button class=\"btn btn-primary\" :class=\"{loading:th.saving}\" @click=\"saveTh\"><span v-html=\"svg('save')\"></span>保存到 memory.toml</button>" +
     '          <button class="btn btn-ghost" @click="loadTh(true)">放弃修改</button>' +
     '          <button class="btn btn-ghost" @click="resetTh">填内置默认值</button>' +
@@ -455,8 +530,8 @@ var SettingsPage = {
     '        </div>' +
     '      </div></x-card>' +
     "  </div>" +
-    "  <div v-if=\"tab==='fns' && fnsDraft\" data-cfg-pane>" +
-    '    <x-card title="快速导入" sub="粘贴 JSON，自动填表">' +
+    "  <div v-if=\"tab==='fns' && canEdit && fnsDraft\" data-cfg-pane>" +
+    '    <x-card title="快速导入" sub="粘贴 JSON，自动填表" v-if="canEdit">' +
     '      <template #actions><x-pill mono>JSON</x-pill></template>' +
     '      <x-banner icon="file">' +
     '        <div>把 FNS 客户端的 <span class="mono">config.json</span> 整段粘进来，自动识别 <span class="mono">api / apiToken / vault / client</span> 等字段，填入下方表单。</div>' +
@@ -480,26 +555,41 @@ var SettingsPage = {
     '    <x-card class="mt" title="FNS 同步">' +
     '      <template #actions><x-pill mono>客户端配置</x-pill></template>' +
     '      <x-banner icon="info">' +
-    '        <div>这些字段保存在 <b>vault 之外的配置文件</b>里（当前：<span class="mono">{{ R.config_path }}</span>），因此不会被同步出去。控制台负责「配置值的落账与导出」，实际同步由 FNS 客户端读取该配置执行。</div></x-banner>' +
+    '        <div>这些字段保存在 <b>vault 之外的配置文件</b>里（当前：<span class="mono">{{ R.config_path }}</span>），因此不会被同步出去。<b>保存后</b>，同步容器会自己来拉取并渲染成它的 <span class="mono">config.yaml</span>（反向拉取，无需给容器写权限）。</div></x-banner>' +
     '      <div class="row2 cfg-stagger">' +
     '        <x-field label="服务器地址">' +
-    '          <input class="input mono" v-model="fnsDraft.server" placeholder="https://obs.example.com:58889" @input="S.fns.dirty=true"></x-field>' +
-    '        <x-field label="账号">' +
-    '          <input class="input" v-model="fnsDraft.account" placeholder="登录账号" @input="S.fns.dirty=true"></x-field>' +
+    '          <input class="input mono" v-model="fnsDraft.server" placeholder="https://obs.example.com:58889" @input="S.fns.dirty=true" :disabled="!canEdit"></x-field>' +
+    '        <x-field label="客户端类型">' +
+    '          <input class="input mono" v-model="fnsDraft.client_type" placeholder="GoFastNoteSync" @input="S.fns.dirty=true" :disabled="!canEdit"></x-field>' +
     '        <x-field label="Vault 名">' +
-    '          <input class="input mono" v-model="fnsDraft.vault" placeholder="ai-memory-centralization" @input="S.fns.dirty=true"></x-field>' +
+    '          <input class="input mono" v-model="fnsDraft.vault" placeholder="ai-memory-centralization" @input="S.fns.dirty=true" :disabled="!canEdit"></x-field>' +
     '        <x-field label="口令 / Token">' +
-    '          <div class="input-group"><input class="input mono" :type="showToken?\'text\':\'password\'" v-model="fnsDraft.token" placeholder="仅存本地，不进 vault" @input="S.fns.dirty=true">' +
+    '          <div class="input-group"><input class="input mono" :type="showToken?\'text\':\'password\'" v-model="fnsDraft.token" placeholder="仅存本地，不进 vault" @input="S.fns.dirty=true" :disabled="!canEdit">' +
     "            <button class=\"btn\" @click=\"showToken=!showToken\">{{ showToken ? '隐藏' : '显示' }}</button></div></x-field>" +
     '      </div>' +
     '      <x-field label="排除规则">' +
     '        <template #hint>一行一条。当前 {{ (fnsDraft.exclude||[]).length }} 条。</template>' +
-    '        <textarea class="textarea" v-model="fnsDraft.excludeText" placeholder="每行一条，如：.obsidian/**&#10;*.tmp" @input="fnsDraft.exclude=fnsDraft.excludeText.split(/[\\r\\n,]+/).filter(Boolean); S.fns.dirty=true"></textarea>' +
+    '        <textarea class="textarea" v-model="fnsDraft.excludeText" :disabled="!canEdit" placeholder="每行一条，如：.obsidian/**&#10;*.tmp" @input="fnsDraft.exclude=fnsDraft.excludeText.split(/[\\r\\n,]+/).filter(Boolean); S.fns.dirty=true"></textarea>' +
     '      </x-field>' +
-    '      <div class="center wrap mt">' +
+    '      <div class="center wrap mt" v-if="canEdit">' +
+    '        <button class="btn" @click="probeFns" :class="{loading:probing}"><span v-html="svg(\'link\')"></span>测试连接</button>' +
     "        <button class=\"btn btn-primary\" @click=\"saveFns\"><span v-html=\"svg('save')\"></span>保存 FNS 配置</button>" +
     '        <x-pill kind="warn" v-if="S.fns.dirty">有未保存修改</x-pill>' +
-    '      </div></x-card>' +
+    '      </div>' +
+    /* 体检结果：成功只报「能不能用、库里有几篇」，失败必须给出原因码与可执行提示 ——
+       「获取不到配置」这类模糊感受，就是缺这一块才查不动。 */
+    '      <x-banner kind="ok" icon="check" v-if="probe && probe.code===1">' +
+    '        <div><b>连接正常</b><span v-if="probe.version"> · 服务端 v{{ probe.version }}</span>' +
+    '          <span v-if="probe.client"> · 客户端类型 <span class="mono">{{ probe.client }}</span></span></div>' +
+    '        <div class="small" v-if="probe.vault">库 <span class="mono">{{ probe.vault }}</span>：' +
+    '          <b v-if="probe.vault_found">{{ probe.note_count || 0 }} 篇笔记</b>' +
+    '          <b v-else>不在该令牌的可见列表里</b></div>' +
+    '        <div class="small faint" v-if="probe.hint">{{ probe.hint }}</div></x-banner>' +
+    '      <x-banner kind="err" icon="alert" v-else-if="probe">' +
+    '        <div><b>{{ probe.reachable ? (\'FNS 拒绝了请求（code \' + probe.code + \'）\') : \'连不上 FNS\' }}</b>' +
+    '          <div class="small">{{ probe.message }}</div>' +
+    '          <div class="small faint" v-if="probe.hint">{{ probe.hint }}</div></div></x-banner>' +
+    '      </x-card>' +
     "  </div>" +
     "  <div v-if=\"tab==='about'\" data-cfg-pane>" +
     '    <x-card title="关于">' +
@@ -511,10 +601,10 @@ var SettingsPage = {
     '        <x-kv-row label="配置存储" mono :value="R.config_path"></x-kv-row>' +
     "        <x-kv-row label=\"鉴权\" :value=\"R.auth_enabled ? '已启用（Bearer token）' : '关闭（仅回环可访问）'\"></x-kv-row>" +
     '      </x-kv>' +
-    '      <div class="divider"></div>' +
-    '      <x-banner icon="shield">' +
-    '        <div><b>三道闸门</b><div class="small">① 破坏性工具执行前二次确认；② 删除走回收站（可 <span class="mono">memory_restore</span> 找回）；③ 审计记录写在 vault 之外。</div></div></x-banner>' +
-'      <div class="hint">控制台不直连 vault、不在进程内直调：对记忆库的一切读写都走完整 MCP 协议，因此与其它 AI 客户端共享同一把锁与同一套索引维护。</div>' +
+    /* 「三道闸门」banner 已摘除（2026-10-23 主人令），连带其上方的 .divider ——
+       divider 原本只为分隔 kv 与该 banner 而存在，banner 没了它就成了孤立装饰线。
+       末句 hint 补 mt：原先与 kv 的间距由 banner 的外边距提供，删掉后需自带。 */
+    '      <div class="hint mt">控制台不直连 vault、不在进程内直调：对记忆库的一切读写都走完整 MCP 协议，因此与其它 AI 客户端共享同一把锁与同一套索引维护。</div>' +
 '    </x-card>' +
 
 /* -------- 版本与更新（2026-10-16 起为**双目标卡**） --------
@@ -528,6 +618,7 @@ var SettingsPage = {
        只有原文能定位。
      · 「重启服务」是**全局**动作（launcher 的 restart 同时停/起 8700 与 8811），
        因此不按目标重复，只在其后放一颗。 */
+'    <template v-if="canEdit">' +
 '    <x-card class="mt" v-for="d in updList" :key="d.target" :title="\'版本与更新 · \' + (d.target_name || d.target)">' +
 '      <template #head>' +
 '        <x-pill mono>{{ d.target }}</x-pill>' +
@@ -592,8 +683,9 @@ var SettingsPage = {
 '        <button class="btn btn-danger" v-if="d.conflicts && d.conflicts.length" :class="{loading:applyingOf(d.target)}" @click="doUpdate(d.target, true)">强制覆盖</button>' +
 '      </div>' +
 '    </x-card>' +
+'    </template>' +
 
-'    <x-card class="mt" title="服务重启">' +
+'    <x-card class="mt" title="服务重启" v-if="canEdit">' +
 '      <x-banner kind="warn" icon="alert" v-if="S.update.reconnecting">' +
 '        <div>正在等待服务恢复… 剩余 {{ S.update.seconds }} 秒</div></x-banner>' +
 '      <div class="center wrap">' +

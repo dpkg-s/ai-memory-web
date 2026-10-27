@@ -7,6 +7,31 @@ import { loadThresholds } from "../features/settings.js";
  * 7. hash 路由
  * ==================================================================== */
 var PAGES = ["dashboard", "console", "library", "access", "settings"];
+
+/* 页面可见性（**唯一事实源**，2026-10-26 建立）。
+   ------------------------------------------------------------------
+   键 = 页面 id，值 = 允许看到该页的角色；**不在表里 = 所有角色可见**。
+   为什么放在 router 而不是各视图里：入口有三处（侧栏 nav、命令面板、
+   hash 直达），三处各写一份判据，迟早会漏掉一处 —— 2026-10-26 之前
+   控制台就正好漏了「调试台」这一页。
+
+   ⚠️ 这只是**界面裁剪**，不是权限。真正的拦截在服务端：
+     · 写接口 → web_console.ADMIN_ONLY（admin 之外 403）
+     · 工具调用 → web_store.role_allows_tool（viewer 只能碰只读工具组）
+   前端藏入口只解决「看不见就点不到」，不解决「知道 URL 直接打接口」。
+
+   ⚠️ role 为空串（本地回环免鉴权 / 首帧异步未到位）一律视为**不裁剪**。
+   空值当「没有权限」会让管理员入口在首帧被藏掉，而 Vue 不会因为
+   role 后到就自动把 v-for 里被过滤掉的项补回来（2026-10-22「账号 0 个」同源）。 */
+var PAGE_ROLES = {
+  console: ["admin", "operator"],
+  access: ["admin", "operator"],
+};
+function pageAllowed(role, id) {
+  if (!role) return true;
+  var allow = PAGE_ROLES[id];
+  return !allow || allow.indexOf(role) >= 0;
+}
 function readHash() {
   var m = (location.hash || "").replace(/^#\/?/, "").split("?")[0];
   return PAGES.indexOf(m) >= 0 ? m : "dashboard";
@@ -158,4 +183,4 @@ window.addEventListener("hashchange", function () {
   });
 });
 
-export { PAGES, readHash, go, syncNavInd, syncTabInd, syncCfgInd };
+export { PAGES, PAGE_ROLES, pageAllowed, readHash, go, syncNavInd, syncTabInd, syncCfgInd };
