@@ -100,7 +100,8 @@ git push origin master --follow-tags
 
 **写在哪里**：存成 `.github/release-notes/<tag>.md`（如 `v1.11.4.md`），`release.yml` 优先取它当正文；
 文件不存在才退回 `--generate-notes`。文件名必须与 tag **完全一致、含 `v` 前缀**，大小写敏感。
-2026-10-27 起三仓口径统一 —— docker 仓先这么改，core 仓与本仓跟进。
+2026-10-27 起三仓口径统一 —— docker 仓先这么改，core 仓与本仓跟进。文件里**只写正文，不写
+H1 标题** —— 标题由带注释 tag 的 subject 提供（`git tag -a v1.11.4 -m "v1.11.4 — 一句话"`）。
 
 ### 附件
 
