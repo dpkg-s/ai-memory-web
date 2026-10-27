@@ -26,6 +26,12 @@
 #
 # ⚠️ 2026-10-22 校验和：两个二进制附件各附 `<文件名>.sha256`（`sha256sum` 格式，
 #   只记裸文件名）。exe 的校验和与核心仓**必须一致** —— 是同一个字节。
+#
+# ⚠️ 2026-10-27 正文口径：Release 正文优先取 `.github/release-notes/<tag>.md`。
+#   此前一律 `--generate-notes`，正文只有 "What's Changed" 和 PR 列表 —— 那是给
+#   改代码的人看的，而 Release 正文的读者是**装了但不动代码的人**。本仓跟随
+#   docker / core 的口径：打 tag 前在 `.github/release-notes/<tag>.md` 写一份
+#   用户视角的说明；不写也能发，但会退回自动生成。
 name: Release
 
 on:
@@ -98,7 +104,14 @@ jobs:
             if [ -n "$SUBJ" ]; then TITLE="$SUBJ"; fi
           fi
           echo "release title = $TITLE"
-          gh release create "$TAG" --title "$TITLE" --generate-notes
+          NOTES_FILE=".github/release-notes/$TAG.md"
+          if [ -f "$NOTES_FILE" ]; then
+            echo "release body = $NOTES_FILE（人工写，用户视角）"
+            gh release create "$TAG" --title "$TITLE" --notes-file "$NOTES_FILE"
+          else
+            echo "release body = 自动生成（未提供 $NOTES_FILE）"
+            gh release create "$TAG" --title "$TITLE" --generate-notes
+          fi
 
       # 附件一：控制台源码包。排除 .github/ 与 tests/，与历史 Release 的 tgz 形态对齐。
       - name: Attach source tarball
