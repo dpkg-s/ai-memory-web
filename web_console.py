@@ -114,7 +114,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlencode
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 import anyio
 import httpx
@@ -123,8 +123,8 @@ from starlette.background import BackgroundTask
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import (FileResponse, JSONResponse, Response,
-                                StreamingResponse)
+from starlette.responses import (FileResponse, HTMLResponse, JSONResponse,
+                                RedirectResponse, Response, StreamingResponse)
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
@@ -134,7 +134,9 @@ from mcp.client.streamable_http import streamablehttp_client
 # 同目录模块（非第三方）。2026-10-21：账号登录与会话签名。
 # 只用标准库实现，不给 requirements.txt 加任何依赖 —— 见 web_auth.py 顶部取舍说明。
 # 2026-10-22：web_store 承载用户表与令牌表（多用户 + 可吊销令牌）。
+# 2026-10-26：web_oauth 承载 OAuth 2.1 授权服务器（网页型 MCP 客户端的接入前提）。
 import web_auth
+import web_oauth
 import web_store
 
 logger = logging.getLogger("ai-memory.web")
@@ -284,6 +286,59 @@ def _get_stores(users_path: Path, tokens_path: Path):
     return got
 
 
+_OAUTH_CLIENTS: dict[str, web_oauth.ClientStore] = {}
+_OAUTH_CODES: web_oauth.CodeStore | None = None
+_OAUTH_LOCK = threading.Lock()
+
+
+def _get_oauth_clients(path: Path) -> web_oauth.ClientStore:
+    """客户端注册表按路径缓存（**一个进程内同一文件只允许有一个写者**）。
+
+    为什么必须缓存：``ClientStore`` 把 ``oauth_clients.json`` 读进内存、每次
+    注册后整体重写。如果每个请求都新建实例，两个实例各持一份快照，后写的一方
+    会把先写的一方**静默覆盖** —— 现象是「刚注册的客户端过一会儿就不认识了」。
+    与 ``_get_stores`` 同一取向。
+    """
+    key = str(path)
+    got = _OAUTH_CLIENTS.get(key)
+    if got is None:
+        got = web_oauth.ClientStore(path)
+        _OAUTH_CLIENTS[key] = got
+    return got
+
+
+def _get_oauth_codes() -> web_oauth.CodeStore:
+    """授权码仓库：进程级单例（纯内存，重启即清空，见 web_oauth.CodeStore）。"""
+    global _OAUTH_CODES
+    with _OAUTH_LOCK:
+        if _OAUTH_CODES is None:
+            _OAUTH_CODES = web_oauth.CodeStore()
+        return _OAUTH_CODES
+
+
+def _public_base(request: Request, cfg: dict) -> str:
+    """本次请求对应的**外部可见**基址（不带尾斜杠）。
+
+    优先级：显式 ``AI_MEMORY_WEB_PUBLIC_URL`` > 反代头 > 请求自身。
+
+    为什么不能只用 ``request.base_url``：控制台只绑回环，经 Cloudflare Tunnel
+    转发后本地看到的 scheme 恒为 ``http``、host 恒为 ``127.0.0.1:8890``。
+    把这两个直接拼进 OAuth 元数据，客户端拿到的授权地址会指向它自己的内网
+    ⇒ 表现为「授权页打不开」或「issuer 校验失败」。cloudflared 会带
+    ``X-Forwarded-Proto`` / ``X-Forwarded-Host``，优先采信它们。
+    """
+    fixed = str(cfg.get("public_url") or "").strip().rstrip("/")
+    if fixed:
+        return fixed
+    proto = (request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
+             or request.url.scheme or "http")
+    host = (request.headers.get("x-forwarded-host", "").split(",")[0].strip()
+            or request.headers.get("host", "") or request.url.netloc)
+    if not host:
+        return ""
+    return f"{proto}://{host}"
+
+
 def config() -> dict:
     """解析运行时配置（含全部校验）。危险组合一律抛错，不静默兜底。"""
     host = _env_str("AI_MEMORY_WEB_HOST", DEFAULT_WEB_HOST) or DEFAULT_WEB_HOST
@@ -397,6 +452,23 @@ def config() -> dict:
                         owner=login_user or "system"):
             logger.info("已把 AI_MEMORY_TOKEN 纳入令牌表（admin / 永不过期）")
 
+    # ---- OAuth 2.1 授权服务器（2026-10-26）--------------------------------
+    # 解决的是「网页型 AI 产品无法粘贴令牌」这一特定问题：这类客户端只走
+    # MCP Authorization（401 → 元数据 → 动态注册 → 授权页 → 换令牌）。
+    # 默认跟随认证形态开启：纯回环裸跑时既没有 token 也没有账号，没人可授权，
+    # 开着只会凭空多两个匿名端点。
+    oauth_enabled = (bool(_env_bool("AI_MEMORY_WEB_OAUTH", True))
+                     and bool(token or login_enabled))
+    # 公网基址。元数据里必须是**外部可见**的绝对 URL，否则 issuer 校验必失败；
+    # 能显式配就显式配，推导逻辑见 _public_base（依赖反代头）。
+    public_url = (_env_str("AI_MEMORY_WEB_PUBLIC_URL") or "").rstrip("/")
+    if public_url and not re.match(r"^https?://", public_url):
+        raise WebConfigError(
+            f"AI_MEMORY_WEB_PUBLIC_URL={public_url!r} 必须是 http(s):// URL。")
+    oauth_clients_path = Path(_env_str("AI_MEMORY_WEB_OAUTH_CLIENTS")
+                              or (cfg_dir / "oauth_clients.json"))
+    oauth_clients = _get_oauth_clients(oauth_clients_path)
+
     return {
         "host": host,
         "port": port,
@@ -419,6 +491,12 @@ def config() -> dict:
         "static": static,
         "config_path": config_path(),
         "config_write": _env_bool("AI_MEMORY_WEB_CONFIG_WRITE", DEFAULT_CONFIG_WRITE),
+        # OAuth 面（2026-10-26）
+        "oauth_enabled": oauth_enabled,
+        "oauth_clients": oauth_clients,
+        "oauth_clients_path": str(oauth_clients_path),
+        "oauth_codes": _get_oauth_codes(),
+        "public_url": public_url,
     }
 
 
@@ -1846,6 +1924,289 @@ class WebConsole:
         )
         return resp
 
+    # -- OAuth 2.1 授权服务器（2026-10-26）---------------------------------
+    # 这一组端点是给**网页型 MCP 客户端**用的：它们没有「填令牌」的入口，
+    # 只能走标准授权流。access_token 最终仍是一枚 oauth: 前缀的 ``amt_`` 令牌，
+    # 所以 /mcp 反代、中间件、视野与读写模式这条链路一行都不用改。
+    def _oauth_base(self, request: Request) -> str:
+        return _public_base(request, self.cfg)
+
+    async def oauth_prm(self, request: Request) -> Response:
+        """RFC 9728 受保护资源元数据：告诉客户端「令牌该向谁要」。"""
+        if not self.cfg["oauth_enabled"]:
+            return _err(404, "未启用 OAuth。")
+        return JSONResponse(
+            web_oauth.protected_resource_metadata(self._oauth_base(request)))
+
+    async def oauth_as(self, request: Request) -> Response:
+        """RFC 8414 授权服务器元数据。
+
+        ``registration_endpoint`` 是网页类客户端的生死线 —— 拿不到
+        ``client_id`` 就无法发起授权，所以这个端点必须存在且免鉴权。
+        """
+        if not self.cfg["oauth_enabled"]:
+            return _err(404, "未启用 OAuth。")
+        return JSONResponse(
+            web_oauth.authorization_server_metadata(self._oauth_base(request)))
+
+    async def oauth_register(self, request: Request) -> Response:
+        """RFC 7591 动态客户端注册。**免鉴权**：这是客户端的第一个请求，
+        此时它还没有任何凭据。
+
+        正因为匿名可写，校验必须严格（见 ``web_oauth.redirect_uri_allowed``），
+        并且客户端数量封顶 —— 否则任何人都能把磁盘写满。
+        """
+        cfg = self.cfg
+        if not cfg["oauth_enabled"]:
+            return _err(404, "未启用 OAuth。")
+        try:
+            body = await _json_body(request)
+        except WebConfigError as e:
+            return _err(400, str(e))
+        try:
+            rec = cfg["oauth_clients"].register(
+                redirect_uris=body.get("redirect_uris") or [],
+                client_name=str(body.get("client_name") or ""),
+                token_endpoint_auth_method=str(
+                    body.get("token_endpoint_auth_method") or "none"))
+        except web_oauth.OAuthError as e:
+            return JSONResponse({"error": e.code, "error_description": e.message},
+                                status_code=400)
+        logger.info("OAuth 客户端注册：%s %s", rec["client_name"], rec["redirect_uris"])
+        return JSONResponse({
+            "client_id": rec["client_id"],
+            "client_id_issued_at": int(rec["created_at"]),
+            "client_name": rec["client_name"],
+            "redirect_uris": rec["redirect_uris"],
+            "grant_types": rec["grant_types"],
+            "response_types": rec["response_types"],
+            "token_endpoint_auth_method": rec["token_endpoint_auth_method"],
+        }, status_code=201)
+
+    def _oauth_authorize_ctx(self, params) -> dict:
+        """校验授权请求里的**全部**不可信入参，返回已净化的上下文。
+
+        任何一项不合法都抛 ``OAuthError``。调用方必须注意：``client_id`` /
+        ``redirect_uri`` 不可信时**不能**重定向回去（那等于开放重定向），
+        只能就地渲染错误页。
+        """
+        cfg = self.cfg
+        get = params.get
+        client_id = str(get("client_id") or "").strip()
+        redirect_uri = str(get("redirect_uri") or "").strip()
+        rec = cfg["oauth_clients"].get(client_id)
+        if not rec:
+            raise web_oauth.OAuthError("invalid_client", "未知的 client_id。")
+        if not cfg["oauth_clients"].redirect_ok(client_id, redirect_uri):
+            raise web_oauth.OAuthError(
+                "invalid_request", f"redirect_uri 与该客户端注册值不一致：{redirect_uri}")
+        if str(get("response_type") or "") != "code":
+            raise web_oauth.OAuthError("unsupported_response_type",
+                                       "只支持 response_type=code。")
+        challenge = str(get("code_challenge") or "").strip()
+        if not challenge:
+            raise web_oauth.OAuthError("invalid_request",
+                                       "缺少 code_challenge：本服务只接受 PKCE 授权请求。")
+        if str(get("code_challenge_method") or "").strip() != "S256":
+            raise web_oauth.OAuthError("invalid_request",
+                                       "只支持 code_challenge_method=S256。")
+        state = str(get("state") or "")
+        scope = str(get("scope") or "")
+        resource = str(get("resource") or "")
+        return {
+            "client_id": client_id,
+            "client_name": rec.get("client_name") or client_id,
+            "redirect_uri": redirect_uri,
+            "state": state, "scope": scope, "resource": resource,
+            "challenge": challenge,
+            "hidden": {
+                "client_id": client_id, "redirect_uri": redirect_uri,
+                "response_type": "code", "code_challenge": challenge,
+                "code_challenge_method": "S256", "state": state,
+                "scope": scope, "resource": resource,
+            },
+        }
+
+    def _oauth_session_user(self, request: Request) -> dict | None:
+        """当前浏览器里的有效登录会话（用于「已登录就直接确认」）。"""
+        cfg = self.cfg
+        if not cfg["session_key"]:
+            return None
+        sess = web_auth.read_session(
+            request.cookies.get(web_auth.COOKIE_NAME, ""), cfg["session_key"])
+        if not sess:
+            return None
+        live = cfg["users"].session_valid(str(sess.get("u") or ""),
+                                          str(sess.get("e") or ""))
+        if not live:
+            return None
+        return {"user": live["name"], "role": live.get("role", "viewer")}
+
+    async def _oauth_form(self, request: Request) -> dict:
+        """解析入参：**表单与 JSON 都收**。
+
+        规范只要求 ``application/x-www-form-urlencoded``，但实测有客户端
+        图省事发 JSON。刻意不用 ``request.form()`` —— 那会引入
+        ``python-multipart`` 依赖，而本仓的部署原则是「不加任何新依赖」
+        （见 web_auth.py 顶部）。urlencoded 用标准库解析即可。
+        """
+        raw = await request.body()
+        if len(raw) > MAX_BODY_BYTES:
+            raise WebConfigError(f"请求体超过 {MAX_BODY_BYTES // 1024} KiB。")
+        text = raw.decode("utf-8", "replace")
+        ctype = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+        if ctype == "application/json":
+            try:
+                obj = json.loads(text or "{}")
+            except ValueError:
+                return {}
+            return ({str(k): str(v) for k, v in obj.items()}
+                    if isinstance(obj, dict) else {})
+        return {k: v[0] for k, v in parse_qs(text, keep_blank_values=True).items()}
+
+    @staticmethod
+    def _oauth_redirect(uri: str, params: dict) -> Response:
+        """回到**已确认属于该客户端**的 ``redirect_uri``，带上结果参数。"""
+        qs = urlencode({k: v for k, v in params.items() if v})
+        if not qs:
+            return RedirectResponse(uri, status_code=302)
+        sep = "&" if "?" in uri else "?"
+        return RedirectResponse(f"{uri}{sep}{qs}", status_code=302)
+
+    async def oauth_authorize_get(self, request: Request) -> Response:
+        """授权页（GET）。未登录则在同一页上让用户登录并确认。"""
+        cfg = self.cfg
+        if not cfg["oauth_enabled"]:
+            return HTMLResponse(web_oauth.error_page("未启用", "本控制台未启用 OAuth。"),
+                                status_code=404)
+        try:
+            ctx = self._oauth_authorize_ctx(request.query_params)
+        except web_oauth.OAuthError as e:
+            return HTMLResponse(web_oauth.error_page("授权请求无效", e.message),
+                                status_code=400)
+        sess = self._oauth_session_user(request)
+        return HTMLResponse(web_oauth.authorize_page(
+            client_name=ctx["client_name"], redirect_uri=ctx["redirect_uri"],
+            state=ctx["state"], scope=ctx["scope"],
+            role=(sess or {}).get("role") or "viewer",
+            user=(sess or {}).get("user") or "",
+            need_login=not sess,
+            login_enabled=bool(cfg["login_enabled"]),
+            hidden=ctx["hidden"]))
+
+    async def oauth_authorize_post(self, request: Request) -> Response:
+        """授权页提交：登录（若需要）+ 同意/拒绝 → 签发授权码。"""
+        cfg = self.cfg
+        if not cfg["oauth_enabled"]:
+            return HTMLResponse(web_oauth.error_page("未启用", "本控制台未启用 OAuth。"),
+                                status_code=404)
+        form = await self._oauth_form(request)
+        try:
+            ctx = self._oauth_authorize_ctx(form)
+        except web_oauth.OAuthError as e:
+            return HTMLResponse(web_oauth.error_page("授权请求无效", e.message),
+                                status_code=400)
+        if str(form.get("decision") or "") != "allow":
+            # 拒绝也是排障事实：授权页点错一次，客户端侧只会说「授权失败」。
+            logger.info("OAuth 授权被拒绝：client=%s", ctx["client_id"])
+            return self._oauth_redirect(
+                ctx["redirect_uri"], {"error": "access_denied", "state": ctx["state"]})
+
+        sess = self._oauth_session_user(request)
+        if not sess:
+            ip = _client_ip(request)
+            left = self._limiter.blocked_for(ip)
+            if left:
+                return HTMLResponse(
+                    web_oauth.error_page("尝试过于频繁", f"请 {left} 秒后再试。"),
+                    status_code=429)
+            rec = cfg["users"].verify(str(form.get("username") or "").strip(),
+                                      str(form.get("password") or ""))
+            if not rec:
+                left = self._limiter.fail(ip)
+                # 只记客户端与来源 IP，**不记用户名/口令**（用户名属 PII，
+                # 口令更是绝对禁区）。这一条是「授权页卡住」最直接的证据。
+                logger.warning("OAuth 授权页登录失败：client=%s ip=%s",
+                               ctx["client_id"], ip)
+                msg = "用户名或口令不正确。"
+                if left:
+                    msg += f" 请 {left} 秒后再试。"
+                return HTMLResponse(web_oauth.authorize_page(
+                    client_name=ctx["client_name"], redirect_uri=ctx["redirect_uri"],
+                    state=ctx["state"], scope=ctx["scope"], role="", user="",
+                    need_login=True, login_enabled=bool(cfg["login_enabled"]),
+                    hidden=ctx["hidden"], error=msg), status_code=401)
+            self._limiter.reset(ip)
+            sess = {"user": rec["name"], "role": rec.get("role", "viewer")}
+
+        role = sess.get("role") or "viewer"
+        code = cfg["oauth_codes"].issue(
+            client_id=ctx["client_id"], redirect_uri=ctx["redirect_uri"],
+            user=sess["user"], role=role, clearance=web_store.clearance_of(role),
+            challenge=ctx["challenge"], scope=ctx["scope"], resource=ctx["resource"])
+        logger.info("OAuth 授权通过：client=%s user=%s role=%s",
+                    ctx["client_id"], sess["user"], role)
+        return self._oauth_redirect(ctx["redirect_uri"],
+                                    {"code": code, "state": ctx["state"]})
+
+    async def oauth_token(self, request: Request) -> Response:
+        """授权码 + PKCE → 一枚 ``amt_`` 访问令牌（复用令牌表，可吊销）。"""
+        cfg = self.cfg
+
+        def bad(code: str, msg: str, status: int = 400) -> Response:
+            # 只记**错误码**，不记 code / code_verifier / redirect_uri：前者是
+            # 一次性凭据，后两者会把完整的回调地址与校验器写进日志。
+            logger.info("OAuth 换令牌失败：error=%s status=%s", code, status)
+            return JSONResponse({"error": code, "error_description": msg},
+                                status_code=status,
+                                headers={"Cache-Control": "no-store"})
+
+        if not cfg["oauth_enabled"]:
+            return bad("invalid_request", "未启用 OAuth。", 404)
+        form = await self._oauth_form(request)
+        if str(form.get("grant_type") or "") != "authorization_code":
+            return bad("unsupported_grant_type", "只支持 authorization_code。")
+
+        # 先消费再校验：无论后续哪一步失败，这个码都不能再用（防重放）。
+        rec = cfg["oauth_codes"].consume(str(form.get("code") or ""))
+        if not rec:
+            return bad("invalid_grant", "授权码无效、已被使用或已过期。")
+        client_id = str(form.get("client_id") or "")
+        if client_id and client_id != rec["client_id"]:
+            return bad("invalid_grant", "client_id 与授权码不匹配。")
+        if str(form.get("redirect_uri") or "") != rec["redirect_uri"]:
+            return bad("invalid_grant", "redirect_uri 与授权时不一致。")
+        verifier = str(form.get("code_verifier") or "")
+        if not verifier:
+            return bad("invalid_request", "缺少 code_verifier。")
+        try:
+            got = web_oauth.s256(verifier)
+        except (UnicodeEncodeError, ValueError):
+            return bad("invalid_request", "code_verifier 含非 ASCII 字符。")
+        if not hmac.compare_digest(got, rec["challenge"]):
+            return bad("invalid_grant", "PKCE 校验失败。")
+
+        client = cfg["oauth_clients"].get(rec["client_id"]) or {}
+        label = client.get("client_name") or rec["client_id"][:12]
+        try:
+            plain, pub = cfg["tokens"].create(
+                name=f"oauth:{label}", owner=rec["user"], role=rec["role"],
+                clearance=rec["clearance"] or None,
+                expires_in=web_oauth.ACCESS_TTL, max_uses=0)
+        except web_store.StoreError as e:
+            logger.warning("OAuth 签发令牌失败：%s", e)
+            return bad("server_error", f"签发令牌失败：{e}", 500)
+        # 字段名从 ``token=`` 改成 ``id=``：这里记的是令牌表记录号（``t_…``），
+        # 不是令牌本身。沿用 ``token=`` 会让后来读日志的人以为泄露了凭据。
+        logger.info("OAuth 换令牌：user=%s client=%s id=%s",
+                    rec["user"], rec["client_id"], pub.get("id"))
+        return JSONResponse({
+            "access_token": plain,
+            "token_type": "Bearer",
+            "expires_in": web_oauth.ACCESS_TTL,
+            "scope": rec.get("scope") or "",
+        }, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
+
     async def logout(self, request: Request) -> Response:
         """清除会话 Cookie。
 
@@ -2201,8 +2562,13 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
 #: 免鉴权的 API 路径。**精确匹配**而非前缀匹配 —— 否则 `/api/sessionXXX`
 #: 这类路径会白拿一张免死金牌。
-    PUBLIC = ("/api/login", "/api/logout", "/api/session")
-
+    PUBLIC = ("/api/login", "/api/logout", "/api/session",
+              # OAuth 面（2026-10-26）：这五个端点**必须在鉴权之前**可达 ——
+              # 客户端正是「没有凭据」才来走这条路的。授权页自己的身份判断
+              # （Cookie 会话 / 表单账号口令）在处理器内部完成。
+              "/.well-known/oauth-protected-resource",
+              "/.well-known/oauth-authorization-server",
+              "/oauth/register", "/oauth/authorize", "/oauth/token")
     def __init__(self, app, cfg: dict, header: str = "Authorization"):
         super().__init__(app)
         self.cfg = cfg
@@ -2251,8 +2617,17 @@ class AuthMiddleware(BaseHTTPMiddleware):
                     user = live["name"]
                     role = live["role"]
         if not via:
-            return _err(401, "未授权：请登录，或在请求头里带上访问令牌。",
+            resp = _err(401, "未授权：请登录，或在请求头里带上访问令牌。",
                         auth_required=True)
+            # MCP Authorization（2026-10-26）：**没有这个响应头，网页型客户端
+            # 永远不会去发起授权** —— 它靠 401 的 WWW-Authenticate 才知道
+            # 该读哪份受保护资源元数据、该向哪个授权服务器要令牌。
+            base = _public_base(request, self.cfg)
+            if base and self.cfg.get("oauth_enabled"):
+                resp.headers["WWW-Authenticate"] = (
+                    'Bearer resource_metadata="'
+                    f'{base}/.well-known/oauth-protected-resource"')
+            return resp
         request.state.auth_via = via
         request.state.auth_user = user
         request.state.auth_role = role
@@ -2318,6 +2693,16 @@ def create_app(cfg: dict | None = None) -> Starlette:
         Route("/api/tokens", console.tokens_get, methods=["GET"]),
         Route("/api/tokens", console.tokens_post, methods=["POST"]),
         Route("/api/tokens/{tid}", console.token_delete, methods=["DELETE"]),
+        # OAuth 2.1 授权服务器（2026-10-26）。五个端点都在 AuthMiddleware.PUBLIC
+        # 里放行 —— 它们服务的是「还没有凭据」的客户端。
+        Route("/.well-known/oauth-protected-resource", console.oauth_prm,
+              methods=["GET"]),
+        Route("/.well-known/oauth-authorization-server", console.oauth_as,
+              methods=["GET"]),
+        Route("/oauth/register", console.oauth_register, methods=["POST"]),
+        Route("/oauth/authorize", console.oauth_authorize_get, methods=["GET"]),
+        Route("/oauth/authorize", console.oauth_authorize_post, methods=["POST"]),
+        Route("/oauth/token", console.oauth_token, methods=["POST"]),
         # 网关回调（不在 /api/ 前缀，鉴权中间件直接放行，处理器自己验内部密钥）
         Route(INTERNAL_VERIFY_PATH, console.internal_verify, methods=["GET"]),
         # MCP 反代（2026-10-22）：**必须**排在最末那条 catch-all 之前，
