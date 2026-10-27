@@ -11,7 +11,7 @@
   D  鉴权中间件（httpx ASGI transport，无需端口）：无 token 401 / Bearer /
      X-Auth-Token / 静态资源不校验 / OPTIONS 204
   E  写保护：AI_MEMORY_WEB_CONFIG_WRITE=0 ⇒ POST /api/thresholds 被拒（400）
-  F  端到端（真起 serve_http + serve_web）：health / tools(25) / overview /
+  F  端到端（真起 serve_http + serve_web）：health / tools(26) / overview /
      thresholds(8 键) / index 回落 / assets 可达 / /api/call 真往返 / 阈值写读往返
   H  更新面（2026-10-15 建立；2026-10-16 扩为 web + core 双目标）：白名单安全边界 /
      行首状态位回归 / 三点 diff 语义 / restarter 与 AI_MEMORY_CORE_DIR 的显式失败
@@ -426,8 +426,8 @@ _mapped = set(web_console._TOOL_GROUP_OF)
 _group_keys = {g["key"] for g in web_console.TOOL_GROUPS}
 _used_keys = set(web_console._TOOL_GROUP_OF.values())
 
-check("G1 server.py 注册了 25 个 @mcp.tool 工具",
-      len(_registered) == 25, f"实际 {len(_registered)} 个")
+check("G1 server.py 注册了 26 个 @mcp.tool 工具",
+      len(_registered) == 26, f"实际 {len(_registered)} 个")
 check("G2 分组表无遗漏（每个已注册工具都有归属）",
       not (_registered - _mapped), ", ".join(sorted(_registered - _mapped)))
 check("G3 分组表无陈旧键（没有已不存在的工具）",
@@ -586,8 +586,8 @@ try:
     st, txt = _http("/api/tools")
     j = json.loads(txt) if st == 200 else {}
     names = {t.get("name") for t in j.get("tools", [])} if j else set()
-    check("F2 /api/tools 返回 25 个工具且含关键项",
-          st == 200 and j.get("count") == 25 and {"memory_batch_tag",
+    check("F2 /api/tools 返回 26 个工具且含关键项",
+          st == 200 and j.get("count") == 26 and {"memory_batch_tag",
                                                   "memory_config",
                                                   "memory_orphans"} <= names,
           f"status={st} count={j.get('count')}")
@@ -600,8 +600,8 @@ try:
     check("F2b /api/tools 下发 6 个功能组且首组为 content",
           st == 200 and len(_gkeys) == 6 and _gkeys[0] == "content",
           f"groups={_gkeys}")
-    check("F2c 25 项工具全部带 group，且值都在组定义内",
-          st == 200 and len(_gtools) == 25
+    check("F2c 26 项工具全部带 group，且值都在组定义内",
+          st == 200 and len(_gtools) == 26
           and all(t.get("group") in _gkeys for t in _gtools),
           ", ".join(sorted({str(t.get("group")) for t in _gtools} - set(_gkeys))))
     check("F2d 没有工具落入 other 兜底组（映射表无遗漏）",

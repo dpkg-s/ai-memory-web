@@ -754,6 +754,9 @@ _TOOL_GROUP_OF = {
     "memory_read": "content",
     "memory_write": "content",
     "memory_update_metadata": "content",
+    # 2026-10-25：memory_commit 是 core 侧后加的统一写入口（带当日时间线与项目
+    # 状态同步），此前的分组表没跟上 ⇒ 它会落进「未归类」兜底组。补登为内容读写。
+    "memory_commit": "content",
     # 检索
     "memory_search": "search",
     "memory_smart_search": "search",
