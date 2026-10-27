@@ -187,7 +187,7 @@ def _ensure_app_logging() -> None:
     logger.propagate = False
 
 
-WEB_VERSION = "1.11.3"
+WEB_VERSION = "1.12.0"
 # ⚠️ 2026-10-22：此常量是控制台**唯一**的机器可读版本源，release.yml 会校验
 #   `tag == WEB_VERSION == CHANGELOG 首条`。历史上一度停在 1.11.1 而 tag 已到
 #   v1.11.3（漂了两个版本），界面「关于」显示的是旧号 —— 改版本时必须同改三处。

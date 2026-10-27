@@ -2,6 +2,27 @@
 
 本仓由 [ai-memory-template](https://github.com/dpkg-s/ai-memory-template) 的 Web 控制台部分拆分而来，自拆分起独立维护。
 
+## [1.12.0] - 2026-10-27
+
+> 主题：**只读也能拿到东西，且看得见谁在拿**。此前控制台的读取全靠前端页面，机器侧只有一个 POST 入口；调用记录散在日志里，出事只能翻文件。这一版把只读调用做成 GET，把调用记录做成一张卡片。
+
+### Added
+
+- **`GET /mcp?tool=<名字>` 只读调用** —— 12 个只读工具的白名单，`args=<json>` 传类型化参数或直接给查询参数，`format=text` 只回文本。**写工具在转发前就 403**，不给上游任何机会。
+- **访问日志卡片**（访问控制页）—— 数据面是 `audit.jsonl`，支持六类筛选、IP 列、CSV / JSON 导出、首屏骨架，以及 8 秒静默轮询（页面不可见即停）。卡底明写「只统计经过控制台的调用」，避免被当成全量审计。
+- **`/mcp/reader` 档位与独立 `reader.html`** —— 浏览器里直接查库的最小只读视图，不加载控制台主包。
+- **OAuth 授权服务器文档**（`docs/oauth.md`）与负向路径测试（`client_secret` 声明、PKCE 不匹配）。
+
+### Changed
+
+- **受限页面收敛成一张表** —— `core/router.js` 的 `PAGE_ROLES` 是唯一判定源，侧栏、快捷键、命令面板、hash 深链四处入口同源。viewer 只剩「概览 / 记忆库 / 配置」，手输 `#access` / `#console` 会被守卫弹回。
+- **五个写接口统一收口** —— `config` / `thresholds` / `fns/probe` / `update` / `update/restart` 此前一条角色判定都没有，改由 `ADMIN_ONLY` 中间件统一拦；前端配置页对非 admin 退化为只读文本，保存与重启整块不渲染。
+- **机器接口前缀回 404 JSON** —— `/api`、`/.well-known`、`/oauth`、`/mcp` 下的未知路径不再回落 `index.html`；鉴权失败日志带时间戳、不含秘密。
+
+### Tests
+
+- `tests/test_web.py` 130 passed / 0 failed；新增 `test_logging.py`、`test_ui_visibility.py`。
+
 ## [1.11.3] - 2026-10-22
 
 > 主题：**Release 自带两个附件，不再靠手工补**。上一版我手动往 v1.11.2 上挂了 tgz 和安装器 —— 手工的东西下次一定会漏。这一版把附件生产写进 `release.yml`。
