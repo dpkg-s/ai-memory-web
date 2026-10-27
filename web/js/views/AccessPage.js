@@ -33,6 +33,51 @@ var ROLE_DESC = {
   viewer: "只能调只读工具",
 };
 
+/* 数据视野（2026-10-26）—— 与「工具组」正交的第二维度。
+ *
+ * 工具组管**能调什么**，视野管**能看见哪些密级的记忆**。缺了它，
+ * viewer 令牌虽然只能调 memory_search，返回的却是全库含 sensitive/secret：
+ * 工具粒度收紧了、数据粒度没收紧，等于只锁了门没锁抽屉。
+ *
+ * 服务端 ROLE_CLEARANCE 是唯一事实源（web_store.py），这里只是镜像用于
+ * 收窄下拉选项；真正的越界拦截在服务端，前端收窄只是为了别让人填完才吃 403。
+ */
+var CLEARANCE_ZH = {
+  owner: "全权",
+  member: "标准",
+  reader: "只读共享",
+  guest: "仅公开",
+};
+var CLEARANCE_DESC = {
+  owner: "全部条目，含绝密",
+  member: "含敏感条目",
+  reader: "日常条目，不含敏感 / 绝密",
+  guest: "仅标记为公开的条目",
+};
+var CLEARANCE_RANK = { guest: 0, reader: 1, member: 2, owner: 3 };
+var ROLE_CLEARANCE = { admin: "owner", operator: "member", viewer: "reader" };
+/* 顺序即下拉呈现顺序（2026-10-26 主人指令：权级从高到低排）。
+   高 → 低，与 CLEARANCE_RANK 相反 —— 下拉要的是「从最宽到最窄」的直觉，
+   而不是数值升序；排序口径只在这一处，别在别处再排一遍。 */
+var CLEARANCE_ALL = ["owner", "member", "reader", "guest"];
+
+/* 读写模式（2026-10-26）—— 与视野正交的第三维度。
+ *
+ * 视野管「看得见多少」，读写模式管「能不能改」。二者正交，所以「全权 + 只读」
+ * 是一个合法且最常用的组合：别的设备能读整个库，但一个字都改不动。
+ *
+ * 服务端 ROLE_ACCESS 是唯一事实源（web_store.py）；这里镜像默认值，只为把
+ * 下拉初值设成「角色的默认」。真正的拦截在服务端（/api/call 与 MCP 的
+ * /mcp/<档位>-ro 端点），前端不做安全判断。
+ */
+var ACCESS_ZH = { rw: "可读写", ro: "只读" };
+var ACCESS_DESC = {
+  rw: "能写条目，仍受视野与角色限制",
+  ro: "只能读，任何写入都会被拒",
+};
+var ACCESS_ALL = ["rw", "ro"];
+var ROLE_ACCESS = { admin: "rw", operator: "rw", viewer: "ro" };
+
 function fmtTs(v) {
   if (v === null || v === undefined || v === "") return "";
   var d = new Date(Number(v) * 1000);
@@ -65,7 +110,10 @@ var AccessPage = {
   data: function () {
     return {
       S: S,
-      tab: "users",
+      /* 空串 = 尚未手动切过，由 activeTab 按角色给默认值（2026-10-25）：
+         管理员默认「账号」，「操作员 / 只读」默认「令牌」—— 他们压根没有
+         账号页，若仍默认到那一页，会看到一条空白列表。 */
+      tab: "",
       loading: false,
       users: [],
       tokens: [],
@@ -75,7 +123,7 @@ var AccessPage = {
       nuBusy: false,
       /* 签发令牌（行内展开，默认收起） */
       ntOpen: false,
-      nt: { name: "", role: "operator", expires: "604800", max_uses: 0 },
+      nt: { name: "", role: "operator", clearance: "", access: "", expires: "604800", max_uses: 0 },
       ntBusy: false,
       /* 一次性明文：**只在创建那一瞬间存在**，关掉就取不回 */
       issued: "",
@@ -109,6 +157,14 @@ var AccessPage = {
     isAdmin: function () {
       return !!S.canManage;
     },
+    /* 实际生效的分段（2026-10-25 主人指令：权限不足的界面直接隐藏）。
+       设计原则：**不给「你没有权限」这种提示**，而是让那一页根本不存在 ——
+       非管理员的分段条里只有「令牌」，也就不存在点进去看提示的路径。
+       身份是异步到位的，所以默认值必须放在 computed 而不是 data 里求值。 */
+    activeTab: function () {
+      if (this.tab) return this.tab;
+      return this.isAdmin ? "users" : "tokens";
+    },
     /* operator 不能签发 admin 令牌（服务端也会拒）；这里先把选项收窄，
        让人别先填完才吃一个 403。 */
     roleOptions: function () {
@@ -141,6 +197,67 @@ var AccessPage = {
         return ROLE_DESC[r] || "";
       };
     },
+    /* 当前选中角色的权级上限。下拉只列 ≤ 上限的档 —— 服务端还会再拦一次，
+       这里收窄纯粹是别让人填完才吃 403。 */
+    clearanceCeil: function () {
+      return ROLE_CLEARANCE[this.nt.role] || "reader";
+    },
+    clearanceOptions: function () {
+      /* ⚠️ clearanceCeil 是 computed，取值即结果，**不能加括号调用**。
+         2026-10-26 实拍复现过代价：写成 this.clearanceCeil() 会抛
+         TypeError，Vue 渲染这棵子树直接失败 —— 表现是点「+ 签发令牌」
+         后整张令牌卡（连同表单）凭空消失，只剩顶栏。 */
+      var ceilRank = CLEARANCE_RANK[this.clearanceCeil];
+      var out = [];
+      for (var i = 0; i < CLEARANCE_ALL.length; i++) {
+        var c = CLEARANCE_ALL[i];
+        if (CLEARANCE_RANK[c] <= ceilRank) out.push(c);
+      }
+      return out;
+    },
+    clearanceZh: function () {
+      return function (c) {
+        return CLEARANCE_ZH[c] || c || "";
+      };
+    },
+    clearanceDesc: function () {
+      return function (c) {
+        return CLEARANCE_DESC[c] || "";
+      };
+    },
+    /* 令牌实际生效的视野：没显式选就按角色推导，与服务端 clearance_of 同口径 */
+    tokenClearance: function () {
+      return function (t) {
+        return t.clearance || ROLE_CLEARANCE[t.role] || "reader";
+      };
+    },
+    /* 令牌实际生效的读写模式：同口径推导（服务端 access_of） */
+    tokenAccess: function () {
+      return function (t) {
+        return t.access || ROLE_ACCESS[t.role] || "rw";
+      };
+    },
+    accessZh: function () {
+      return function (a) {
+        return ACCESS_ZH[a] || a || "";
+      };
+    },
+    accessDesc: function () {
+      return function (a) {
+        return ACCESS_DESC[a] || "";
+      };
+    },
+    /* viewer 只列「只读」：它的角色默认就是 ro，服务端也会拒绝 rw 声明。
+       与其让人选完吃 400，不如不给这个选项。 */
+    accessOptions: function () {
+      return (ROLE_ACCESS[this.nt.role] === "ro") ? ["ro"] : ACCESS_ALL;
+    },
+    /* 角色默认的读写模式。模板里**不能**直接写 ROLE_ACCESS[nt.role] ——
+       模块级变量不在组件渲染上下文里，那样写会得到 undefined（并把整段
+       hint 渲染成空白），所以必须经一个 computed 转一手。 */
+    accessDefault: function () {
+      return ROLE_ACCESS[this.nt.role] || "rw";
+    },
     tsZh: function () {
       return function (v) {
         return fmtTs(v);
@@ -165,6 +282,28 @@ var AccessPage = {
   watch: {
     isAdmin: function (v) {
       if (v) this.refresh();
+      /* 权限一旦落定为否，把停留过的「账号」分段收回「令牌」—— 否则用户
+         会停在一条已经没有按钮指向它的分段上（该页内容也不再渲染）。 */
+      if (!v && this.tab === "users") this.tab = "tokens";
+    },
+    /* 改角色后权级必须跟着收窄（2026-10-26）：下拉已改为直接列权级、不再有
+       「随角色」兜底项，所以「先选全权、再把角色降成只读」会留下一个超出
+       上限的值 —— 签发时才被服务端 403 就太晚了，这里直接钳到新上限。 */
+    "nt.role": function () {
+      var ceil = ROLE_CLEARANCE[this.nt.role] || "reader";
+      var cur = this.nt.clearance;
+      if (CLEARANCE_RANK[cur] === undefined || CLEARANCE_RANK[cur] > CLEARANCE_RANK[ceil]) {
+        this.nt.clearance = ceil;
+      }
+      /* 读写模式跟着角色收窄（2026-10-26）：viewer 只能只读，所以切到 viewer
+         必须把它按到 ro。反方向**不动** —— 用户手动选的只读要保留，那是意图，
+         不能因为换了个角色就被悄悄放宽成可写。 */
+      var defAccess = ROLE_ACCESS[this.nt.role] || "rw";
+      if (defAccess === "ro") {
+        this.nt.access = "ro";
+      } else if (ACCESS_ALL.indexOf(this.nt.access) < 0) {
+        this.nt.access = defAccess;
+      }
     },
   },
   methods: {
@@ -323,7 +462,17 @@ var AccessPage = {
     toggleNewToken: function () {
       this.ntOpen = !this.ntOpen;
       if (this.ntOpen) {
-        this.nt = { name: "", role: "operator", expires: "604800", max_uses: 0 };
+        /* 权级默认落在角色的上限档（2026-10-26 主人指令：取消「视野随角色」
+           这一伪选项，直接给权级）。默认值等价于旧行为 —— 不手动降档时
+           令牌的权级就是角色上限。 */
+        this.nt = {
+          name: "",
+          role: "operator",
+          clearance: ROLE_CLEARANCE.operator || "reader",
+          access: ROLE_ACCESS.operator || "rw",
+          expires: "604800",
+          max_uses: 0,
+        };
       }
     },
     createToken: function () {
@@ -338,13 +487,25 @@ var AccessPage = {
         role: self.nt.role,
         max_uses: Number(self.nt.max_uses) || 0,
       };
+      /* 权级：表单恒有值（默认 = 角色上限），照直带上；服务端仍会校验 ≤ 角色上限 */
+      if (self.nt.clearance) body.clearance = self.nt.clearance;
+      /* 读写模式：表单恒有值（默认 = 角色默认），照直带上。传 ro 永远合法，
+         传 rw 会被服务端按角色上限再拦一次 —— 前端不做安全判断。 */
+      if (self.nt.access) body.access = self.nt.access;
       if (self.nt.expires) body.expires_in = Number(self.nt.expires);
       api
         .tokenCreate(body)
         .then(function (d) {
           self.issued = d.token || "";
           self.issuedName = self.nt.name;
-          self.nt = { name: "", role: "operator", expires: "604800", max_uses: 0 };
+          self.nt = {
+            name: "",
+            role: "operator",
+            clearance: ROLE_CLEARANCE.operator || "reader",
+            access: ROLE_ACCESS.operator || "rw",
+            expires: "604800",
+            max_uses: 0,
+          };
           self.ntOpen = false;
           self.refresh();
         })
@@ -382,6 +543,14 @@ var AccessPage = {
           return api.tokenCreate({
             name: t.name,
             role: t.role,
+            /* 重发必须原样带上视野：否则自定义档位会静默退回角色默认，
+               行为上表现为「重发一次，能看的东西就变多了」—— 属于不该有的
+               隐性放宽。旧令牌没有该字段时按角色推导，与服务端同口径。 */
+            clearance: t.clearance || ROLE_CLEARANCE[t.role] || "reader",
+            /* 读写模式同理必须原样带上：漏了它，一枚「全权只读」令牌重发之后
+               会变回可写 —— 那是比视野退回更严重的一类隐性放宽（读写比能看
+               多少更接近不可逆），所以这里宁可显式推导也不省略。 */
+            access: t.access || ROLE_ACCESS[t.role] || "rw",
             expires_in: expiresIn,
             max_uses: t.max_uses || 0,
           });
@@ -475,9 +644,13 @@ var AccessPage = {
        也交代了「我以什么身份在看」，视线不必跨两行。 */
     '  <div class="ac-bar">' +
     '    <div class="ac-seg" role="tablist">' +
-    '      <button role="tab" :aria-selected="tab===\'users\'" :class="{on:tab===\'users\'}" @click="tab=\'users\'">' +
+    /* 账号分段只对管理员存在（2026-10-25）：不再是「点进去看一句你没权限」，
+       而是根本没有这个按钮。 */
+    '      <button v-if="isAdmin" role="tab" :aria-selected="activeTab===\'users\'"' +
+    '              :class="{on:activeTab===\'users\'}" @click="tab=\'users\'">' +
     "        <span v-html=\"svg('shield')\"></span>账号</button>" +
-    '      <button role="tab" :aria-selected="tab===\'tokens\'" :class="{on:tab===\'tokens\'}" @click="tab=\'tokens\'">' +
+    '      <button role="tab" :aria-selected="activeTab===\'tokens\'"' +
+    '              :class="{on:activeTab===\'tokens\'}" @click="tab=\'tokens\'">' +
     "        <span v-html=\"svg('key')\"></span>令牌</button>" +
     "    </div>" +
     '    <div class="tags ac-who">' +
@@ -491,14 +664,9 @@ var AccessPage = {
     '  <div class="ac-grid" :class="{\'ac-solo\': isAdmin}">' +
     '    <div class="ac-main">' +
 
-    /* ===== 账号清单 ===== */
-    '      <div v-if="tab===\'users\'" class="ac-col">' +
-    '        <x-card v-if="!isAdmin" title="需要管理员权限">' +
-    '          <div class="hint">当前账号是 <b>{{ myRoleZh }}</b>，只能管理自己签发的令牌。' +
-    "            账号的增删改需要 <b>管理员</b>。</div>" +
-    "        </x-card>" +
-    "        <template v-else>" +
-    '          <x-card title="账号" :sub="users.length + \' 个\'">' +
+    /* ===== 账号清单（仅管理员渲染）===== */
+    '      <div v-if="isAdmin && activeTab===\'users\'" class="ac-col">' +
+    '        <x-card title="账号" :sub="users.length + \' 个\'">' +
     '            <div class="list" v-if="users.length">' +
     '              <template v-for="u in users" :key="u.name">' +
     '                <div class="list-item">' +
@@ -563,12 +731,11 @@ var AccessPage = {
     "              </div>" +
     '              <div class="hint">{{ roleDesc(nu.role) }}</div>' +
     "            </div>" +
-    "          </x-card>" +
-    "        </template>" +
+    "        </x-card>" +
     "      </div>" +
 
     /* ===== 令牌清单 ===== */
-    '      <div v-if="tab===\'tokens\'" class="ac-col">' +
+    '      <div v-if="activeTab===\'tokens\'" class="ac-col">' +
     /* 一次性明文 + 连接串：签发成功后浮到最上方 */
     '        <x-card v-if="issued" title="这串令牌只显示这一次">' +
     '          <div class="hint" style="margin-bottom:10px">' +
@@ -598,6 +765,11 @@ var AccessPage = {
     '              <div class="li-main">' +
     '                <div class="li-title">{{ t.name }}' +
     '                  <span class="pill">{{ roleZh(t.role) }}</span>' +
+    '                  <span class="pill" :title="clearanceDesc(tokenClearance(t))">{{ clearanceZh(tokenClearance(t)) }}</span>' +
+    /* 只读令牌必须一眼认出来（2026-10-26）：它决定「这台设备能不能改库」，比
+       视野更该显眼。可读写不挂 pill —— 默认态不喧哗，与列表只在非默认档显示
+       彩色 pill 是同一取向。 */
+    '                  <span class="pill" v-if="tokenAccess(t)===\'ro\'" :title="accessDesc(\'ro\')">只读</span>' +
     '                  <span class="pill" v-if="!t.enabled">已停用</span>' +
     "                </div>" +
     '                <div class="li-sub mono">' +
@@ -626,6 +798,18 @@ var AccessPage = {
     '              <select class="select" v-model="nt.role">' +
     '                <option v-for="r in roleOptions" :key="r" :value="r">{{ roleZh(r) }}</option>' +
     "              </select>" +
+    /* 权级（2026-10-26 主人指令）：直接列权级本身，从高到低排，
+       不再放「视野随角色（标准）」这种伪选项 —— 它既与下方首个真选项
+       同义，展开时就出现两行一样的字。选项只列 ≤ 角色上限的档，
+       默认选中该上限（等价于旧「随角色」），服务端仍会再拦一次。 */
+    '              <select class="select" v-model="nt.clearance" title="权级：该令牌能看见哪些密级的记忆">' +
+    '                <option v-for="c in clearanceOptions" :key="c" :value="c">{{ clearanceZh(c) }}</option>' +
+    "              </select>" +
+    /* 读写模式（2026-10-26）：与权级正交的第二个下拉。「全权 + 只读」就是
+       「能读完整库、一个字都不许改」，是别的设备最常用的形态。 */
+    '              <select class="select" v-model="nt.access" title="读写模式：该令牌能否修改记忆">' +
+    '                <option v-for="a in accessOptions" :key="a" :value="a">{{ accessZh(a) }}</option>' +
+    "              </select>" +
     '              <select class="select" v-model="nt.expires">' +
     '                <option value="3600">1 小时</option>' +
     '                <option value="86400">1 天</option>' +
@@ -639,9 +823,8 @@ var AccessPage = {
     '              <button class="btn btn-primary" @click="createToken" :class="{loading:ntBusy}">签发</button>' +
     '              <button class="btn" @click="toggleNewToken">取消</button>' +
     "            </div>" +
-    '            <div class="hint">{{ roleDesc(nt.role) }} · 同一令牌 30 秒内的多个请求只计 1 次</div>' +
+    '            <div class="hint">{{ roleDesc(nt.role) }} · 权级：{{ clearanceDesc(nt.clearance || clearanceCeil) }} · 读写：{{ accessDesc(nt.access || accessDefault) }} · 同一令牌 30 秒内的多个请求只计 1 次</div>' +
     "          </div>" +
-    '          <div class="hint mt" v-if="!canCreateToken">当前账号是 <b>{{ myRoleZh }}</b>，不能签发令牌。请让管理员代办。</div>' +
     "        </x-card>" +
     "      </div>" +
     "    </div>" +

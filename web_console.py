@@ -500,11 +500,47 @@ def save_app_config(raw: dict) -> dict:
     return cfg
 
 
-def resolve_mcp(cfg: dict | None = None) -> str:
-    """MCP 端点：JSON 配置里的值优先（前端可改），否则用环境变量默认。"""
+#: 本来就只读的视野档。服务端不为它们生成 `-ro` 变体（等价路径等于白送一个
+#: 可绕过的口子），所以拼端点时也不能加后缀。
+_READONLY_LEVELS = frozenset({"guest", "reader"})
+
+
+def resolve_mcp(cfg: dict | None = None, level: str | None = None,
+                writable: bool | None = None) -> str:
+    """MCP 端点：JSON 配置里的值优先（前端可改），否则用环境变量默认。
+
+    ``level``（2026-10-26）：**数据视野**档位。给定非 owner 档时把路径改成
+    ``<base>/<level>``（``/mcp`` → ``/mcp/reader``）。这是「令牌权限」真正落地
+    的地方 —— 同一台上游、同一份 vault，不同视野打不同端点，由 MCP 侧的
+    ClearanceRouter 决定这条连接能看见哪些密级的条目。
+
+    ``writable``（2026-10-26）：读写模式，与视野**正交**。``False`` 时给路径加
+    ``-ro`` 后缀（``/mcp/owner-ro``）—— 这样「全库可读、一字不许改」在传输层
+    就成了硬边界，而不是靠调用方自觉不动写工具。
+
+    两个刻意的细节：
+
+    1. **只读必须显式落到 -ro**，绝不回落到无后缀的 base。反之则会「静默丢掉
+       只读意图」，而那正是最难发现的一类权限漏洞。
+    2. ``writable is None``（调用方没给）按可写处理，与改造前行为一致；只有明确
+       传 ``False`` 才降级。用 ``if not writable`` 会把 ``None`` 当成只读，
+       存量调用点全部变成只读 —— 这类「默认值写反」是权限逻辑里最常见的翻车点。
+
+    为什么不在这里做过滤：密级判定的事实源在 MCP 侧（security/clearance 两个
+    frontmatter 字段 + 各工具内部的 _can_read）。控制台如果自己再过滤一遍，
+    就变成两套口径，迟早对不上 —— 而这类不一致只会往「多看到」的方向错。
+    """
     cfg = cfg or config()
     app_cfg = load_app_config()
-    return app_cfg.get("mcp_endpoint") or cfg["mcp"]
+    base = app_cfg.get("mcp_endpoint") or cfg["mcp"]
+    lvl = level or "owner"
+    want_ro = writable is False
+    if lvl == "owner":
+        # owner 的可写形态就是 base 本身（服务端不为 owner 开别名）
+        return (base.rstrip("/") + "/owner-ro") if want_ro else base
+    if want_ro and lvl not in _READONLY_LEVELS:
+        return base.rstrip("/") + "/" + lvl + "-ro"
+    return base.rstrip("/") + "/" + lvl
 
 
 def resolve_vault() -> Path | None:
@@ -788,6 +824,24 @@ _TOOL_GROUP_OF = {
     "memory_delete": "lifecycle",
     "memory_restart": "lifecycle",
 }
+
+#: 会**改动库或机器行为**的工具（2026-10-26，配合令牌的只读模式）。
+#:
+#: 为什么需要这张表而不是按 ``TOOL_GROUPS`` 的组来判：``content`` 组里既有
+#: ``memory_read``（读）也有 ``memory_write``（写），按组判会把读工具一起封掉。
+#: 组是给界面分栏用的，写权边界必须逐工具声明。
+#:
+#: 这是**友好报错层**，不是硬边界 —— 硬边界在 MCP 侧（``/mcp/<档位>-ro`` 端点
+#: 上的 ``_owner_gate`` / ``_readonly_endpoint``）。这里提前拦一下，是为了让
+#: 只读令牌拿到「该端点为只读」而不是等上游返回之后的半截错误；即便有人绕过
+#: 这一层直接打 MCP 端点，也改不动东西。
+#: 新增写工具时若忘记登记，最坏结果是「多绕一次上游拒绝」，不会变成放行。
+WRITE_TOOLS = frozenset({
+    "memory_write", "memory_commit", "memory_update_metadata",
+    "memory_delete", "memory_archive", "memory_restore", "memory_archive_old",
+    "memory_batch_tag", "memory_batch_tier", "memory_heat_suggest",
+    "memory_config", "memory_restart",
+})
 
 
 async def mcp_tools(endpoint: str, timeout: float = MCP_TIMEOUT) -> list[dict]:
@@ -1636,7 +1690,17 @@ class WebConsole:
         if not isinstance(arguments, dict):
             return _err(400, "arguments 必须是 JSON 对象。")
 
-        endpoint = resolve_mcp(self.cfg)
+        # 数据视野（2026-10-26）：工具粒度之外的第二道 —— 打哪个端点决定这条
+        # 连接能看见哪些密级的条目。缺 auth_clearance（本机无鉴权形态）时
+        # 保持 owner，行为与改造前一致。
+        clearance = getattr(request.state, "auth_clearance", "") or "owner"
+        writable = getattr(request.state, "auth_writable", True) is not False
+        # 只读令牌碰写工具直接拒。硬边界在 MCP 端点上（见 WRITE_TOOLS 注释），
+        # 这里是「提前把话说清楚」：否则前端会收到一句来自上游的服务端措辞，
+        # 用户看着像 bug 而不像权限设定。
+        if not writable and tool in WRITE_TOOLS:
+            return _err(403, f"当前令牌为只读，不能调用 {tool}。")
+        endpoint = resolve_mcp(self.cfg, level=clearance, writable=writable)
         t0 = time.perf_counter()
         try:
             results = await mcp_session_calls(endpoint, [(tool, arguments)])
@@ -1803,10 +1867,14 @@ class WebConsole:
         if not supplied:
             supplied = request.headers.get("X-Auth-Token", "").strip()
         role = ""
+        clearance = ""
+        access = ""
         if supplied:
             hit = cfg["tokens"].verify(supplied)
             if hit:
                 mode, user, role = "token", str(hit.get("owner") or ""), str(hit.get("role") or "")
+                clearance = str(hit.get("clearance") or "")
+                access = str(hit.get("access") or "")
         # ⚠️ 这里必须是 ``mode == "none"`` 而不能写 ``not mode``：
         # mode 的初值是字符串 "none"（真值），``not mode`` 恒为 False，
         # 于是会话分支整段不会执行 —— 表现是「登录成功但立刻问状态又说没登录」。
@@ -1828,6 +1896,14 @@ class WebConsole:
             "mode": mode,
             "user": user,
             "role": role,
+            # 当前连接的数据视野（2026-10-26）。前端据此显示「能看见哪些密级」，
+            # 与 /api/call 实际使用的端点是同一个值，不会各说各话。
+            "clearance": (clearance if clearance in web_store.CLEARANCE_RANK
+                          else (web_store.clearance_of(role) if role else "")),
+            # 读写模式（2026-10-26）。前端据此把写入口置灰；真正的拦截在
+            # /api/call 与 MCP 只读端点上，不依赖这条字段。
+            "access": (web_store.access_of(role, access) if role else ""),
+            "writable": (web_store.access_of(role, access) == "rw") if role else True,
             "can_manage": role == "admin",
             "multi_user": bool(cfg["multi_user"]),
             "login_enabled": bool(cfg["login_enabled"]),
@@ -1943,11 +2019,18 @@ class WebConsole:
         return JSONResponse({"ok": True})
 
     async def tokens_get(self, request: Request) -> Response:
-        """管理员看全部，其他人只看自己的。"""
+        """管理员看全部，operator 只看自己的，**只读账号整条路不通**。
+
+        2026-10-26 主人指令：只读账号连「访问控制」页都不该进。入口已从侧栏
+        移除，服务端在这里同步收紧 —— 只藏 UI 不拦接口，等于给出一条
+        「知道 URL 就能用」的后门，而这类后门恰恰是最容易被忘掉的那种。
+        """
         if self._is_open_mode():
             return JSONResponse({"ok": True, "tokens": self.cfg["tokens"].list(),
                                  "self_only": False})
         role = getattr(request.state, "auth_role", "") or ""
+        if role == "viewer":
+            return _err(403, "只读账号不具备令牌管理能力。")
         user = self._actor(request)
         rows = self.cfg["tokens"].list() if role == "admin" else self.cfg["tokens"].list(owner=user)
         return JSONResponse({"ok": True, "tokens": rows,
@@ -1980,6 +2063,15 @@ class WebConsole:
                 name=str(body.get("name") or ""),
                 owner=actor,
                 role=want_role,
+                # 数据视野：不传则由角色推导（viewer→reader / operator→member /
+                # admin→owner）；传了必须 ≤ 角色上限，越界由 TokenStore 拒绝。
+                clearance=(str(body.get("clearance")).strip()
+                           if body.get("clearance") else None),
+                # 读写模式（2026-10-26）：不传则由角色推导（admin/operator→rw、
+                # viewer→ro）；传 ro 永远允许（更保守），传 rw 时若角色默认只读
+                # 会被 TokenStore 拒 —— 不签「表里不一」的令牌。
+                access=(str(body.get("access")).strip()
+                        if body.get("access") else None),
                 expires_in=(int(expires_in) if expires_in not in (None, "", 0) else None),
                 max_uses=int(body.get("max_uses") or 0))
         except (web_store.StoreError, TypeError, ValueError) as e:
@@ -1994,6 +2086,9 @@ class WebConsole:
         tid = str(request.path_params.get("tid") or "")
         actor = self._actor(request)
         role = getattr(request.state, "auth_role", "") or "admin"
+        # 与 tokens_get 同一口径：只读账号不参与令牌管理（含吊销自己的）。
+        if role == "viewer" and not self._is_open_mode():
+            return _err(403, "只读账号不具备令牌管理能力。")
         try:
             self.cfg["tokens"].revoke(tid, owner=(None if role == "admin" else actor))
         except web_store.StoreError as e:
@@ -2045,7 +2140,9 @@ class WebConsole:
         鉴权已经在 ``AuthMiddleware`` 里做完（``/mcp`` 与 ``/api/*`` 同一口径），
         这里只负责转发；本控制台自己的凭据（Authorization / Cookie）**不往上游带**。
         """
-        target = resolve_mcp(self.cfg)
+        clearance = getattr(request.state, "auth_clearance", "") or "owner"
+        writable = getattr(request.state, "auth_writable", True) is not False
+        target = resolve_mcp(self.cfg, level=clearance, writable=writable)
         # 我们自己认的 ?token= 不往上游带：它不该多传一跳。
         params = [(k, v) for k, v in request.query_params.multi_items()
                   if k != "token"]
@@ -2131,7 +2228,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
         if path.rstrip("/") in self.PUBLIC:
             return await call_next(request)
 
-        via, user, role = "", "", ""
+        via, user, role, clearance, access = "", "", "", "", ""
         supplied = self._bearer(request)
         # 两条通道都走**恒定时间比较**：令牌在 TokenStore 里用 compare_digest 逐个比，
         # 会话靠签名校验（read_session 内部同样是 compare_digest）。
@@ -2141,6 +2238,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 via = "token"
                 user = str(hit.get("owner") or "")
                 role = str(hit.get("role") or "viewer")
+                clearance = str(hit.get("clearance") or "")
+                access = str(hit.get("access") or "")
         if not via and self.cfg["session_key"]:
             sess = web_auth.read_session(
                 request.cookies.get(web_auth.COOKIE_NAME, ""), self.cfg["session_key"])
@@ -2157,6 +2256,17 @@ class AuthMiddleware(BaseHTTPMiddleware):
         request.state.auth_via = via
         request.state.auth_user = user
         request.state.auth_role = role
+        # 数据视野（2026-10-26）：令牌自带就用它，会话路径则按角色推导。
+        # 它是**这条连接能看见哪些密级记忆**的唯一依据，供 /api/call 与 /mcp
+        # 反代选端点；没有它，令牌只在「工具粒度」上生效，数据粒度仍全开。
+        request.state.auth_clearance = (
+            clearance if clearance in web_store.CLEARANCE_RANK
+            else web_store.clearance_of(role))
+        # 读写模式（2026-10-26）：与视野正交的第二根轴。同样是「令牌自带就用它，
+        # 会话路径则按角色推导」。供 /api/call 决定是否放行写工具，并供 /mcp 反代
+        # 选 `/mcp/<档位>-ro` 端点 —— 后者才是硬边界。
+        request.state.auth_writable = (
+            web_store.access_of(role, access) == "rw")
         return await call_next(request)
 
 

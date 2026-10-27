@@ -52,6 +52,67 @@ ROLE_TOOLS = {
 #: 角色强弱顺序，用于「不能给比自己更高的角色」这类判断。
 ROLE_RANK = {"viewer": 1, "operator": 2, "admin": 3}
 
+#: 角色 → 默认的**数据视野**（MCP 的 clearance 档位）。这与「工具组」是正交的
+#: 第二个维度：``ROLE_TOOLS`` 决定能调哪些工具，本表决定「即便能调，也只看得见
+#: 哪些密级的记忆」。
+#:
+#: 为什么必须分开：控制台后端连 MCP 时如果一律走 ``/mcp``（owner 端点），那么
+#: viewer 令牌虽然只能调 ``memory_search``，返回的却是全库 —— 含 sensitive /
+#: secret。工具粒度收紧了、数据粒度没收紧，等于只锁了门没锁抽屉。
+#:
+#: 映射依据是各角色已有的语义，不新增概念：
+#:   admin    全权          → owner
+#:   operator 可写普通条目   → member（读 internal + sensitive）
+#:   viewer   纯只读         → reader（读 internal，读不到 sensitive / secret）
+ROLE_CLEARANCE = {
+    "admin": "owner",
+    "operator": "member",
+    "viewer": "reader",
+}
+
+#: 数据视野强弱顺序。令牌可以声明比角色**更低**（更保守）的档位，但不得更高 ——
+#: 与「不能签出比自己更高权限的令牌」同一条原则。
+CLEARANCE_RANK = {"guest": 0, "reader": 1, "member": 2, "owner": 3}
+
+#: 缺省视野（角色未知时的兜底）。取最保守的一档，脏数据只会「看不到」。
+DEFAULT_CLEARANCE = "reader"
+
+#: 读写模式（2026-10-26）。这是与视野**正交**的第二根轴：视野决定「看得见多少」，
+#: 本字段决定「能不能改」。之所以不把「只读」做成第五个视野档位：档位 4 × 读写 2
+#: = 8 种组合，用档位名表达会组合爆炸，且每加一档都要重算各档的读权关系。
+#:
+#: 服务端侧对应的判据是 `server.current_writable()`（档位允许写 AND 请求允许写），
+#: 端点形态是 `/mcp/<档位>-ro`。这一层只负责把这个意图**记在令牌上**并传下去。
+ACCESS_MODES = ("rw", "ro")
+
+#: 角色默认读写模式。刻意保持 admin / operator 可写 —— 不改变任何存量令牌的行为；
+#: viewer 本来就是只读视野，额外给写标志没有意义。**不给远程令牌默认只读**是
+#: 有意的：那会让所有在线设备升级后突然写不进去，属于无声的行为变更。
+ROLE_ACCESS = {"admin": "rw", "operator": "rw", "viewer": "ro"}
+DEFAULT_ACCESS = "rw"
+
+
+def access_of(role: str, access: str | None = None) -> str:
+    """取实际生效的读写模式：显式声明优先，否则由角色推导。
+
+    与 ``clearance_of`` 同一取向：非法值回落角色默认而不是抛错 —— 这层是读取
+    路径，存量令牌没有该字段，读的时候不能因此炸掉。
+    """
+    if access in ACCESS_MODES:
+        return access
+    return ROLE_ACCESS.get(role, DEFAULT_ACCESS)
+
+
+def clearance_of(role: str, clearance: str | None = None) -> str:
+    """取实际生效的数据视野：显式声明优先，否则由角色推导。
+
+    非法值一律回落到该角色的默认档，而不是抛错 —— 这一层是**读取**路径，
+    存量令牌可能没有 clearance 字段，读的时候不能因此炸掉。
+    """
+    if clearance in CLEARANCE_RANK:
+        return clearance
+    return ROLE_CLEARANCE.get(role, DEFAULT_CLEARANCE)
+
 #: 令牌明文前缀。带上它才能在日志/界面上与口令一眼区分开，也便于密钥扫描器识别。
 TOKEN_PREFIX = "amt_"
 
@@ -354,6 +415,8 @@ class TokenStore:
             "prefix": t.get("prefix", ""),
             "owner": t.get("owner", ""),
             "role": t.get("role", "operator"),
+            "clearance": clearance_of(t.get("role", "operator"), t.get("clearance")),
+            "access": access_of(t.get("role", "operator"), t.get("access")),
             "enabled": bool(t.get("enabled", True)),
             "created_at": t.get("created_at"),
             "expires_at": t.get("expires_at"),
@@ -373,6 +436,7 @@ class TokenStore:
 
     # -- 写 -----------------------------------------------------------------
     def create(self, *, name: str, owner: str, role: str = "operator",
+               clearance: str | None = None, access: str | None = None,
                expires_in: int | None = None, max_uses: int = 0) -> tuple[str, dict]:
         """建令牌，返回 ``(明文, 对外记录)``。**明文只在这一刻存在**。"""
         name = (name or "").strip()
@@ -382,6 +446,29 @@ class TokenStore:
             raise StoreError("令牌名称最长 48 个字符")
         if role not in ROLE_TOOLS:
             raise StoreError(f"未知角色：{role}")
+        # 数据视野：显式值必须在档位表里，且不得高于角色上限。
+        ceil = ROLE_CLEARANCE.get(role, DEFAULT_CLEARANCE)
+        want = str(clearance or ceil).strip().lower()
+        if want not in CLEARANCE_RANK:
+            raise StoreError(
+                f"未知数据视野：{want}（可选 {'/'.join(CLEARANCE_RANK)}）")
+        if CLEARANCE_RANK[want] > CLEARANCE_RANK[ceil]:
+            raise StoreError(
+                f"数据视野不能高于角色上限（{want} > {ceil}）。要把令牌视野调到"
+                f"{want}，得先给它 {role} 之上能覆盖该档的角色。")
+        # 读写模式：只能比角色默认更保守。角色默认只读（viewer）时不允许声明 rw ——
+        # 否则会签出一枚「界面上写着可写、实际因视野只读而写不进去」的令牌，
+        # 那种表里不一比直接拒绝更难查。
+        if access is None:
+            want_access = ROLE_ACCESS.get(role, DEFAULT_ACCESS)
+        else:
+            want_access = str(access).strip().lower()
+            if want_access not in ACCESS_MODES:
+                raise StoreError(
+                    f"未知读写模式：{want_access}（可选 {'/'.join(ACCESS_MODES)}）")
+            if want_access == "rw" and ROLE_ACCESS.get(role, DEFAULT_ACCESS) != "rw":
+                raise StoreError(
+                    f"角色 {role} 的令牌不能声明可读写（该角色默认只读）。")
         if expires_in is not None:
             if int(expires_in) < 60:
                 raise StoreError("有效期至少 60 秒")
@@ -399,6 +486,8 @@ class TokenStore:
                 "hash": _digest(plain),
                 "owner": owner,
                 "role": role,
+                "clearance": want,
+                "access": want_access,
                 "enabled": True,
                 "created_at": _now(),
                 "expires_at": (_now() + expires_in) if expires_in else None,
@@ -461,6 +550,12 @@ class TokenStore:
                 "hash": _digest(plain),
                 "owner": owner,
                 "role": role,
+                # 认领来的老令牌（.env 总钥匙）按角色推导视野，默认 admin → owner，
+                # 语义与改造前一致：它是部署方的总钥匙，不能因这次变更被削弱。
+                "clearance": clearance_of(role),
+                # 同理，读写模式也按角色推导（admin → rw）。老令牌升级后仍可写 ——
+                # 这里若默认成 ro，等于在无人察觉的情况下收走了部署方的写权。
+                "access": access_of(role),
                 "enabled": True,
                 "created_at": _now(),
                 "expires_at": None,
@@ -510,7 +605,15 @@ class TokenStore:
                 t["last_used_at"] = now
                 self._maybe_flush()
                 return {"id": t.get("id"), "name": t.get("name"),
-                        "owner": t.get("owner"), "role": t.get("role", "operator")}
+                        "owner": t.get("owner"), "role": t.get("role", "operator"),
+                        # 数据视野随令牌一起返回：调用方据此选 MCP 端点，而不是
+                        # 一律打 /mcp（owner）。旧令牌没有该字段时按角色推导。
+                        "clearance": clearance_of(t.get("role", "operator"),
+                                                  t.get("clearance")),
+                        # 读写模式同理：调用方据此决定打 /mcp/<档位> 还是
+                        # /mcp/<档位>-ro。旧令牌没有该字段时按角色推导（rw）。
+                        "access": access_of(t.get("role", "operator"),
+                                            t.get("access"))}
         return None
 
     def flush(self) -> None:

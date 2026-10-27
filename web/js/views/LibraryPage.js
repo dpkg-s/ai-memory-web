@@ -1,6 +1,6 @@
 import { computed } from "../../vendor/vue.esm-browser.prod.js";
 import { S, toast } from "../core/store.js";
-import { confZh, fmtNum, mdRender, statusZh, tierZh, typeZh } from "../core/util.js";
+import { clearanceZh, confZh, fmtNum, mdRender, securityPill, securityZh, statusZh, tierZh, typeZh } from "../core/util.js";
 import { browseLibrary, onMdClick, openNote } from "../features/library.js";
 
 var LibraryPage = {
@@ -14,6 +14,19 @@ var LibraryPage = {
     tagsOf: function () {
       return function (it) {
         return (it.tags || []).slice(0, 4);
+      };
+    },
+    /* 列表行的访问控制 pill（2026-10-25）：**只在非默认档时出现**。
+       服务端 `_meta_facets` 只回写非默认值，所以默认的 internal/member 在这里
+       天然拿不到条目 —— 416 条存量不会整屏挂 pill；一旦某条被提级成 secret /
+       owner，它会在列表里自己跳出来。 */
+    accessTag: function () {
+      return function (it) {
+        var f = (it && it.facets) || {};
+        var sec = f.security;
+        if (!sec && !f.clearance) return null;
+        var key = sec || "internal";
+        return { kind: securityPill(key), text: securityZh(key) };
       };
     },
     rendered: function () {
@@ -39,6 +52,11 @@ var LibraryPage = {
         ["版本", m.version, ""],
         ["状态", statusZh(m.status), m.status],
         ["置信度", confZh(m.confidence), m.confidence],
+        /* v3 访问控制（2026-10-25）：元数据表**总是**列出这两行 —— 默认档也显示，
+           因为「这条谁能读」是审计问题，而审计不能靠「没显示 = 默认」去猜。
+           列表行那边才做省略（见 listPills），否则 416 条会挂满 pill。 */
+        ["安全等级", securityZh(m.security || "internal"), m.security || "internal"],
+        ["权级", clearanceZh(m.clearance || "member"), m.clearance || "member"],
       ];
       return rows
         .filter(function (r) {
@@ -151,7 +169,8 @@ var LibraryPage = {
     "        <transition-group tag=\"div\" name=\"liblist\" class=\"list\" appear v-else-if=\"L.mode==='browse' && L.items.length\">" +
     '          <x-list-item v-for="(it, i) in L.items" :key="it.path || it.title" :style="\'--i:\' + i" :title="it.title" :sub="short(it.preview)" @click="openNote(it.title)">' +
     '            <div class="tags mt-sm"><span class="tag" v-for="tg in tagsOf(it)" :key="tg">{{ tg }}</span></div>' +
-    '            <template #right><x-pill :kind="tierPill(it.tier)">{{ it.tier }}</x-pill>' +
+    '            <template #right><x-pill v-if="accessTag(it)" :kind="accessTag(it).kind">{{ accessTag(it).text }}</x-pill>' +
+    '              <x-pill :kind="tierPill(it.tier)">{{ it.tier }}</x-pill>' +
     '              <span class="small faint nowrap">{{ it.reads }} 次</span></template>' +
     "          </x-list-item></transition-group>" +
     '        <x-empty v-else-if="L.mode===\'search\' && L.searchRaw" icon="search" title="没有命中">' +

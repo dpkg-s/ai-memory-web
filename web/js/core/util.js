@@ -139,6 +139,15 @@ var TIER_ZH = { hot: "活跃", warm: "常温", cold: "归档" };
 var CONF_ZH = { high: "高", medium: "中", low: "低" };
 var SCOPE_ZH = { global: "全局", project: "项目", temporary: "临时" };
 var STATUS_ZH = { active: "有效", archived: "已归档", stub: "存根" };
+/* 访问控制两字段（v3，2026-10-25）。措辞刻意偏口语，让非技术的自己也一眼看懂：
+   「安全等级」说的是内容多敏感，「权级」说的是谁能读。 */
+var SECURITY_ZH = {
+  public: "公开",
+  internal: "内部",
+  sensitive: "敏感",
+  secret: "绝密",
+};
+var CLEARANCE_ZH = { guest: "访客", member: "成员", owner: "本人" };
 
 /* 查表 → 中文；查不到就原样返回（服务端将来加新枚举时不会显示空白，
    也不会把未知值误标成某个已知类型）。空值统一给空串，由调用方决定占位。 */
@@ -161,6 +170,20 @@ function scopeZh(v) {
 }
 function statusZh(v) {
   return mapZh(STATUS_ZH, v);
+}
+function securityZh(v) {
+  return mapZh(SECURITY_ZH, v);
+}
+function clearanceZh(v) {
+  return mapZh(CLEARANCE_ZH, v);
+}
+/* 安全等级的色调：公开=中性、内部=常规信息色、敏感=警示、绝密=危险。
+   与「涨红跌绿」无关，这里借用的是告警语义（红=最高风险）。 */
+function securityPill(v) {
+  if (v === "secret") return "err";
+  if (v === "sensitive") return "warn";
+  if (v === "internal") return "info";
+  return "";
 }
 
 var KIND_ZH = {
@@ -363,4 +386,4 @@ function parseSearch(text) {
   return items;
 }
 
-export { fmtNum, fmtBytes, relTime, TOOL_ZH, ARG_ZH, KIND_ZH, TYPE_ZH, TIER_ZH, CONF_ZH, SCOPE_ZH, STATUS_ZH, mapZh, typeZh, tierZh, confZh, scopeZh, statusZh, toolZhName, toolZhDesc, argZh, kindZh, dispWidth, cutWidth, shortDesc, tryJson, escapeHtml, mdReady, mdRender, grab, parseStats, sectionRows, parseSearch };
+export { fmtNum, fmtBytes, relTime, TOOL_ZH, ARG_ZH, KIND_ZH, TYPE_ZH, TIER_ZH, CONF_ZH, SCOPE_ZH, STATUS_ZH, SECURITY_ZH, CLEARANCE_ZH, mapZh, typeZh, tierZh, confZh, scopeZh, statusZh, securityZh, clearanceZh, securityPill, toolZhName, toolZhDesc, argZh, kindZh, dispWidth, cutWidth, shortDesc, tryJson, escapeHtml, mdReady, mdRender, grab, parseStats, sectionRows, parseSearch };
