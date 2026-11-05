@@ -25,6 +25,7 @@ var PAGES = [
   { id: "dashboard", label: "概览", icon: "grid", sub: "健康度与最近动态" },
   { id: "console", label: "调试台", icon: "terminal", sub: "直接调用 MCP 工具" },
   { id: "library", label: "记忆库", icon: "book", sub: "浏览与检索条目" },
+  { id: "logs", label: "日志", icon: "clock", sub: "访问日志 · FNS 同步" },
   { id: "access", label: "访问控制", icon: "shield", sub: "账号 · 令牌 · 权限" },
   { id: "settings", label: "配置", icon: "sliders", sub: "连接 · 阈值 · 同步" },
 ];

@@ -86,6 +86,18 @@ var SettingsPage = {
     updList: function () {
       return S.update.targets || [];
     },
+    /* 同步方向三态的**后果**文案（2026-11-04）。
+       选完要能立刻知道「哪一条方向被掐掉」，否则这个下拉只是三个字母。
+       口径由客户端实现决定：ro 复用既有的 readonly_sync_enabled（只挡上行），
+       wo 是本次新增的 sync_mode=wo（只挡下行），两者互不重叠。 */
+    fnsModeHint: function () {
+      var m = (this.fnsDraft && this.fnsDraft.mode) || "rw";
+      if (m === "ro")
+        return "上行关闭：本机写入的笔记不再推给 FNS，别的设备看不到新内容；服务端下发照常落盘。";
+      if (m === "wo")
+        return "下行关闭：FNS 上新改的笔记不会落进 vault，本机只往外推。需客户端镜像支持 sync_mode（旧镜像不认识该键，会当作读写，等于什么都没关）。";
+      return "双向：本地改动上传，服务端改动落盘。同一篇两边都改时按 mtime 新者胜，冲突不丢正文。";
+    },
   },
   methods: {
     pick: function (id) {
@@ -104,6 +116,33 @@ var SettingsPage = {
        但 zoom 会变，所以照样接上。 */
     onResize: function () {
       this.syncInd(false);
+      this.syncNavX();
+    },
+    /* 手机端横滚胶囊的「还有内容」提示（css/8-responsive.css §32 ④）。
+       只在**真的溢出**时才挂属性：没溢出也挂上，末颗胶囊的右沿会被渐变吃掉，
+       看起来像渲染错误 —— 这是本函数存在的全部理由。
+       三个属性：data-x = 可横滚；data-x-start = 已离开左端（左边要渐隐）；
+                data-x-end = 右边还有内容（右边要渐隐）。 */
+    syncNavX: function () {
+      var nav = this.$el && this.$el.querySelector(".cfg-nav");
+      if (!nav) return;
+      /* 监听只绑一次：resize 与 scroll 都会进这里，重复绑定会让同一帧跑多次。
+         句柄记在实例上，unmounted 时按它摘（元素那时可能已经不在文档里）。 */
+      if (this._navEl !== nav) {
+        if (this._navEl) this._navEl.removeEventListener("scroll", this.onNavScroll);
+        this._navEl = nav;
+        nav.addEventListener("scroll", this.onNavScroll, { passive: true });
+      }
+      var max = nav.scrollWidth - nav.clientWidth;
+      var can = max > 1;
+      var atStart = nav.scrollLeft <= 1;
+      var atEnd = max - nav.scrollLeft <= 1;
+      nav.toggleAttribute("data-x", can);
+      nav.toggleAttribute("data-x-start", can && !atStart);
+      nav.toggleAttribute("data-x-end", can && !atEnd);
+    },
+    onNavScroll: function () {
+      this.syncNavX();
     },
     loadTh: function (f) {
       return loadThresholds(f);
@@ -198,6 +237,7 @@ var SettingsPage = {
             client_type: fns.client_type,
             vault: fns.vault,
             token: fns.token,
+            mode: fns.mode || "rw",
             exclude: fns.exclude,
           },
           ui: (S.about.app || {}).ui || {},
@@ -417,6 +457,9 @@ var SettingsPage = {
             client_type: f.client_type || f.account || "",
             vault: f.vault || "",
             token: f.token || "",
+            /* 同步方向三态（2026-11-04）。缺省 rw = 改造前行为，旧配置读进来不会变。
+               取值与后端 _FNS_MODES 必须一致，否则后端会静默回落成 rw。 */
+            mode: f.mode === "ro" || f.mode === "wo" ? f.mode : "rw",
             exclude: Array.isArray(f.exclude) ? f.exclude.slice() : [],
             excludeText: (Array.isArray(f.exclude) ? f.exclude : []).join(
               "\n",
@@ -434,6 +477,7 @@ var SettingsPage = {
        走 nextTick 是因为活跃条目靠 tab computed 写 class —— 等 Vue 写全再量。 */
     nextTick(function () {
       self.syncInd(false);
+      self.syncNavX();
     });
     window.addEventListener("resize", this.onResize);
   },
@@ -441,6 +485,10 @@ var SettingsPage = {
     /* SettingsPage 在 Root 里是 v-if 切换的 ⇒ 离开配置页即卸载，
        监听必须摘掉，否则反复进出会累积。 */
     window.removeEventListener("resize", this.onResize);
+    if (this._navEl) {
+      this._navEl.removeEventListener("scroll", this.onNavScroll);
+      this._navEl = null;
+    }
   },
   template:
     '<div class="page">' +
@@ -567,6 +615,13 @@ var SettingsPage = {
     '          <div class="input-group"><input class="input mono" :type="showToken?\'text\':\'password\'" v-model="fnsDraft.token" placeholder="仅存本地，不进 vault" @input="S.fns.dirty=true" :disabled="!canEdit">' +
     "            <button class=\"btn\" @click=\"showToken=!showToken\">{{ showToken ? '隐藏' : '显示' }}</button></div></x-field>" +
     '      </div>' +
+    '      <x-field label="同步方向">' +
+    '        <template #hint>{{ fnsModeHint }}</template>' +
+    '        <select class="select" v-model="fnsDraft.mode" @change="S.fns.dirty=true" :disabled="!canEdit">' +
+    '          <option value="rw">读写（双向）：本地改动上传，服务端下发也落盘</option>' +
+    '          <option value="ro">只读（只接收）：不向服务端推送本地改动</option>' +
+    '          <option value="wo">只写（只上传）：服务端下发一律不落盘</option>' +
+    '        </select></x-field>' +
     '      <x-field label="排除规则">' +
     '        <template #hint>一行一条。当前 {{ (fnsDraft.exclude||[]).length }} 条。</template>' +
     '        <textarea class="textarea" v-model="fnsDraft.excludeText" :disabled="!canEdit" placeholder="每行一条，如：.obsidian/**&#10;*.tmp" @input="fnsDraft.exclude=fnsDraft.excludeText.split(/[\\r\\n,]+/).filter(Boolean); S.fns.dirty=true"></textarea>' +

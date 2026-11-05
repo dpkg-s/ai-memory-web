@@ -1,5 +1,6 @@
 import { S, toast } from "../core/store.js";
 import { api } from "../core/api.js";
+import { AUDIT_ACTION_ZH } from "../core/util.js";
 
 /* ======================================================================
  * 15. 访问控制页（2026-10-22，控制台 v1.7.0）
@@ -91,8 +92,45 @@ function fmtTs(v) {
   );
 }
 
-/* 到期/次数的人话描述。分开算是因为两者都可能缺 —— 缺 = 不限。 */
-function expiresZh(t) {
+/* 日志左列只要 HH:MM（2026-10-28）：一份日增几十条的清单里反复写
+   「2026-10-28」纯属噪音，把横向空间全吃掉了。完整时刻挂在 title 上。
+   跨天的记录仍要能分清 —— 所以日期不是丢掉，是挪进 .audit-day 分组行
+   （同一天只在首条上方出现一次）。 */
+function fmtHm(v) {
+  if (v === null || v === undefined || v === "") return "";
+  var d = new Date(Number(v) * 1000);
+  if (isNaN(d.getTime())) return "";
+  function p(n) {
+    return (n < 10 ? "0" : "") + n;
+  }
+  return p(d.getHours()) + ":" + p(d.getMinutes());
+}
+
+/* 悬停用的完整时间戳：精确到秒。审计里「同一分钟内两次操作谁先谁后」
+   是真会被问的问题，而 fmtTs 只到分钟。 */
+function fmtTsFull(v) {
+  if (v === null || v === undefined || v === "") return "";
+  var d = new Date(Number(v) * 1000);
+  if (isNaN(d.getTime())) return "";
+  function p(n) {
+    return (n < 10 ? "0" : "") + n;
+  }
+  return (
+    d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) +
+    " " + p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds())
+  );
+}
+
+/* 耗时（2026-10-28）：服务端现在给数值字段 ms，不再是 detail 里的
+   "676.6ms · 地址栏"。≥1s 换成秒 —— 三位数毫秒与「2.3s」并排时，
+   后者才是需要立刻被认出的那一档。 */
+function fmtMs(n) {
+  if (!isFinite(n) || n <= 0) return "";
+  if (n < 1000) return Math.round(n) + "ms";
+  return (n / 1000).toFixed(1) + "s";
+}
+
+/* 到期/次数的人话描述。分开算是因为两者都可能缺 —— 缺 = 不限。 */function expiresZh(t) {
   if (!t.expires_at) return "永久";
   var left = Number(t.expires_at) - Date.now() / 1000;
   if (left <= 0) return "已过期";
@@ -113,50 +151,93 @@ function usesZh(t) {
  * 映射：文案改动不该要求重启后端（Python 改动要重启，JS 保存即生效）。
  * 映射表留兜底 —— 将来服务端多一个动作，界面上显示原始 action 而不是空白，
  * 这比「静默丢一行」有用得多。
+ *
+ * 2026-11-05：动作表已提到 core/util.js（AUDIT_ACTION_ZH）—— 新的「日志」页
+ * 读的是同一份 audit.jsonl，两处各存一份迟早出现「同一动作两种叫法」。
  * ------------------------------------------------------------------------- */
-var AUDIT_ACTION_ZH = {
-  "login.ok": "登录",
-  "login.fail": "登录失败",
-  "logout": "登出",
-  "password.change": "修改口令",
-  "account.create": "创建账号",
-  "account.update": "修改账号",
-  "account.delete": "删除账号",
-  "token.issue": "签发令牌",
-  "token.revoke": "吊销令牌",
-  "config.write": "修改配置",
-  "config.thresholds": "修改阈值",
-  "tool.call": "调用工具",
-  "tool.denied": "调用被拒",
-  "mcp.connect": "MCP 接入",
-  "auth.denied": "鉴权拦截",
-  "audit.export": "导出日志",
-};
 
-/* 一条事件压成「谁 · 什么时候 · 干了什么」三段：
-   fact 段给人一眼认出动作，detail 段补充「哪个工具 / 什么角色 / 多久」。
-   2026-10-27 追加 ip：这是判断「同一个人 vs 同一枚令牌被两个人用」的关键旁证，
-   只放在 detail 里（服务端本来就有）等于白存 —— 界面上得看得见才算记录。 */
-function auditRow(e) {
+/* 一条事件压成三槽位（2026-10-28，主人选型 B）：
+   「时间列 | 圆点 | 主体 | 耗时列」。
+
+   为什么放弃原来的两行「· 串」：第二行把 时间 · IP · 耗时 · 渠道 四种性质
+   完全不同的东西平铺在同一个分隔符下，读起来是一句话而不是一张表 ——
+   耗时是唯一可以横向比较的数值，却埋在最不起眼的位置。
+
+   令牌标识同理：原来只有 via="token" ⇒ 显示「（令牌）」，只说明走了令牌通道，
+   说不出是哪一枚，WorkBuddy / Codex / Claude Code 全糊成一个人。 */
+function auditRow(e, tokById, tokAll) {
   var actor = String(e.actor || "").trim();
   if (!actor || actor === "anonymous") actor = "匿名";
-  /* 令牌通道的主体是「哪枚令牌的 owner」+ 标记，否则同名的人与脚本会混成一列。 */
-  if (e.via === "token") actor += "（令牌）";
+
+  /* 令牌的认出顺序（越具体越优先）：
+     ① 服务端快照 token_name —— 最准，令牌改名/删除后历史仍然准确；
+     ② 服务端 token_id → 现表 join 出的名称；
+     ③ 同一 id 只有前缀 → 前缀兜底；
+     ④ 连 id 都没有 = 改造前的旧记录。这里**不直接放弃**：审计里同时记了
+        owner（actor）与 role，若同一 owner 名下该角色的令牌只剩一枚，那它
+        就是唯一解 —— 这是推断，不是猜测，必须写明出处（tooltip）。
+     ⑤ 仍多解（同一人同角色有好几枚）才落到「旧记录」，这时谁都认不出来，
+        谎报一个名字比诚实说不知道更糟。 */
+  var tok = "";
+  var tokTip = "";
+  if (e.via === "token") {
+    var rec = (e.token_id && tokById && tokById[e.token_id]) || null;
+    var nm = String(e.token_name || "").trim() || (rec && rec.name) || "";
+    var prefix = (rec && rec.prefix) || "";
+    if (nm) {
+      tok = nm;
+      tokTip = prefix ? "令牌前缀 " + prefix : "令牌";
+    } else if (prefix) {
+      /* 前缀兜底只在栏宽允许时才有意义：12 位前缀 ≈ 85px，与一枚 19 字符
+         的工具名并排就要把工具名挤到换行。截到 8 位仍足以区分（同一个人
+         的两枚令牌前 8 位撞车概率可忽略），省下 30px 留给工具名。 */
+      tok = prefix.length > 9 ? prefix.slice(0, 8) + "…" : prefix;
+      tokTip = "令牌名称未知，按前缀辨认：" + prefix;
+    } else if (e.token_id) {
+      tok = "已失效";
+      tokTip = "这枚令牌已吊销或删除，表里查不到";
+    } else {
+      var cand = (tokAll || []).filter(function (t) {
+        return t && t.owner === actor && t.role === e.role;
+      });
+      if (cand.length === 1) {
+        tok = cand[0].name || (cand[0].prefix || "").slice(0, 8) || "令牌";
+        tokTip = "旧记录：未记令牌标识，按「同一个人 + 同一角色」唯一匹配推断为 " + tok;
+      } else {
+        tok = "旧记录";
+        tokTip = "这条写于令牌标识入库之前，当时没记是哪一枚；"
+          + "同一人同角色有 " + cand.length + " 枚令牌，无法唯一确定。";
+      }
+    }
+  } else if (e.via) {
+    tok = "会话";
+    tokTip = "浏览器会话（Cookie），不是令牌通道";
+  }
+
+  var n = Number(e.ms);
+  var hasMs = isFinite(n) && n > 0;
   return {
     id: (e.t || 0) + "-" + (e.action || "") + "-" + (e.target || ""),
     kind: e.kind || "other",
     actor: actor,
     action: AUDIT_ACTION_ZH[e.action] || e.action || "—",
     target: e.target || "",
+    /* 令牌胶囊只在令牌/会话通道出现；本机无鉴权形态下 via 为空，不显示 */
+    tok: tok,
+    tokTip: tokTip,
+    /* 耗时（2026-10-28）：服务端给了数值字段 ms，不再从 detail 字符串里
+       正则抠。缺失（MCP 反代不测量耗时）显示「—」。 */
+    ms: hasMs ? fmtMs(n) : "",
+    slow: hasMs && n >= 1000,
+    /* 左列只给 HH:MM：同一份日志里重复写日期纯属噪音，完整时间戳挂 title。 */
+    hm: fmtHm(e.t),
+    full: fmtTsFull(e.t),
+    /* detail 现在只剩渠道（地址栏 / 调试台 / MCP 反代），耗时已拆走 */
     detail: e.detail || "",
-    /* 回环地址单独标一下：它既可能是「本机直连」，也可能是 cloudflared
-       隧道没带 CF-Connecting-IP（服务端只信这个头）。混在公网 IP 里看是噪音。 */
     ip: e.ip || "",
     ipLocal: e.ip === "127.0.0.1" || e.ip === "::1" || e.ip === "::ffff:127.0.0.1",
     time: fmtTs(e.t),
     ok: e.ok !== false,
-    /* 类名在 JS 里拼好，模板里就只剩一个属性绑定 —— 在单引号字符串里再嵌
-       单引号（:'k-' + ...）既难读又极易被转义吃掉（2026-10-27 踩过）。 */
     dot: "k-" + (e.kind || "other"),
     bad: e.ok === false,
   };
@@ -343,8 +424,35 @@ var AccessPage = {
     auditSkel: function () {
       return this.auditBusy && !this.auditLoaded && !this.auditEvents.length;
     },
+    /* 日志行（2026-10-28 三槽位改造）：
+       · tokById：把令牌 id 换成名称/前缀。令牌名优先取服务端快照，所以这张
+         表只在「快照为空」（旧记录、或令牌签发于改造前）时才真正用得上 ——
+         但它必须是「已加载才准」的数据，没加载时 join 不到会误报「已失效」，
+         故 provider 恒有值（refresh 无条件拉 tokens），缺的只是命中项。
+       · day：同一天只在首条打一个日期锚。左列时间砍到 HH:MM 之后，跨天的
+         记录必须有这个东西，否则「11:14」到底哪天的分不清。日志是新→旧，
+         所以日期变化的边界出现在**下一条**，标记打在当天**最早**的那条上
+         看起来更自然 —— 这里按「相邻两条日期不同」打，即日期块的首条。 */
     auditRows: function () {
-      return (this.auditEvents || []).map(auditRow);
+      var byId = {};
+      var all = [];
+      (this.tokens || []).forEach(function (t) {
+        if (t && t.id) byId[t.id] = t;
+        all.push(t);
+      });
+      var prevDay = "";
+      var out = [];
+      for (var i = 0; i < (this.auditEvents || []).length; i++) {
+        var e = this.auditEvents[i];
+        var row = auditRow(e, byId, all);
+        var day = String(row.full || "").slice(0, 10);
+        if (day && day !== prevDay) {
+          row.day = day;
+          prevDay = day;
+        }
+        out.push(row);
+      }
+      return out;
     },
     expZh: function () {
       return function (t) {
@@ -1081,33 +1189,52 @@ var AccessPage = {
     '                  :class="{on:auditKind===k.key}" @click="setAuditKind(k.key)">' +
     "            {{ k.label }}</button>" +
     "        </div>" +
-    /* 首屏骨架：6 行「圆点 + 两段线」，形状与真实条目一致 —— 用灰条而不是
-       转圈，是因为它同时告诉眼睛「这里将出现一列什么形状的东西」。
-       骨架行复用 .audit-item 的排布，高度对得上，替换时不跳。 */
+    /* 首屏骨架：6 行「时间 + 圆点 + 两段线 + 耗时」，形状与真实条目一致 ——
+       用灰条而不是转圈，是因为它同时告诉眼睛「这里将出现一列什么形状的东西」。
+       骨架行复用 .audit-item 的 grid 槽位，列宽对得上，替换时整列不跳。 */
     '        <div class="audit-list audit-skel" v-if="auditSkel" aria-busy="true">' +
     '          <div class="audit-item" v-for="i in 6" :key="i">' +
+    '            <span class="skel line w-time"></span>' +
     '            <span class="audit-dot skel-dot"></span>' +
     '            <div class="audit-main">' +
     '              <div class="skel line skel-l1"></div>' +
     '              <div class="skel line w40"></div>' +
     "            </div>" +
+    '            <span class="skel line w-ms"></span>' +
     "          </div>" +
     "        </div>" +
     /* 已有数据时的刷新：整列降透明度 + 卡头按钮转圈。不换成骨架 ——
        那会把用户正在看的那一行整页抽走。 */
     '        <div class="audit-list" v-else-if="auditRows.length" :class="{stale:auditBusy}">' +
-    '          <div class="audit-item" v-for="e in auditRows" :key="e.id">' +
-    '            <span class="audit-dot" :class="e.dot" :data-bad="e.bad"></span>' +
-    '            <div class="audit-main">' +
-    '              <div class="audit-line"><b>{{ e.actor }}</b> {{ e.action }}' +
-    '                <code class="audit-target" v-if="e.target">{{ e.target }}</code></div>' +
-    '              <div class="audit-sub"><span>{{ e.time }}</span>' +
-    '                <span class="audit-ip" :class="{local:e.ipLocal}" v-if="e.ip"' +
-    '                      :title="e.ipLocal ? \'本机直连或隧道未带真实来源\' : \'来源 IP\'">' +
-    "                  · {{ e.ip }}</span>" +
-    '                <span v-if="e.detail"> · {{ e.detail }}</span></div>' +
+    /* 三槽位（2026-10-28 方案 B）：时间列 | 圆点 | 主体 | 耗时列。
+       主体第一行给「对象」（工具名等，mono 等宽）+ 令牌胶囊，第二行才是
+       「谁 · 动作 · 来源 · 渠道」—— 因为这一栏最常被问的两个问题是
+       「哪个工具」和「哪枚令牌」，主语反而是天天不变的那一项。
+       令牌/会话胶囊靠右浮：它的长度差异极大（amt_3f9c… vs 未标注），
+       若跟在标签后面会把下面一行的起点推得七零八落。 */
+    '          <template v-for="e in auditRows" :key="e.id">' +
+    '            <div class="audit-day" v-if="e.day">{{ e.day }}</div>' +
+    '            <div class="audit-item" :class="{bad:e.bad}">' +
+    '              <span class="audit-time" :title="e.full">{{ e.hm }}</span>' +
+    '              <span class="audit-dot" :class="e.dot"></span>' +
+    '              <div class="audit-main">' +
+    '                <div class="audit-line">' +
+    '                  <code class="audit-target" v-if="e.target">{{ e.target }}</code>' +
+    '                  <span class="audit-act" v-else>{{ e.action }}</span>' +
+    '                  <span class="audit-tok" v-if="e.tok" :title="e.tokTip">{{ e.tok }}</span>' +
+    "                </div>" +
+    '                <div class="audit-sub">' +
+    '                  <span class="audit-actor">{{ e.actor }}</span>' +
+    '                  <span v-if="e.target">{{ e.action }}</span>' +
+    '                  <span class="audit-ip" :class="{local:e.ipLocal}" v-if="e.ip"' +
+    '                        :title="e.ipLocal ? \'127.0.0.1 / ::1：本机直连，或隧道未带真实来源\' : \'来源 IP\'">' +
+    '                    {{ e.ipLocal ? "本机" : e.ip }}</span>' +
+    '                  <span v-if="e.detail">{{ e.detail }}</span>' +
+    "                </div>" +
+    "              </div>" +
+    '              <span class="audit-ms" :class="{slow:e.slow}">{{ e.ms || "—" }}</span>' +
     "            </div>" +
-    "          </div>" +
+    "          </template>" +
     "        </div>" +
     '        <x-empty v-else-if="!auditBusy" icon="clock"' +
     '                  :title="auditKind ? \'没有匹配记录\' : \'还没有记录\'"' +

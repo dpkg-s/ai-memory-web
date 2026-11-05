@@ -413,7 +413,12 @@
   border-color: var(--accent);
   box-shadow: var(--ring);
   outline: none;
-  background: var(--surface);
+  /* ⚠️ 只能用 background-color，**不能用 background 简写**（2026-10-29）。
+     `.select` 的下拉箭头是 background-image 画的两块 45°/135° 渐变（见下方
+     `.select` 规则）；`background:` 简写会把 background-image 重置为 none ——
+     于是「点开下拉 ⇒ 元素获得焦点 ⇒ 箭头当场消失，点走才回来」。
+     主人原话：「展开用的小三角显示有问题」。 */
+  background-color: var(--surface);
 }
 
 .input::placeholder,
@@ -719,6 +724,47 @@
 .list {
   display: flex;
   flex-direction: column;
+}
+
+/* ---------- 11b. 列表续载哨兵（2026-10-29） ---------- */
+/* 记忆库页「滚到底自动续载」的尾部状态行。定位上它是列表的收尾，所以用虚线
+   上边与内容分隔，而不是再套一层卡片 —— 卡片会让人以为那是可折叠的独立区块。 */
+.lib-tail {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+  margin-top: 10px;
+  padding: 14px 0 4px;
+  border-top: 1px dashed var(--border);
+}
+
+/* 降级按钮：**有意**压到文字级对比度。主通道是滚动自动续载，这颗按钮只服务
+   「内核没有 IntersectionObserver」和「想手动催一页」两种情形；做成常规按钮
+   会被误读成「必须点这里才会加载」。hover / 键盘聚焦时才提到正常对比度。 */
+.lib-more {
+  border: 0;
+  padding: 4px 12px;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-faint);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition:
+    color var(--t-fast) var(--ease),
+    background var(--t-fast) var(--ease);
+}
+
+.lib-more:hover,
+.lib-more:focus-visible {
+  color: var(--text);
+  background: var(--surface-3);
+}
+
+.lib-more:disabled {
+  opacity: 0.6;
+  cursor: default;
 }
 
 .list-item {

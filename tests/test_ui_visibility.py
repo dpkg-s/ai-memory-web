@@ -87,7 +87,7 @@ function navOf(role) {
     visible: visiblePages,
     navIds: nav.map((n) => n.id),
     canSee: Object.fromEntries(
-      ["dashboard", "console", "library", "access", "settings"].map((id) => [
+      ["dashboard", "console", "library", "logs", "access", "settings"].map((id) => [
         id,
         Root.methods.canSee.call({ visiblePages }, id),
       ]),
@@ -183,8 +183,13 @@ def _run_probe() -> dict:
     js = os.path.join(tmp, "probe.mjs")
     with open(js, "w", encoding="utf-8") as f:
         f.write(PROBE_JS)
-    env = dict(os.environ, WEBJS_BASE=JS_BASE + os.sep)
-    r = subprocess.run([node, js], capture_output=True, text=True, env=env)
+    env = dict(os.environ, WEBJS_BASE=JS_BASE + os.sep, PYTHONIOENCODING="utf-8")
+    # 编码必须两端一致：node 的 stderr/stdout 若含非 ASCII，Windows 下父进程按
+    # locale(GBK) 解码会在读线程抛 UnicodeDecodeError，r.stdout 直接变成 None
+    # —— 报错落在 json.loads 上（"not NoneType"），看起来像探针没输出，
+    # 与真实故障完全无关。故显式钉 utf-8 + replace 兜底。
+    r = subprocess.run([node, js], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", env=env)
     if r.returncode != 0:
         print("FAIL: node 求值组件失败\n" + (r.stderr or ""))
         raise SystemExit(1)
@@ -201,17 +206,24 @@ def main() -> int:
 
     # ---------- 逻辑层：PAGE_ROLES 的判定结果 ----------
     roles = data["roles"]
-    ck(roles["(空)"]["navIds"] == ["dashboard", "console", "library", "access", "settings"],
+    # 2026-11-05：侧栏第 4 项「日志」上线（PAGES 从 5 项变 6 项，access/settings
+    # 顺延为 5/6）。日志页**仅 admin** —— 服务端 /api/logs 同样 admin 专属，
+    # 入口与接口必须同一口径，否则就是「点得进但必然 403」。
+    _NAV_ALL = ["dashboard", "console", "library", "logs", "access", "settings"]
+    ck(roles["(空)"]["navIds"] == _NAV_ALL,
        "角色为空时不该裁剪任何入口（首帧会误藏管理员入口）")
-    ck(roles["admin"]["navIds"] == ["dashboard", "console", "library", "access", "settings"],
+    ck(roles["admin"]["navIds"] == _NAV_ALL,
        "admin 应看到全部入口")
     ck(roles["operator"]["navIds"] == ["dashboard", "console", "library", "access", "settings"],
-       "operator 应看到全部入口（含调试台与访问控制）")
+       f"operator 应看到除日志外的全部入口，实际 {roles['operator']['navIds']}")
     ck(roles["viewer"]["navIds"] == ["dashboard", "library", "settings"],
        f"viewer 只能看到 概览/记忆库/配置，实际 {roles['viewer']['navIds']}")
     ck(roles["viewer"]["canSee"]["console"] is False, "viewer 不应能进调试台")
     ck(roles["viewer"]["canSee"]["access"] is False, "viewer 不应能进访问控制")
     ck(roles["viewer"]["canSee"]["library"] is True, "viewer 应能进记忆库")
+    ck(roles["viewer"]["canSee"]["logs"] is False, "viewer 不应能进日志页")
+    ck(roles["operator"]["canSee"]["logs"] is False,
+       "operator 也不应能进日志页（/api/logs 是 admin 专属）")
 
     # ---------- 逻辑层：配置页 FNS 页签 ----------
     sa, sv = data["settings"]["admin"], data["settings"]["viewer"]

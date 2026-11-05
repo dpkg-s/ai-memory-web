@@ -24,6 +24,7 @@ import { browseLibrary, openNote, searchLibrary } from "./features/library.js";
 import { ConsolePage } from "./views/ConsolePage.js";
 import { Dashboard } from "./views/Dashboard.js";
 import { LibraryPage } from "./views/LibraryPage.js";
+import { LogsPage } from "./views/LogsPage.js";
 import { AccessPage } from "./views/AccessPage.js";
 import { Root } from "./views/Root.js";
 import { SettingsPage } from "./views/SettingsPage.js";
@@ -73,6 +74,7 @@ Object.assign(app.config.globalProperties, {
   ["dashboard", Dashboard],
   ["console-page", ConsolePage],
   ["library-page", LibraryPage],
+  ["logs-page", LogsPage],
   ["access-page", AccessPage],
   ["settings-page", SettingsPage],
 ].forEach(function (c) {

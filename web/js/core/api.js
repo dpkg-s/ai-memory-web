@@ -4,6 +4,21 @@ import { S } from "./store.js";
  * 4. API 客户端
  * ==================================================================== */
 var TOKEN_KEY = "am.token";
+
+/* 查询串拼装（2026-11-05 提取）：audit / auditExport / logs / logsExport 四处
+   用的是同一套「丢掉空值再 encode」的规则，各写一遍迟早有一处漏掉空串检查
+   —— 那会变成 `?kind=` 这种「看起来没筛选、实际传了空」的请求。 */
+function qsOf(params) {
+  var qs = [];
+  var p = params || {};
+  Object.keys(p).forEach(function (k) {
+    if (p[k] !== "" && p[k] !== null && p[k] !== undefined) {
+      qs.push(encodeURIComponent(k) + "=" + encodeURIComponent(p[k]));
+    }
+  });
+  return qs.join("&");
+}
+
 var api = {
   token: (function () {
     try {
@@ -109,14 +124,8 @@ var api = {
   /* 访问日志（2026-10-27）。参数全部可选：limit / kind / actor / since。
      服务端对非 admin 回 403 —— 这里不做前端判断，让权限只有一处事实源。 */
   audit: function (params) {
-    var qs = [];
-    var p = params || {};
-    Object.keys(p).forEach(function (k) {
-      if (p[k] !== "" && p[k] !== null && p[k] !== undefined) {
-        qs.push(encodeURIComponent(k) + "=" + encodeURIComponent(p[k]));
-      }
-    });
-    return this.req("/api/audit" + (qs.length ? "?" + qs.join("&") : ""));
+    var qs = qsOf(params);
+    return this.req("/api/audit" + (qs ? "?" + qs : ""));
   },
   /* 导出访问日志（2026-10-27）——**唯一一个不走 req() 的接口**。
      为什么不用 `<a download>` 直接指过去：会话过期时浏览器会把那段 JSON
@@ -125,16 +134,24 @@ var api = {
      返回值是 Blob（不是解析后的对象）—— CSV 不是 JSON，req() 的解析会把它
      拆成 {error: "时间,类型,..."}，等于当场毁掉数据。 */
   auditExport: function (params) {
-    var qs = [];
-    var p = params || {};
-    Object.keys(p).forEach(function (k) {
-      if (p[k] !== "" && p[k] !== null && p[k] !== undefined) {
-        qs.push(encodeURIComponent(k) + "=" + encodeURIComponent(p[k]));
-      }
-    });
+    return this._blob("/api/audit/export", qsOf(params));
+  },
+  /* ---- 日志页（2026-11-05，主人：「添加新页面日志」）----
+     一条合并时间轴：访问日志（audit.jsonl） + FNS 同步事件（sync-events.jsonl）。
+     服务端已按时间合并、截断（见 web_console.logs_get），前端**不再分两次请求**
+     —— 分拉会让两条流各自截断，拼起来中间是空的。 */
+  logs: function (params) {
+    var qs = qsOf(params);
+    return this.req("/api/logs" + (qs ? "?" + qs : ""));
+  },
+  logsExport: function (params) {
+    return this._blob("/api/logs/export", qsOf(params));
+  },
+  /* 二进制下载通道（导出专用）：成功才交 Blob，失败把服务端的 JSON error 掏出来。 */
+  _blob: function (path, qs) {
     var headers = {};
     if (this.token) headers.Authorization = "Bearer " + this.token;
-    return fetch("/api/audit/export" + (qs.length ? "?" + qs.join("&") : ""), {
+    return fetch(path + (qs ? "?" + qs : ""), {
       headers: headers,
       credentials: "same-origin",
       cache: "no-store",

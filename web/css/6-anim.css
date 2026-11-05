@@ -1554,3 +1554,24 @@ html.theming *::after {
   transition-timing-function: var(--ease-in-out);
   transition-delay: 0s;
 }
+
+/* ---------------------------------------------------------------------------
+ * 17n. 断点跨越 FLIP 期间让位（2026-10-29，2026-10-30 补注）
+ *   病征：`core/flip.js` 每帧写 inline `transform`，而 `.card` 自己挂着
+ *   `transition: transform var(--t) var(--ease)`（§5 卡片）⇒ 每一帧的目标值都被
+ *   过渡再插值一次，观感是卡片"拖着走"、落点迟半拍，越大的卡越明显。
+ *   治法：动画期间由 flip.js 在 `<html>` 上挂牌 `data-flipping`，这里把过渡整段
+ *   关掉；动画结束后**隔两帧**摘牌（同步摘牌会在清 inline transform 的同一帧把
+ *   过渡重新打开，浏览器就把"从位移回 0"补间一遍 —— 收尾那下闪烁）。
+ *   ⚠️ 只压 `transition`，**不碰 `animation`**：`.grid.two > .card` 的 riseIn 是
+ *      `animation ... both`，中途把 `animation-name` 置 none 再恢复会让它**重播**
+ *      一遍入场 —— 那就变成「跨越断点后卡片又弹一次」。
+ *      这类「已播完但仍填终值」的入场动画会压住 inline transform（CSS 动画优先级
+ *      高于 inline style），改由 flip.js 在起手前 `cancel()` 掉，不在这里处理。
+ *   ⚠️ 选择器必须带 `html[data-flipping]` 前缀（特异性 (0,1,1) + !important），
+ *      否则压不住 `.card` 自带的同名过渡。
+ * ------------------------------------------------------------------------- */
+html[data-flipping] .card,
+html[data-flipping] .card * {
+  transition: none !important;
+}

@@ -121,10 +121,51 @@ var S = reactive({
     loading: false,
     error: null,
     items: [],
+    /* 分页游标（2026-10-29，滚动续载）。`items` 是**累积**数组而非当前页，
+       所以 `items.length` 本身就是下一页的 offset —— 不另存 offset，
+       免得两个真值互相漂移。`hasMore` 由服务端 `count` 与已到手条数比较得出，
+       前端不推算总页数（条数是服务端过滤后的口径，前端算不出来）。
+       数据源是 `GET /api/library`：memory_list 没有 offset，整包又超 _THUMB，
+       切片只能落在服务端（见 web_console.py 的 Console.library）。 */
+    hasMore: false,
+    loadingMore: false,
+    count: 0,
+    hidden: 0,
     searchRaw: "",
     searchItems: [],
     note: null,
     noteLoading: false,
+    /* 「全部条目」排序（2026-11-05 主人：「添加笔记排序方式」）。
+       默认空 = 保持服务端原序（路径倒序）；非空时由 GET /api/library 在
+       **切片之前**排序（前端排只能排当前页，翻页会错位）。
+       order 空串 = 该字段的默认方向（见 web_console.sort_library_entries）。 */
+    sort: "",
+    order: "",
+  },
+  /* 日志页（2026-11-05）：访问日志 + FNS 同步事件，一条合并时间轴。
+     服务端合并后按时间倒序下发（/api/logs），前端只做「按天/按分钟分组」，
+     不重新排序 —— 排序口径只有一处（服务端），免得两条流在页面上打架。 */
+  logs: {
+    loading: false,
+    error: null,
+    /* 首屏还没成功读过一次 ⇒ 显示骨架而不是「暂无记录」（两者长得像、
+       含义完全不同：一个在等、一个真没有）。与 AccessPage.auditLoaded 同口径。 */
+    loaded: false,
+    events: [],
+    counts: { access: 0, fns: 0 },
+    total: 0,
+    /* FNS 数据源状态：available=false 表示「没有事件文件」（未启用 FNS /
+       卷没挂），不是错误 —— 右栏要显示成「尚未接入」，别报红。 */
+    fns: { available: false, path: "", error: "" },
+    filters: { access_kinds: [], sync_actions: [], sync_kinds: [] },
+    stats: { access: {}, fns: {} },
+    /* 视图筛选（服务端口径）：
+         source = all / access / fns；akind = 访问日志类型；faction = 同步动作 */
+    source: "all",
+    akind: "",
+    faction: "",
+    /* 导出独立的忙标志：与「刷新」共用会让刷新按钮在导出时也转圈。 */
+    exporting: false,
   },
   settingsTab: "conn",
   thresholds: {

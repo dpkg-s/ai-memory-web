@@ -6,7 +6,7 @@ import { loadThresholds } from "../features/settings.js";
 /* ======================================================================
  * 7. hash 路由
  * ==================================================================== */
-var PAGES = ["dashboard", "console", "library", "access", "settings"];
+var PAGES = ["dashboard", "console", "library", "logs", "access", "settings"];
 
 /* 页面可见性（**唯一事实源**，2026-10-26 建立）。
    ------------------------------------------------------------------
@@ -26,6 +26,11 @@ var PAGES = ["dashboard", "console", "library", "access", "settings"];
 var PAGE_ROLES = {
   console: ["admin", "operator"],
   access: ["admin", "operator"],
+  /* 日志页只给 admin（2026-11-05）：它把访问日志（谁进过门、动过什么）与
+     FNS 同步事件（哪些笔记何时上下行）放在一页 —— 两份都是侦察地图级别的
+     信息，服务端 /api/logs 也按 admin 卡。入口与接口必须同一口径，否则就是
+     「点得进但必然 403」。 */
+  logs: ["admin"],
 };
 function pageAllowed(role, id) {
   if (!role) return true;

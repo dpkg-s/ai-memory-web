@@ -1,11 +1,42 @@
 import { computed } from "../../vendor/vue.esm-browser.prod.js";
 import { S, toast } from "../core/store.js";
 import { clearanceZh, confZh, fmtNum, mdRender, securityPill, securityZh, statusZh, tierZh, typeZh } from "../core/util.js";
-import { browseLibrary, onMdClick, openNote } from "../features/library.js";
+import { browseLibrary, loadMoreLibrary, onMdClick, openNote, setLibrarySort } from "../features/library.js";
+
+/* 滚动续载的预取余量（2026-10-29）：哨兵进入「视口 + 这个余量」就要下一页。
+   取值要**小于一页的高度**（40 条 ≈ 2160px），否则追加一页后哨兵仍在预取区内、
+   下一次滚动才算「再次进入」，用户会看到「滚到底却没反应」。实测一页远超 400px，
+   360 足够提前 6~7 条开始要数据。 */
+var TAIL_MARGIN_PX = 360;
 
 var LibraryPage = {
   data: function () {
     return { S: S };
+  },
+  /* 续载哨兵的两处挂钩（2026-10-29）：
+     · mounted —— 装滚动捕获（第三参 true = 捕获阶段，能收到**任何**容器的滚动）；
+     · watch —— 数据到达不会触发 scroll，必须单独补一次「是否已经该续载」。
+     ⚠️ 这里**不用 IntersectionObserver**：实测（2026-10-29，无头 Chrome 劫持
+     构造函数取证）本页 IO 一次都没有被创建 —— `$refs` 在 `v-if` 哨兵上取不到，
+     且真正的滚动容器是 `.grid.lib` 里的 **.card**（overflow:auto，
+     clientH 610 / scrollH 6044），不是页面层。scroll 捕获 + rAF 节流不依赖
+     「滚动容器是谁」，也不依赖 ref 时序，是实测能跑通的那条路。 */
+  mounted: function () {
+    window.addEventListener("scroll", this.onScrollCapture, true);
+    this.$nextTick(this.maybeLoad);
+  },
+  watch: {
+    /* 只看长度变化：翻页一定改长度，而 loading / error 这类翻转不需要重算。 */
+    "L.items.length": function () {
+      this.$nextTick(this.maybeLoad);
+    },
+  },
+  unmounted: function () {
+    window.removeEventListener("scroll", this.onScrollCapture, true);
+    if (this._raf) {
+      cancelAnimationFrame(this._raf);
+      this._raf = 0;
+    }
   },
   computed: {
     L: function () {
@@ -95,8 +126,55 @@ var LibraryPage = {
         return { title: t, n: count[t] };
       });
     },
+    /* 排序（2026-11-05，主人：「全部条目 添加笔记排序方式」）。
+       字段与方向各自一项、可自由组合 —— 不做「标题 A→Z」这类预设墙：
+       预设越多，没实现的组合越容易被当成本该有。 */
+    libSorts: function () {
+      return [
+        { key: "", label: "默认（路径倒序）" },
+        { key: "created", label: "创建时间" },
+        { key: "title", label: "标题" },
+        { key: "tier", label: "热度" },
+        { key: "reads", label: "读取次数" },
+        { key: "path", label: "路径" },
+      ];
+    },
   },
   methods: {
+    /* 改排序 = 重新取第一页（必须重置：服务端排完再切片，续载才接得上）。 */
+    applySort: function (key, order) {
+      setLibrarySort(key, order);
+    },
+    /* ---------- 滚动续载（2026-10-29） ----------
+       形态由主人选定：**滚到底自动追加**，不让人点按钮。
+       判据用 `getBoundingClientRect()` 而不是 IO 的交叉状态：实测本页的滚动容器
+       是卡片自身（`.card`，overflow:auto），窗口根本不滚；而 window 上的
+       **捕获阶段** scroll 监听能收到任意容器冒泡上来的滚动事件，与滚动容器是谁无关。
+       rAF 节流：滚动每帧都可能触发，读一次布局本身便宜，但没必要一帧跑多次。 */
+    tailInView: function () {
+      var el = this.$el && this.$el.querySelector(".lib-tail");
+      if (!el) return false;
+      var r = el.getBoundingClientRect();
+      var vh = window.innerHeight || document.documentElement.clientHeight || 0;
+      return r.top < vh + TAIL_MARGIN_PX && r.bottom > -TAIL_MARGIN_PX;
+    },
+    maybeLoad: function () {
+      if (this.tailInView()) this.loadMore();
+    },
+    onScrollCapture: function () {
+      var self = this;
+      if (this._raf) return;
+      this._raf = requestAnimationFrame(function () {
+        self._raf = 0;
+        self.maybeLoad();
+      });
+    },
+    loadMore: function () {
+      var L = S.library;
+      if (L.mode !== "browse" || !L.hasMore) return;
+      if (L.loading || L.loadingMore) return;
+      loadMoreLibrary();
+    },
     onMd: function (ev) {
       onMdClick(ev);
     },
@@ -152,6 +230,20 @@ var LibraryPage = {
     '        <select class="select" v-model="L.tier" @change="browseLibrary()">' +
     '          <option value="">全部</option><option value="hot">hot</option>' +
     '          <option value="warm">warm</option><option value="cold">cold</option></select></x-field>' +
+    "    </div>" +
+    /* 排序（2026-11-05）。放在单独一行的理由：它与上面两个是**同一次取数**的
+       参数，但语义不同 —— 上面是「筛出哪些」，这里是「按什么顺序排」。
+       挤进同一行会在窄屏被压成四个半宽控件，选项名全被截断。 */
+    '    <div class="row2 mt">' +
+    '      <x-field flat label="排序">' +
+    '        <select class="select" v-model="L.sort" @change="applySort(L.sort, L.order)">' +
+    '          <option v-for="s in libSorts" :key="s.key" :value="s.key">{{ s.label }}</option>' +
+    "        </select></x-field>" +
+    '      <x-field flat label="方向">' +
+    '        <select class="select" v-model="L.order" :disabled="!L.sort"' +
+    '                @change="applySort(L.sort, L.order)">' +
+    '          <option value="">默认</option><option value="asc">升序</option>' +
+    '          <option value="desc">降序</option></select></x-field>' +
     "    </div></x-card>" +
     '  <div class="grid lib">' +
     '    <x-card bare>' +
@@ -167,7 +259,11 @@ var LibraryPage = {
     '            <template #right><x-pill kind="accent">打开</x-pill></template>' +
     "          </x-list-item></transition-group>" +
     "        <transition-group tag=\"div\" name=\"liblist\" class=\"list\" appear v-else-if=\"L.mode==='browse' && L.items.length\">" +
-    '          <x-list-item v-for="(it, i) in L.items" :key="it.path || it.title" :style="\'--i:\' + i" :title="it.title" :sub="short(it.preview)" @click="openNote(it.title)">' +
+    /* `--i` 取模（2026-10-29）：续载是**追加**，全局索引会一路涨到 400+，
+       而 6-anim.css 的 `min(var(--i),12) * 30ms` 夹到 360ms ⇒ 后面每一页的
+       条目都要先干等 360ms 才齐刷出现，追加手感像卡住。按 12 取模让每一批
+       都重新错峰，视觉一致且不积压。 */
+    '          <x-list-item v-for="(it, i) in L.items" :key="it.path || it.title" :style="\'--i:\' + (i % 12)" :title="it.title" :sub="short(it.preview)" @click="openNote(it.title)">' +
     '            <div class="tags mt-sm"><span class="tag" v-for="tg in tagsOf(it)" :key="tg">{{ tg }}</span></div>' +
     '            <template #right><x-pill v-if="accessTag(it)" :kind="accessTag(it).kind">{{ accessTag(it).text }}</x-pill>' +
     '              <x-pill :kind="tierPill(it.tier)">{{ it.tier }}</x-pill>' +
@@ -176,6 +272,19 @@ var LibraryPage = {
     '        <x-empty v-else-if="L.mode===\'search\' && L.searchRaw" icon="search" title="没有命中">' +
     '          <pre class="code mt" style="text-align:left">{{ L.searchRaw }}</pre></x-empty>' +
     '        <x-empty v-else icon="book" title="还没有加载内容" text="点上面「浏览」看全部条目，或输入关键词搜索。"></x-empty>' +
+    /* 续载哨兵（2026-10-29）。必须挂在 v-if/v-else 链**之外**：插进链中间会
+       把后面的 `v-else` 变成「无前置 v-if」，直接编译失败。
+       容器常留、内容按状态切换 —— 节点稳定，IO 的 observe 目标才不会每页换一次。
+       按钮不是主通道（自动续载已覆盖），它是 IO 不可用时的降级入口，所以做成
+       低对比度的纯文字样式，不抢列表的注意力。 */
+    '        <div class="lib-tail" v-if="L.mode===\'browse\' && !L.loading && !L.error && L.items.length">' +
+    '          <template v-if="L.hasMore">' +
+    '            <button class="lib-more" @click="loadMore" :disabled="L.loadingMore">' +
+    "              {{ L.loadingMore ? '正在加载…' : '加载更多' }}</button>" +
+    '            <div class="small faint">{{ L.items.length }} / {{ L.count }} 条 · 继续下滑自动加载</div>' +
+    "          </template>" +
+    '          <div class="small faint" v-else>已全部加载 · 共 {{ L.items.length }} 条</div>' +
+    "        </div>" +
     "      </div></x-card>" +
     '    <x-card sticky bare>' +
     '      <div class="card-head" v-if="L.note"><h3>{{ L.note.title }}</h3>' +

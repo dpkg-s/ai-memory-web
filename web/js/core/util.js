@@ -149,6 +149,48 @@ var SECURITY_ZH = {
 };
 var CLEARANCE_ZH = { guest: "访客", member: "成员", owner: "本人" };
 
+/* 审计动作（2026-10-27，2026-11-05 从 AccessPage 提到这里）。
+   为什么挪出来：访问控制页与新的「日志」页看的是同一份 audit.jsonl，
+   两处各写一份表迟早出现「同一动作两种叫法」；表的归属只能是共享层。
+   留兜底 —— 服务端将来多一个动作，界面显示原始 action 而不是空白。 */
+var AUDIT_ACTION_ZH = {
+  "login.ok": "登录",
+  "login.fail": "登录失败",
+  logout: "登出",
+  "password.change": "修改口令",
+  "account.create": "创建账号",
+  "account.update": "修改账号",
+  "account.delete": "删除账号",
+  "token.issue": "签发令牌",
+  "token.revoke": "吊销令牌",
+  "config.write": "修改配置",
+  "config.thresholds": "修改阈值",
+  "tool.call": "调用工具",
+  "tool.denied": "调用被拒",
+  "mcp.connect": "MCP 接入",
+  "auth.denied": "鉴权拦截",
+  "audit.export": "导出日志",
+  "logs.export": "导出日志",
+};
+
+/* FNS 同步事件的动作与对象（2026-11-05，日志页右栏）。
+   与 Go 侧 eventlog.go 的 action 枚举一一对应；服务端 web_synclog.py 也有一份
+   （导出 CSV 用），两边改一处要一起改 —— 之所以不合并：一个在 Python、
+   一个在 JS，共享成本高于重复成本。 */
+var SYNC_ACTION_ZH = {
+  upload: "上传",
+  download: "下载",
+  modify: "修改",
+  delete: "删除",
+  rename: "重命名",
+};
+var SYNC_KIND_ZH = {
+  note: "笔记",
+  file: "附件",
+  setting: "配置",
+  folder: "目录",
+};
+
 /* 查表 → 中文；查不到就原样返回（服务端将来加新枚举时不会显示空白，
    也不会把未知值误标成某个已知类型）。空值统一给空串，由调用方决定占位。 */
 function mapZh(table, v) {
@@ -386,4 +428,4 @@ function parseSearch(text) {
   return items;
 }
 
-export { fmtNum, fmtBytes, relTime, TOOL_ZH, ARG_ZH, KIND_ZH, TYPE_ZH, TIER_ZH, CONF_ZH, SCOPE_ZH, STATUS_ZH, SECURITY_ZH, CLEARANCE_ZH, mapZh, typeZh, tierZh, confZh, scopeZh, statusZh, securityZh, clearanceZh, securityPill, toolZhName, toolZhDesc, argZh, kindZh, dispWidth, cutWidth, shortDesc, tryJson, escapeHtml, mdReady, mdRender, grab, parseStats, sectionRows, parseSearch };
+export { fmtNum, fmtBytes, relTime, TOOL_ZH, ARG_ZH, KIND_ZH, TYPE_ZH, TIER_ZH, CONF_ZH, SCOPE_ZH, STATUS_ZH, SECURITY_ZH, CLEARANCE_ZH, AUDIT_ACTION_ZH, SYNC_ACTION_ZH, SYNC_KIND_ZH, mapZh, typeZh, tierZh, confZh, scopeZh, statusZh, securityZh, clearanceZh, securityPill, toolZhName, toolZhDesc, argZh, kindZh, dispWidth, cutWidth, shortDesc, tryJson, escapeHtml, mdReady, mdRender, grab, parseStats, sectionRows, parseSearch };

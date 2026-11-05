@@ -384,10 +384,26 @@ var Dashboard = {
        🔴 选择器必须只命中「断点前后同一批 DOM」：这三组都是 v-for / 静态节点，
           不随断点增删；只有「骨架 ↔ 真卡」那一步是 v-if 换节点 ——
           骨架态抓到 0 个目标，flip.js 会存 null 并退化成硬切，正是预期。
-       899 / 560 两个断点与 8-responsive.css 的 @media 逐字符一致。 */
+       🔴 2026-10-29 断点表随 §17c-5 重排（与 7-views.css 逐字符一致）：
+          1399 / 1024 是「分布卡组」的三档分界（等分 → 两列自然 → 单列），
+          899 是整页转单列，699 是**平板档（700–899）的下界**（见 8-responsive.css
+          §20：该档起分布卡组两列、统计卡四列），560 是窄屏收边，
+          699 的高度门槛（`max-height`）是等分档的竖向条件。
+          这几条**任意一条**跨越都要演动画，漏一条就是「布局变了、卡却硬切」。
+       🔴 2026-10-30：flip.js 已改为「自己算矩形差量 + gsap 补间 transform」，
+          不再依赖 Flip 插件，也不再给父容器钉 min-height；同时会 cancel 掉这些
+          卡身上已播完的 statReveal / riseIn（`animation … both` 会压住 inline
+          transform，那是「动画看着没播、页面却在抖」的真凶，详见 flip.js 文件头）。 */
     this._flipOff = breakpointFlip(
       ".grid.ov .grid.stats > *, .grid.ov .grid.two > *, .grid.ov > .ov-side",
-      ["(max-width: 899px)", "(max-width: 560px)"],
+      [
+        "(max-width: 1399px)",
+        "(max-width: 1024px)",
+        "(max-width: 899px)",
+        "(max-width: 699px)",
+        "(max-width: 560px)",
+        "(max-height: 699px)",
+      ],
     );
   },
   beforeUnmount: function () {

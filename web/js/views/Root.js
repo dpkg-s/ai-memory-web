@@ -15,13 +15,18 @@ var NAV = [
   { id: "dashboard", label: "概览", icon: "grid", key: "1" },
   { id: "console", label: "调试台", icon: "terminal", key: "2" },
   { id: "library", label: "记忆库", icon: "book", key: "3" },
-  { id: "access", label: "访问控制", icon: "shield", key: "4" },
-  { id: "settings", label: "配置", icon: "sliders", key: "5" },
+  /* 日志（2026-11-05）：访问日志 + FNS 同步日志共用一条时间轴。
+     位置放在「记忆库」与「访问控制」之间 —— 它读的是这两个模块的下游事实
+     （谁读过库、同步动过哪条），排在一起更顺。 */
+  { id: "logs", label: "日志", icon: "clock", key: "4" },
+  { id: "access", label: "访问控制", icon: "shield", key: "5" },
+  { id: "settings", label: "配置", icon: "sliders", key: "6" },
 ];
 var PAGE_TITLES = {
   dashboard: "概览",
   console: "调试台",
   library: "记忆库",
+  logs: "日志",
   access: "访问控制",
   settings: "配置",
 };
@@ -29,6 +34,7 @@ var PAGE_SUBS = {
   dashboard: "健康度与最近动态",
   console: "直接调用 MCP 工具",
   library: "浏览与检索条目",
+  logs: "访问日志 · FNS 同步",
   access: "账号 · 令牌 · 权限",
   settings: "连接 · 阈值 · 同步",
 };
@@ -418,6 +424,7 @@ var Root = {
     "      <dashboard v-if=\"S.page==='dashboard'\"></dashboard>" +
     "      <console-page v-else-if=\"S.page==='console' && canSee('console')\"></console-page>" +
     "      <library-page v-else-if=\"S.page==='library'\"></library-page>" +
+    "      <logs-page v-else-if=\"S.page==='logs' && canSee('logs')\"></logs-page>" +
     /* 多一道 canSee：watch 的重定向要等一拍才生效，这一帧不该把整页画出来
        （哪怕只有一帧，也不该让只读账号看见「调试台」「账号」这些字样）。 */
     "      <access-page v-else-if=\"S.page==='access' && canSee('access')\"></access-page>" +

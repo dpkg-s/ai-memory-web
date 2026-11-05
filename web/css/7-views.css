@@ -482,51 +482,114 @@
 }
 
 /* ---------------------------------------------------------------------------
- * 17c-5. 概览页「分布卡组」扩成 2 列 2 行（2026-10-16，主人裁决方案 A）
- *   病征（`_v3_ov_blank_probe.py` 实测）：卡内死白 100% 集中在 `.grid.two` ——
- *   1440 下合计 614px、1920 下 1024px，而右栏与统计卡几乎不空（热度分层卡
- *   内容 204px vs 卡高 513px ⇒ 死白 309px / 60%）。
- *   治法：`.grid.two` 由 2 列 1 行改 **2 列 2 行**，新增两格
- *   「项目分布」（`sectionRows(parsed,"作用域分布",1)`，5 行 199px）与
- *   「写入趋势」（近 14 天折线，SVG 随卡片高度伸缩）。
- *
- *   🔴 行高策略 = `auto minmax(0, 1fr)`，**不是两行均分**：
- *     实测「记忆类型」8 行内容高 286px；1440 下 `.grid.two` 总高 513px，若均分
- *     则每行只有 **249.5px** ⇒ 溢出 37px（页面出现垂直滚动）。改 `auto` 后第一行
- *     按内容高（286），全部余量交给第二行（1440：213 ／ 1920：416）⇒ **无需削减
- *     任何内容**即可消溢出。
+ * 17c-5. 概览页「分布卡组」空间分配（2026-10-29 重做 · 方案 B：等分格位 + 卡内滚动）
+ *   历史口径（2026-10-16）：行高 `auto minmax(0, 1fr)` —— 行一按内容、余量全给行二。
+ *   该口径在**数据长胖之后崩了**。2026-10-29 无头实测（1440×900）：
+ *     热度分层 3 行 / 记忆类型 9 行 / 项目分布 10 行 / 写入趋势折线；
+ *     内容需求高 320 / 320 / 410 / 126，而 `.grid.two` 只有 513
+ *     ⇒ 行二被压到 178，项目分布卡内溢出 232px；
+ *     1280×800 行二 48px；1024×768 与 900×800 行二只剩 **2px**
+ *     （`flex:1 1 0` 吃满剩余高度 + 行 `1fr` 没有地板值 ⇒ 有空间全给行一、
+ *      没空间就把行二压成一条缝）。
+ *   现口径（主人 2026-10-29 选定方案 B）：
+ *     · **有空间就四格严格等分**：2×2，每格 1/4（`repeat(2, minmax(0,1fr))`）；
+ *     · 内容放不下时**卡内滚动**，一行数据都不裁（`.card-body { overflow:auto }`）；
+ *     · 空间真的不够时**不再硬塞**，退回自然行高 + 页面滚动 —— 这是治 2px 塌陷的
+ *       唯一办法：等分只有在「装得下两行」时才成立，装不下还硬等分就是把它压死。
+ *   三档（宽度和高度都参与，矮窗口同样排不下两行）：
+ *     ≥1400px 且 ≥700px 高 → 2×2 等分，`.grid.two` 吃满 `.ov-main` 余量；
+ *     1025–1399px          → 2 列自然行高（不参与 flex 拉伸，页面滚动）；
+ *     ≤1024px              → 单列自然行高（与 ≤899 整页单列同口径，避免窄卡）。
+ *   🔴 宽度分界 2026-10-30 由 1100 改为 **1024**（主人定规：桌面只分「≤1024 / ≥1025」
+ *      两档，900 以上不再有第三档骨架）。原 1100 是为躲 244px 窄卡，而按现口径
+ *      1025 视口的主区约 610px（实测标定值见 3-components「统计卡轨道下限」注释）
+ *      ⇒ 两列各约 298px，仍在可读线以上；≤1024 沿用单列，1024×768 不受影响。
+ *   ⚠️ 1400 是算出来的：`.grid.stats` 排成 1 行需主区 ≥810px（4×192+42=810），
+ *      主区 = 视口 − 侧栏 252 − 右栏 312 − 各 gap ⇒ 视口 ≥1400 才稳定。
+ *      低于它统计卡折成两行（123→260），留给分布卡组的高度腰斩，等分必然压死。
  *   ⚠️ `1fr` 必须写 `minmax(0, 1fr)`：裸 `1fr` 会被子项 min-content 顶破（§17d 同款坑）。
  *   ⚠️ 模板顺序决定自动摆位：热度分层 → 记忆类型 → 项目分布 → 写入趋势。
- *   ⚠️ 必须 gate 在 ≥900px：本选择器特异性高于 8-responsive.css 的窄档回落，
- *      不加媒体查询会把 ≤560px 的单列规则一起覆盖掉（横向溢出）。
+ *   ⚠️ 这里的断点与 `Dashboard.js` 的 `breakpointFlip` 数组**必须逐字符一致**，
+ *      否则跨越该档时布局变了却不演 FLIP 动画。
  * ------------------------------------------------------------------------- */
-@media (min-width: 900px) {
+@media (min-width: 1400px) and (min-height: 700px) {
   .page:has(.grid.ov) .grid.two {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-rows: repeat(2, minmax(0, 1fr));
   }
 
-  /* 🔴 顶高问题（2026-10-16 实测）：改 2 行后 `.grid.two` 的**固有内容高**变成
-     行一(304) + gap(14) + 行二的内容高(219) = 537 > 1440 可用 513 ⇒ 整页被顶高
-     24px、出现垂直滚动条（docScrollH 924 > 视口 900）。
-     治法：把 flex 基准从 `auto` 改成 `0` —— 本项不再把自己的内容高计入父级固有尺寸，
-     只吃「剩余空间」（1440：513 ／ 1920：716）。⚠️ `flex-basis:0` 必须配 `min-height:0`
-     （§17c-3 已给），否则子项 min-content 仍会顶破。 */
+  /* 等分档才让本项吃「剩余空间」：flex 基准设 0，自己的内容高不计入父级固有尺寸
+     （§17c-3 已给 min-height:0，缺它子项 min-content 仍会顶破）。 */
   .page:has(.grid.ov) .ov-main > .grid.two {
     flex: 1 1 0;
   }
+}
 
-  /* 安全网：任一格内容超过轨道高时**卡内滚动**，不外溢、不撑破（例如将来项目
-     分布多出第 6 行）。内容放得下时不会出现滚动条。 */
-  .page:has(.grid.ov) .grid.two > .card > .card-body {
-    overflow: auto;
+@media (min-width: 1025px) and (max-width: 1399px) {
+  .page:has(.grid.ov) .grid.two {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-rows: auto auto;
+  }
+
+  /* 自然行高档：不拉伸。否则 `.ov-main` 是 flex column，余量会被硬塞进来再压回去，
+     又回到「行二几十像素」的老毛病。 */
+  .page:has(.grid.ov) .ov-main > .grid.two {
+    flex: 0 0 auto;
   }
 }
 
-/* 行高策略只在「够高」的视口启用：矮窗口下余量不足以撑起第二行，硬上会让
-   第二行被压到几十像素。此时退回 auto 行（与既有行为一致），页面可滚动。 */
-@media (min-width: 900px) and (min-height: 761px) {
+@media (max-width: 1024px) {
   .page:has(.grid.ov) .grid.two {
-    grid-template-rows: auto minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto auto auto auto;
+  }
+
+  .page:has(.grid.ov) .ov-main > .grid.two {
+    flex: 0 0 auto;
+  }
+}
+
+/* 卡内滚动兜底（方案 B 的核心）：只有 ≥1025px 的等分/两列档才可能出现溢出；
+   窄档走自然行高，内容本来就放得下，不需要滚动容器。
+   `overscroll-behavior: contain`：卡内滚到底不要把整页一起带下去。 */
+@media (min-width: 1025px) {
+  .page:has(.grid.ov) .grid.two > .card > .card-body {
+    overflow: auto;
+    overscroll-behavior: contain;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * 17c-5b. 统计卡「永远不出现 3 列」（2026-10-29）
+ *   病征（无头实测 + 1024×768 截图）：`.grid.stats` 用
+ *   `repeat(auto-fit, minmax(192px, 1fr))`，主区恰好装得下 3 列时（约 604–809px）
+ *   4 张卡排成 **3 + 1**：第 4 张「孤立笔记」独占第二行，右半边整片空着。
+ *   实测受影响区间：视口约 1010–1215（1024×768 就是典型）。
+ *   治法：按**主区实际宽度**切 2 列 / 4 列两档，永远跳过 3 列。
+ *   用容器查询而不是媒体查询 —— 主区宽度和视口不是线性关系（侧栏与页面留白
+ *   在不同档位会变），实测 1280 主区 882 而 1440 只有 832，用视口算必然错一档。
+ *   ⚠️ 4 列的门槛 810 = 4×192 + 3×14，与 3-components.css 的轨道下限同源。
+ *   ⚠️ `container-type: inline-size` 只做「行内尺寸」隔离，块向高度仍由内容决定，
+ *      不影响 `.ov-main` 的 flex 拉伸。
+ *   ⚠️ 必须在 8-responsive.css 之前生效（本文件先加载），窄屏的 148px 双列规则
+ *      由它自己按 ≤560 覆盖，两处不冲突。
+ * ------------------------------------------------------------------------- */
+.page:has(.grid.ov) .ov-main {
+  container-type: inline-size;
+}
+
+/* 门槛取 561 而不是 900：≤899 时整页转单列，主区反而变宽（约 800px），同样会掉进
+   3 列的坑（实测 880 宽就是 3+1）。561 以下是 8-responsive 的 148px 双列档，
+   留给它自己处理。 */
+@media (min-width: 561px) {
+  .page:has(.grid.ov) .grid.stats {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@container (min-width: 810px) {
+  .page:has(.grid.ov) .grid.stats {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 }
 
@@ -539,18 +602,16 @@
  *     而且「写入趋势」还会先闪一下「近 14 天没有更新」的空态。
  *   治法：数据未到只画 4 块骨架；数据到位（或该接口报错，见 `Dashboard.twoReady`）
  *   才挂载真卡 ⇒ 四卡入场 + 卡内分布条/折线揭幕**全部与数据同帧开始**。
- *   🔴 高度必须与真卡**逐像素对齐**，否则数据到达时整块跳版：
- *     · 行一 = **292px** —— 实测值（由「记忆类型」8 行的内容高决定，与视口无关，
- *       1440 / 1920 同值）；与 `.stat-skel` 同一套「实测值 + 探针守护」的口径；
- *     · 行二 = `height: 100%` —— 直接吃 `minmax(0, 1fr)` 的余量，
- *       天然等于真卡高，**不需要**再钉一个会随视口变化的魔数
- *       （1440 是 207px、1920 是 410px，钉死必然错一个）。
+ *   🔴 高度必须与真卡**逐像素对齐**，否则数据到达时整块跳版。
+ *     2026-10-29 起行高口径改为「有空间就四格等分」（§17c-5），于是骨架也跟着变：
+ *     · 等分档（≥1400 且 ≥700 高）四块都写 `height:100%`，各自吃所在行的 1fr，
+ *       **天然**等于真卡高 —— 不再需要「行一 292px」这种会随内容变化的魔数；
+ *     · 两列自然行高档没有轨道可依，只能给 `min-height` 占位（对不齐是已知取舍，
+ *       那一档真卡高度由内容决定、骨架没有内容可量）。
  *   ⚠️ 骨架**不带** `.card` 类：`.grid.two > .card` 挂着 riseIn 入场规则，
  *      带上就等于骨架自己先演一遍、真卡再演一遍（那是方案 C 的「两段动画」）。
- *   ⚠️ 高度规则必须在 `min-width:900px + min-height:761px` 内 —— 与 §17c-5 的
- *      `auto minmax(0,1fr)` 同一条启用条件；矮/窄窗口下 `.grid.two` 退回 auto 行，
- *      此时用 `min-height` 给个体面的占位高即可（不会与真卡对齐，但那个档位
- *      本来就是滚动布局，不存在"填满余量"的语义）。
+ *   ⚠️ 两个骨架断点必须与 §17c-5 的档位**逐条对齐**（1400/700 与 1025–1399），
+ *      否则会出现「骨架按等分排、真卡按自然高排」的错位。
  *   ⚠️ 由 `_v3_ov_two_skel_probe.py` 守护：骨架态与数据态的**行一高度必须相等**、
  *      容器高差 ≤2px（照抄 `.stat-skel` 的守护口径）。
  * ------------------------------------------------------------------------- */
@@ -559,15 +620,21 @@
   min-height: 120px;
 }
 
-@media (min-width: 900px) and (min-height: 761px) {
+/* 等分档：四块骨架都吃 `minmax(0,1fr)` 的 1/4，天然与真卡等高（2026-10-29）。
+   ⚠️ 原实现给前两块钉死 292px、后两块 100%——那是「行一 auto + 行二 1fr」口径下
+   的补偿值；现在两行等分，还留着就会让骨架态比真卡态矮一截、数据到达时跳版。 */
+@media (min-width: 1400px) and (min-height: 700px) {
   .grid.two > .two-skel {
     height: 100%;
     min-height: 0;
   }
+}
 
-  /* 前两块在行一（auto 行）⇒ 需要显式高度把轨道撑到 292；后两块在行二吃 1fr。 */
-  .grid.two > .two-skel:nth-child(-n + 2) {
-    height: 292px;
+/* 两列自然行高档：真卡是内容高（≈320 / 410），骨架没有内容可量，只能给个体面
+   的占位高。这里**不追求逐像素对齐**（它们对不上），只保证不塌成一条缝。 */
+@media (min-width: 1025px) and (max-width: 1399px) {
+  .grid.two > .two-skel {
+    min-height: 240px;
   }
 }
 
@@ -676,10 +743,17 @@ svg.trend {
    `height: auto`    断掉全局 `height:100%`，双保险。
    `min-height: 0`   不给的话 flex 项默认 `min-height:auto` 会被内容（158px）顶破 20%。
    `overflow: auto`  硬比例也不裁内容 —— 矮视口下若内容超出 20%，内部滚动兜底。 */
+/* 🔴 2026-11-05：比例由 20% 改为「按内容 + 上限 40%」。
+   起因是记忆库工具栏加了一行「排序 / 方向」：实测 1440×1000 下卡片仍是 176px
+   （20%），而内容已经 242px —— 排序的两个下拉被裁在卡片底边之下，**必须先把
+   筛选卡内部滚一滚才看得见**。排序是主人这次点名要的控件，藏进内滚等于没做。
+   现在的口径：内容多高就多高（封顶 40%，防止将来加更多筛选把列表区吃光），
+   差额从 `.grid.lib` 扣 —— 列表区本来就有 min-height:0 + 内滚，矮视口下依然兜得住。 */
 .page:has(.grid.lib) > .card {
-  flex: 0 0 20%;
+  flex: 0 0 auto;
   height: auto;
   min-height: 0;
+  max-height: 40%;
   overflow: auto;
 }
 
@@ -1145,9 +1219,18 @@ svg.trend {
   top: calc(var(--topbar-h) + var(--crumbs-h) + 14px);
 }
 
-@media (max-width: 1099px) {
+@media (max-width: 1024px) {
   .ac-grid {
     grid-template-columns: minmax(0, 1fr) minmax(268px, 300px);
+  }
+
+  /* 日志条目降级（2026-10-28）：栏宽收到 268–300px 时主体列只剩约 168px，
+     第二行 `admin · 调用工具 · 本机 · 地址栏` 刚好卡在折行边缘（实测
+     1024 视口会折出「· 地址栏」一个孤行）。牺牲顺序是明确的：先丢掉
+     「本机」——它每天都一样、完整 IP 还在 title 上；随后才轮到令牌胶囊
+     换行让位。工具名与令牌名一个都不能丢，它们才是这条日志被查看的原因。 */
+  .audit-ip.local {
+    display: none;
   }
 }
 
@@ -1295,7 +1378,12 @@ svg.trend {
   width: auto;
   flex: 0 0 auto;
   min-height: 31px;
-  padding: 5px 8px;
+  /* 右侧必须留住箭头的 26px（2026-10-29）：`.select` 的三角画在
+     `100% - 17px` ~ `100% - 12px` 这 5px 区间内，需要 ≥17px 的右内边距
+     才不与文字重叠。原 `padding: 5px 8px` 把右内边距压到 8px，角色名
+     （viewer / member / admin）直接压在三角上、看起来像三角「缺了一块」。
+     上下仍为 5px、左 8px，保持与 .btn-sm 同高同起点。 */
+  padding: 5px 26px 5px 8px;
   font-size: 12.5px;
 }
 
@@ -1439,7 +1527,7 @@ svg.trend {
    🔴 这段必须写在 `.ac-chip` 基础规则**之后**：同权重同属性，靠后即胜。
    第一版写在 .ac-grid 那一带（文件更前面），被这里的基础规则压掉，
    CDP 量出来仍是 38px —— 位置即优先级，别只看选择器够不够具体。 */
-@media (min-width: 900px) and (max-width: 1099px) {
+@media (min-width: 900px) and (max-width: 1024px) {
   .ac-chip {
     padding: 2px 5px;
     font-size: 10.5px;
@@ -1456,11 +1544,47 @@ svg.trend {
   padding: 0 6px;
 }
 
+/* 三槽位（2026-10-28 主人选型 B）：时间列 | 圆点 | 主体 | 耗时列。
+   原来是「两行 · 串」：第二行把 时间 · IP · 耗时 · 渠道 四种性质不同的东西
+   平铺在同一个分隔符下，读起来是一句话而不是一张表 —— 耗时是唯一可以横向
+   比较的数值，却埋在最不起眼的位置。改成网格后两者各自成列、纵向对齐，
+   一列数字扫下去就能看出哪条慢。
+
+   列宽用固定 px 而不是 fr：时间与耗时都是定长内容（HH:MM、4 字符以内），
+   固定才能让主体列在所有行上完全一致 —— 否则位数一变整列就抖。 */
 .audit-item {
-  display: flex;
-  gap: 8px;
+  display: grid;
+  grid-template-columns: 34px 6px minmax(0, 1fr) 42px;
+  gap: 7px;
+  align-items: start;
   padding: 6px 0;
   border-bottom: 1px solid var(--border);
+}
+
+/* 日期锚：左列时间砍到 HH:MM 之后，跨天记录必须靠这个分清是哪一天。
+   吸顶（列表内部滚动）—— 滚到深处也知道自己在看哪天。背景必须与卡片
+   同色（--surface），否则滚动时下面的行会从字缝里透出来。 */
+.audit-day {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 5px 0 4px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.02em;
+  color: var(--text-faint);
+}
+
+/* tabular-nums 是这一列能对齐的前提：比例数字下 1 比 8 窄，
+   一列「11:14 / 11:07」会左右参差，扫读时反而更乱。 */
+.audit-time {
+  padding-top: 3px;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-faint);
 }
 
 .audit-item:last-child {
@@ -1504,36 +1628,122 @@ svg.trend {
   background: var(--err);
 }
 
+/* 失败态（2026-10-28）：模板从 ``data-bad`` 属性改成 ``.audit-item.bad`` 类，
+   圆点变红必须跟着挪过来 —— ``tool.call`` 失败时 kind 仍是 tool（蓝点），
+   不补这条就只剩「一个同色的点 + 一句没人读的细节」。 */
+.audit-item.bad .audit-dot {
+  background: var(--err);
+}
+
 .audit-main {
   min-width: 0;
   flex: 1;
 }
 
+/* 主体第一行：对象（mono）+ 令牌胶囊。两者 baseline 对齐 —— 胶囊有内边距，
+   默认 stretch 会把等宽字母顶高一两像素。
+
+   flex-wrap 是这套排版的必要兜底（2026-10-28 实拍 1024 发现）：栏宽收到
+   300px 时，`memory_smart_search` 与一枚前缀胶囊并排需要约 216px，主体列
+   只有约 168px —— 若不许换行，浏览器会把工具名**拆成两三段**
+   （`memory_s / mart_sea / rch`），那种断法比任何截断都难读。
+   允许换行后让胶囊整体下移，工具名保持完整。 */
 .audit-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  row-gap: 2px;
+  gap: 6px;
   font-size: 12.5px;
   line-height: 1.5;
   color: var(--text-2);
-  word-break: break-word;
 }
 
-.audit-line b {
+/* 没有对象（登录 / 鉴权失败这类）时，动作本身顶到第一行当主角 ——
+   那一行不能因为缺 target 就空着。 */
+.audit-act {
   color: var(--text);
   font-weight: 500;
 }
 
-.audit-target {
-  font-family: var(--mono);
-  font-size: 11.5px;
-  color: var(--text-faint);
-  word-break: break-all;
+/* 令牌胶囊（2026-10-28）：主语行的第二个问题「哪一枚」。
+   margin-left:auto 让它固定靠右 —— 名称长度差异极大（WorkBuddy / 已失效 /
+   未标注），跟在后面会把下一行起点推得七零八落，靠右反而成列。
+   max-width 给到 84px：实测 72px 会把 WorkBuddy 截成「WorkBud…」，而
+   84px 既能装下常见令牌名（含「笔记本-Claude」这类混排），又不至于
+   在 344px 栏里把工具名挤走（超过就换行，见上面的 flex-wrap）。 */
+.audit-tok {
+  margin-left: auto;
+  flex: 0 0 auto;
+  padding: 0 4px;
+  border-radius: 4px;
+  background: var(--surface-3);
+  border: 1px solid var(--border);
+  font-size: 10.5px;
+  line-height: 1.6;
+  color: var(--text-2);
+  max-width: 84px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
+/* 工具名 / 路径：**不折行**，超长就省略。
+   这里与 .audit-sub 的策略故意相反 —— 标识符断在任意字符上会变成另一个
+   单词（memory_smart_search 断在 s|earch 就成了两条），而自然语言断在哪
+   都还能读懂。 */
+.audit-target {
+  min-width: 0;
+  flex: 0 1 auto;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 第二行：谁 · 动作 · 来源 · 渠道。用 gap + ::before 出分隔点而不是把「·」
+   写进文本 —— 这样折行时不会出现「· 本机」这种以点开头的行；
+   窄栏（300px）里这行必然折，分隔点的归属必须靠元素结构表达。 */
 .audit-sub {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0 5px;
   margin-top: 1px;
   font-size: 11.5px;
   line-height: 1.45;
   color: var(--text-faint);
   word-break: break-word;
+}
+
+.audit-sub > span + span::before {
+  content: "·";
+  margin-right: 5px;
+  color: var(--text-dim);
+  opacity: 0.7;
+}
+
+.audit-actor {
+  color: var(--text-2);
+  font-weight: 500;
+}
+
+/* 耗时列：右对齐 + tabular-nums，让「677ms / 2.3s / —」这列数字本身
+   就是一张小表，纵向扫一眼就能找到异常值。≥1s 转 warn 色：
+   这是全列唯一需要被「跳出来」的语义。 */
+.audit-ms {
+  padding-top: 3px;
+  text-align: right;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+}
+
+.audit-ms.slow {
+  color: var(--warn);
 }
 
 /* 来源 IP（2026-10-27 主人：「再添加个 ip 显示」）。
@@ -1610,6 +1820,18 @@ svg.trend {
   width: 74%;
 }
 
+/* 骨架也要占住时间列与耗时列（2026-10-28）：只画中间两段的话，
+   骨架是「两栏形状」而真实条目是「四槽位」，替换那一刻整列会平移。 */
+.audit-skel .skel.w-time {
+  width: 30px;
+  margin-top: 3px;
+}
+
+.audit-skel .skel.w-ms {
+  width: 34px;
+  margin: 3px 0 0 auto;
+}
+
 @keyframes auditDotPulse {
   0%,
   100% {
@@ -1651,3 +1873,331 @@ svg.trend {
     flex: 1 1 100%;
   }
 }
+
+/* ============================================================================
+ * 日志页（2026-11-05）
+ *
+ * 形态：一条共用的时间轴 —— 左「访问日志」、中「刻度」、右「FNS 同步日志」。
+ *
+ * 三列 grid 的取值：`1fr 92px 1fr`。中间那列是**固定轨宽**而不是百分比 ——
+ * 刻度文字（HH:MM）宽度不随容器变化，用百分比会让轴在宽屏上变成一条空走廊，
+ * 两侧内容反而被挤窄。92px = 时刻文字 44px + 圆点槽 + 两侧留白。
+ *
+ * 轴本身不是独立的 DOM 层，而是每行 .lg-axis 的 ::before 竖线首尾相接
+ * （top:0 / bottom:0）—— 这样「行高由内容决定」时轴自动跟着长，不需要
+ * JS 量高度，也不会在某一栏折叠时断开。
+ * ========================================================================= */
+.lg-toolbar .lg-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.lg-seg {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  background: var(--surface-3);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+}
+
+.lg-seg-btn {
+  padding: 5px 12px;
+  border: 0;
+  border-radius: calc(var(--r-sm) - 2px);
+  background: transparent;
+  color: var(--text-2);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background var(--t-fast) var(--ease), color var(--t-fast) var(--ease);
+}
+
+.lg-seg-btn:hover {
+  color: var(--text);
+}
+
+/* 选中态用「面板色 + 阴影」而不是强调色填充：这组按钮是导航而不是主操作，
+   染成主题色会把视线从下面的日志列表上抢走。 */
+.lg-seg-btn.on {
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: var(--shadow-1);
+}
+
+.lg-chips {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+
+.lg-chip-label {
+  font-size: 11px;
+  color: var(--text-faint);
+  letter-spacing: 0.04em;
+  margin-right: 2px;
+}
+
+.lg-status {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+
+.lg-src-off {
+  color: var(--warn);
+}
+
+.lg-src-on {
+  color: var(--text-dim);
+}
+
+.lg-card {
+  overflow: hidden;
+}
+
+.lg-head {
+  display: grid;
+  grid-template-columns: 1fr 92px 1fr;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 14px;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border);
+  /* 卡头钉住：列表长了以后，左右两栏的归属必须一直可见 —— 否则往下滚十行
+     就分不清哪一栏是访问、哪一栏是同步。与记忆库三卡同一取向。 */
+  position: sticky;
+  top: 0;
+  z-index: 2;
+}
+
+.lg-col-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+.lg-col-head .nav-icon {
+  width: 14px;
+  height: 14px;
+  opacity: 0.7;
+}
+
+.lg-col-axis {
+  justify-content: center;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.lg-body {
+  padding: 4px 14px 14px;
+}
+
+.lg-tl {
+  position: relative;
+}
+
+.lg-day {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 14px 0 6px;
+  font-size: 12px;
+  color: var(--text-2);
+  border-bottom: 1px dashed var(--border-soft);
+}
+
+.lg-row {
+  display: grid;
+  grid-template-columns: 1fr 92px 1fr;
+  gap: 10px;
+}
+
+.lg-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 5px 0;
+  min-width: 0;
+}
+
+/* 轴：竖线贯穿本行，两端各留 0（上下相邻行的线正好接上）。
+   刻度与圆点都必须是 position:relative + z-index:1，否则会被竖线穿过。 */
+.lg-axis {
+  position: relative;
+  align-items: center;
+  justify-content: flex-start;
+  padding-top: 7px;
+}
+
+.lg-axis::before {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--border);
+  transform: translateX(-0.5px);
+}
+
+.lg-hm {
+  position: relative;
+  z-index: 1;
+  padding: 0 4px;
+  background: var(--surface-2);
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-2);
+}
+
+.lg-dot {
+  position: relative;
+  z-index: 1;
+  width: 7px;
+  height: 7px;
+  margin-top: 5px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 3px var(--surface-2);
+}
+
+.lg-dot.sync {
+  background: var(--info);
+}
+
+.lg-dot.err {
+  background: var(--err);
+}
+
+.lg-ev {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 7px 9px;
+  text-align: left;
+  background: var(--surface-3);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  color: var(--text-2);
+  font: inherit;
+  cursor: default;
+  transition: border-color var(--t-fast) var(--ease),
+    background var(--t-fast) var(--ease);
+}
+
+/* 可点 = 这条事件能打开某篇笔记。不可点的不给 hover 反馈，否则
+   「看起来能点、点了没反应」比没有链接更让人怀疑页面坏了。 */
+.lg-ev.link {
+  cursor: pointer;
+}
+
+.lg-ev.link:hover {
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  background: var(--surface-hi);
+}
+
+.lg-ev-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+
+.lg-tool {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lg-act {
+  font-size: 11px;
+  color: var(--text-2);
+  flex: none;
+}
+
+.lg-bad {
+  flex: none;
+  font-size: 10px;
+  color: var(--err);
+  border: 1px solid var(--err);
+  border-radius: var(--r-pill);
+  padding: 0 5px;
+}
+
+.lg-ev-obj {
+  font-size: 12px;
+  color: var(--accent);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lg-ev-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+/* 同步事件按动作染左边框：上传 / 下载 / 修改 / 删除 / 重命名 在扫视时的
+   第一眼就该分开 —— 一行小字「上传」在密集列表里几乎读不出来。 */
+.lg-ev.lg-s {
+  border-left-width: 2px;
+}
+
+.lg-ev.lg-s.s-upload {
+  border-left-color: var(--ok);
+}
+
+.lg-ev.lg-s.s-download {
+  border-left-color: var(--info);
+}
+
+.lg-ev.lg-s.s-modify {
+  border-left-color: var(--accent);
+}
+
+.lg-ev.lg-s.s-delete {
+  border-left-color: var(--err);
+}
+
+.lg-ev.lg-s.s-rename {
+  border-left-color: var(--warn);
+}
+
+.lg-gap {
+  flex: 1;
+}
+
+.lg-skel .skel-l1 {
+  width: 62%;
+}
+
+.lg-foot {
+  padding: 10px 14px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  line-height: 1.7;
+  color: var(--text-faint);
+}
+
+.lg-empty-hint {
+  margin: 6px auto 0;
+  max-width: 560px;
+  text-align: center;
+  line-height: 1.8;
+}
+

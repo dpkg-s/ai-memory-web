@@ -142,6 +142,7 @@ import web_audit
 import web_auth
 import web_oauth
 import web_store
+import web_synclog
 
 logger = logging.getLogger("ai-memory.web")
 
@@ -187,7 +188,7 @@ def _ensure_app_logging() -> None:
     logger.propagate = False
 
 
-WEB_VERSION = "1.12.0"
+WEB_VERSION = "1.13.0"
 # ⚠️ 2026-10-22：此常量是控制台**唯一**的机器可读版本源，release.yml 会校验
 #   `tag == WEB_VERSION == CHANGELOG 首条`。历史上一度停在 1.11.1 而 tag 已到
 #   v1.11.3（漂了两个版本），界面「关于」显示的是旧号 —— 改版本时必须同改三处。
@@ -289,9 +290,24 @@ _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]"}
 #   令牌的三维是 `p:` 协议 / `c:` 客户端 / `Vaults` 库白名单，其中 `c:` 对应的
 #   就是客户端 config 里的 ``client_type``（旧标签「账号」会让人填登录名，然后
 #   WS 握手 315）。旧配置里的 ``account`` 键读取时自动迁移，见 ``_FNS_LEGACY``。
-_FNS_FIELDS = ("server", "client_type", "vault", "token", "exclude")
+_FNS_FIELDS = ("server", "client_type", "vault", "token", "exclude", "mode")
 _FNS_LEGACY = {"account": "client_type"}
 _EXCLUDE_MAX = 200
+
+#: 同步方向三态（2026-11-04）。语义是**掐掉哪一侧**，不是「给谁权限」：
+#:   rw = 双向（本地改动上传 + 服务端下发落盘）
+#:   ro = 只读（只接收：本地改动一律不推给服务端）
+#:   wo = 只写（只上传：服务端下发一律不落盘）
+#: rw 是缺省，且与改造前行为完全一致 —— 旧配置没有这个键时一律读成 rw，
+#: 绝不因为「多了个字段」就让存量部署的同步方向发生漂移。
+_FNS_MODES = ("rw", "ro", "wo")
+_FNS_MODE_DEFAULT = "rw"
+
+
+def _fns_mode(raw: Any) -> str:
+    """把任意输入收敛成三个合法值之一；非法/缺省一律回落 rw（= 改造前行为）。"""
+    m = str(raw or "").strip().lower()
+    return m if m in _FNS_MODES else _FNS_MODE_DEFAULT
 
 
 class WebConfigError(RuntimeError):
@@ -354,6 +370,95 @@ def _get_stores(users_path: Path, tokens_path: Path):
 
 
 _AUDITS: dict[str, web_audit.AuditLog] = {}
+
+
+#: 这些工具的第一个「对象」是条目名（title）。
+#:
+#: 为什么要把它记进审计（2026-11-05，主人要求「访问日志点击可查看读取/修改的
+#: 笔记」）：此前 ``target`` 只记工具名，于是「谁读了哪篇」在日志里完全不可见 ——
+#: 500 条 ``tool.call target=memory_read`` 长得一模一样。记标题不违反
+#: 「不落正文」的口径：标题在 vault 里就是文件名，而正文 / 关键词 / 参数
+#: 一律仍然不入库（``memory_search`` 的 keyword 尤其不能被记 —— 那等于把
+#: 「谁在找什么」抄进日志）。
+NOTE_TITLE_TOOLS = frozenset({
+    "memory_read",
+    "memory_commit",
+    "memory_write",
+    "memory_update_metadata",
+    "memory_delete",
+    "memory_archive",
+    "memory_restore",
+    "memory_graph",
+    "memory_context",
+})
+
+#: 标题长度上限：标题本身可长（「项目_xxx_20261105」之类），截断只为不让一条
+#: 审计记录把导出 CSV 的一行撑爆。
+_NOTE_TITLE_MAX = 120
+
+
+def audit_note_title(tool: str, args: Any) -> str:
+    """从工具参数里认出这条调用动的**哪一条记忆**（认不出返回空串）。"""
+    if tool not in NOTE_TITLE_TOOLS or not isinstance(args, dict):
+        return ""
+    title = args.get("title")
+    if not isinstance(title, str):
+        return ""
+    title = title.strip()
+    if len(title) > _NOTE_TITLE_MAX:
+        return title[:_NOTE_TITLE_MAX] + "…"
+    return title
+
+
+#: 记忆库「全部条目」支持的排序字段（2026-11-05）。
+#:
+#: 只收 ``memory_list(json)`` **已经回传**的字段：``updated`` / 文件大小这类
+#: 信息协议面上没有，与其在控制台里凭路径猜，不如不提供这个选项 ——
+#: 一个「点了没变化」的排序比没有排序更让人怀疑页面坏了。
+LIBRARY_SORTS = ("title", "created", "tier", "reads", "path")
+
+#: 热度的排序权重。用显式表而不是字符串比较：``cold < hot < warm`` 的字典序
+#: 与「冷热」毫无关系，直接 sort 会把 cold 排到 hot 前面。
+_TIER_RANK = {"hot": 0, "warm": 1, "cold": 2}
+
+
+def sort_library_entries(entries: list[dict], sort_key: str,
+                         order: str) -> list[dict]:
+    """按 ``sort_key`` 排条目（在切片之前调用，见 Console.library 的说明）。
+
+    ``order`` 为空时用「该字段最有用的方向」：标题/路径升序，创建时间与读取
+    次数降序（新的、读得多的在前）。**热度不在这条降序名单里**：它排的是
+    ``_TIER_RANK``（hot=0 / warm=1 / cold=2），「热在前」对应的是**升序**，
+    写进降序名单会把 cold 顶到第一行（V15 首版就是在这儿翻的车）。
+    显式给 asc/desc 则覆盖 —— 「按创建时间升序」（最老的在前）也是一个真实需求，
+    不能替主人决定。
+    """
+    if not sort_key:
+        return entries
+    desc = (order == "desc") if order else sort_key in ("created", "reads")
+
+    def key(e: Any) -> Any:
+        if not isinstance(e, dict):
+            return ""
+        if sort_key == "title":
+            return str(e.get("title") or "").lower()
+        if sort_key == "created":
+            return str(e.get("created") or "")
+        if sort_key == "tier":
+            return _TIER_RANK.get(str(e.get("tier") or ""), 9)
+        if sort_key == "reads":
+            try:
+                return int(e.get("reads") or 0)
+            except (TypeError, ValueError):
+                return 0
+        return str(e.get("path") or e.get("title") or "").lower()
+
+    try:
+        return sorted(entries, key=key, reverse=desc)
+    except TypeError:
+        # 混型键（历史条目里 created 可能是 null 之外的怪值）不该让整页 502：
+        # 退回字符串键，顺序不完美但页面照常可用。
+        return sorted(entries, key=lambda e: str(key(e)), reverse=desc)
 
 
 def _get_audit(path: Path) -> web_audit.AuditLog:
@@ -523,6 +628,13 @@ def config() -> dict:
     audit_path = Path(_env_str("AI_MEMORY_WEB_AUDIT") or (cfg_dir / "audit.jsonl"))
     audit = _get_audit(audit_path)
 
+    # FNS 同步事件（2026-11-05，「日志」页右栏的数据面）。
+    # **只读**：写者是 fns-sync 容器（同一条事件文件在它的 /state 卷里），
+    # 控制台只把那个卷以只读方式挂到 /fns-state 读。文件不存在不是错误 ——
+    # 没启用 FNS / 卷没挂 都会走到这里，界面要能显示「没有数据源」。
+    fns_log = web_synclog.SyncEventLog(
+        web_synclog.resolve_sync_log_path(cfg_dir))
+
     # 从旧版单用户配置平滑迁移：表为空时把 .env 里那组 USER + HASH 变成 admin。
     # 没有这一步，升级后 users.json 是空的 —— 谁都登不进去，只能进容器手改文件。
     if login_enabled and users.bootstrap(login_user, login_hash, "admin"):
@@ -590,6 +702,8 @@ def config() -> dict:
         "tokens": tokens,
         "audit_path": str(audit_path),
         "audit": audit,
+        "fns_log": fns_log,
+        "fns_log_path": str(fns_log.path),
         "multi_user": multi_user,
         "internal_key": internal_key,
         "mcp": mcp,
@@ -622,10 +736,13 @@ def describe(cfg: dict | None = None) -> str:
 # 配置面：vault 之外的 JSON（FNS 凭据等）
 # ---------------------------------------------------------------------------
 def _blank_app_config() -> dict:
+    fns = {k: "" for k in _FNS_FIELDS}
+    # mode 不吃空串：前端直接拿它做下拉的 v-model，空串会让 select 停在「未选」。
+    fns["mode"] = _FNS_MODE_DEFAULT
     return {
         "mcp_endpoint": "",
         "vault_dir": "",
-        "fns": {k: "" for k in _FNS_FIELDS},
+        "fns": fns,
         "ui": {"theme": "auto"},
         "updated": "",
     }
@@ -647,7 +764,11 @@ def _sanitize_app_config(raw: Any) -> dict:
                 src[new] = src[old]
         for k in _FNS_FIELDS:
             v = src.get(k, "")
-            if k == "exclude":
+            if k == "mode":
+                # 三态取值必须收敛，不能把前端传上来的任意字符串落盘 ——
+                # 它会被渲染进容器配置，写歪了等于悄悄改了同步方向。
+                out["fns"][k] = _fns_mode(v)
+            elif k == "exclude":
                 if isinstance(v, str):
                     items = [x.strip() for x in re.split(r"[\r\n,]+", v) if x.strip()]
                 elif isinstance(v, list):
@@ -902,6 +1023,7 @@ def fns_sync_config(app_fns: dict) -> tuple[str, list[str]]:
     token = str(app_fns.get("token") or "").strip()
     vault = str(app_fns.get("vault") or "").strip()
     client = str(app_fns.get("client_type") or "").strip() or "GoFastNoteSync"
+    mode = _fns_mode(app_fns.get("mode"))
     extra = [str(x).strip() for x in (app_fns.get("exclude") or []) if str(x).strip()]
 
     missing = [k for k, v in (("server", server), ("token", token),
@@ -932,8 +1054,13 @@ def fns_sync_config(app_fns: dict) -> tuple[str, list[str]]:
     lines.append("sync_enabled: true")
     # 🔴 默认 true 会把 .obsidian/data.json 一类配置回灌，必须显式关掉
     lines.append("config_sync_enabled: false")
-    # 🔴 实测语义 = 双向静默（不是「只拉不推」），设 true 会连上传一起断掉
-    lines.append("readonly_sync_enabled: false")
+    # 同步方向（2026-11-04）。``sync_mode`` 是唯一真值，客户端三个方向都认它：
+    #   rw 双向 / ro 只接收 / wo 只上传。
+    # ``readonly_sync_enabled`` 只对 ro 置 true —— 它是**老镜像也认识**的等价键
+    # （客户端里它只挡上行：local_events / NeedPush / 文件与设置上传），
+    # 所以即使镜像没跟着升级，「只读」也还能真生效；「只写」则依赖新的 sync_mode。
+    lines.append(f"sync_mode: {_yaml_str(mode)}")
+    lines.append("readonly_sync_enabled: " + ("true" if mode == "ro" else "false"))
     lines.append("offline_delete_sync_enabled: false")
     lines.append("manual_sync_enabled: false")
     lines.append("")
@@ -2122,6 +2249,92 @@ class WebConsole:
             "items": items,
         })
 
+    async def library(self, request: Request) -> Response:
+        """记忆库页的分页数据面（2026-10-29）：**后端切片**，一次只回一页。
+
+        为什么不复用 ``/api/call`` + ``memory_list``：
+          ① 核心仓的 ``memory_list`` 只有 ``limit``、**没有 offset**（见 server.py
+             签名），前端根本无从表达「第 41 条之后」；
+          ② 回传浏览器一律要过 ``_clip``（``_THUMB`` = 40000 字符），而 416 条
+             整包 JSON 约 10 万字符 ⇒ 截断后的 JSON ``parse`` 必崩（与
+             ``/api/activity`` 踩过的是同一个坑，注释见该端点的 docstring）。
+        ⇒ 由本端以 ``clip=False`` 取整包、按 ``offset/limit`` 切片回传，
+        单页（40 条）实测约 **23KB** —— 注意本端点走 ``JSONResponse``、不经
+        ``_clip``，所以封顶在这里不再拦截；``_THUMB`` 只是「不能用 /api/call
+        自己分页」的**原因**，不是本端点的约束。前端滚动到底再要下一页。
+
+        契约：``{ok, count, offset, limit, shown, hidden, items}``
+        —— ``count`` 是过滤后的**总条数**，不受本页 limit 影响，前端据此判断
+        「还有没有下一页」。``items`` 与 ``memory_list(json)`` 的 entries 同构，
+        故前端渲染层不必为分页改写字段映射。
+        """
+        offset = _bounded_int(request.query_params.get("offset"), 0, 0, 100000)
+        limit = _bounded_int(request.query_params.get("limit"), 40, 1, 200)
+        tag = (request.query_params.get("tag") or "").strip()
+        tier = (request.query_params.get("tier") or "").strip()
+        # 排序（2026-11-05 主人：「全部条目 添加笔记排序方式」）。
+        # 🔴 必须在**切片之前**排：先切页再排只会重排当前这一页，翻页时
+        # 顺序会整体错位（而且「按标题排」在页内看起来像随机）。
+        # 字段取自 memory_list(json) 已有字段，不新增协议面 —— 服务端拿不到
+        # updated 之类的「文件时间」，就不假装能按它排。
+        sort = (request.query_params.get("sort") or "").strip().lower()
+        order = (request.query_params.get("order") or "").strip().lower()
+        sort_key = "" if sort in ("", "default", "path") else sort
+        if sort_key and sort_key not in LIBRARY_SORTS:
+            return _err(400, "sort 只能是 " + " / ".join(["default", *LIBRARY_SORTS])
+                             + "，收到：" + sort_key)
+        if order not in ("", "asc", "desc"):
+            return _err(400, "order 只能是 asc 或 desc。")
+        # ⚠️ memory_list 用 entries[:limit] 截取，没有 offset —— 只能「多要前 offset+limit
+        # 条再丢前缀」。服务端本来就要遍历全库 md 生成完整 entries，多要前缀不额外扫盘；
+        # 代价只在回环上的那点 JSON 体积，值得换掉「协议层无 offset」这个硬阻塞。
+        args: dict = {"limit": offset + limit, "output_format": "json"}
+        if tag:
+            args["tag"] = tag
+        if tier:
+            args["tier"] = tier
+        endpoint = resolve_mcp(self.cfg)
+        t0 = time.perf_counter()
+        try:
+            results = await mcp_session_calls(
+                endpoint, [("memory_list", args)], clip=False,
+            )
+        except Exception as e:                                    # noqa: BLE001
+            return _err(502, f"无法读取记忆列表：{_mcp_error_text(e)}")
+        try:
+            payload = json.loads(results[0].get("text") or "{}")
+        except Exception as e:                                    # noqa: BLE001
+            return _err(502, f"记忆列表不是合法 JSON：{_mcp_error_text(e)}")
+        entries = payload.get("entries")
+        if not isinstance(entries, list):
+            entries = []
+        # 排序必须在切片前（2026-11-05）：先切页再排只会重排当前页。
+        entries = sort_library_entries(entries, sort_key, order)
+        page = entries[offset:offset + limit]
+        count = int(payload.get("count") or 0)
+        # 审计（2026-10-29）：**只在首页**落一条 ``tool.call``。
+        # 这条不是可选项：改成本端点之前，记忆库浏览走的是 ``/api/call``，
+        # 每次都留一条 ``tool.call target=memory_list``；不分页时「谁读了库」
+        # 在访问日志里一目了然。换端点而忘了补审计，等于读取行为整体从日志里消失。
+        # 只记首页的理由：翻页是同一动作的延续（545 条要翻 14 页），每页一条会把
+        # 日志刷满；而「谁、何时、从哪个口、总数多少」在首页这条里已经齐了。
+        if offset == 0:
+            hint = self._caller_hint(request)
+            self._audit(
+                request, "tool", "tool.call", target="memory_list",
+                detail=(hint + " · " if hint else "") + f"分页读取（共 {count} 条）",
+                ms=round((time.perf_counter() - t0) * 1000, 1),
+            )
+        return JSONResponse({
+            "ok": True,
+            "count": count,
+            "offset": offset,
+            "limit": limit,
+            "shown": len(page),
+            "hidden": int(payload.get("hidden") or 0),
+            "items": page,
+        })
+
     async def config_get(self, request: Request) -> Response:
         app_cfg = load_app_config()
         vault = resolve_vault()
@@ -2255,7 +2468,9 @@ class WebConsole:
         res["ok"] = not res["isError"]
         self._audit(request, "tool", "tool.call", target=tool,
                     ok=bool(res["ok"]),
-                    detail=f"{res['elapsed_ms']}ms · {self._caller_hint(request)}")
+                    detail=self._caller_hint(request),
+                    ms=res["elapsed_ms"],
+                    note=audit_note_title(tool, arguments))
         return JSONResponse(res)
 
     # -------- 更新面 --------
@@ -2778,19 +2993,23 @@ class WebConsole:
 
     def _audit(self, request: Request, kind: str, action: str, *,
                target: str = "", ok: bool = True, detail: str = "",
-               actor: str = "") -> None:
+               actor: str = "", ms: float | None = None,
+               note: str = "") -> None:
         """记一条审计事件（访问控制页「访问日志」卡的唯一写入口）。
 
-        两条刻意的设计：
+        三条刻意的设计：
 
         * **永不抛错**：审计写盘失败（磁盘满、文件被占用）不该让业务请求跟着失败。
           代价是「日志有洞」，收益是「服务不因日志而不可用」—— 这个取舍在本场景
           是明确的：日志是旁证，不是业务的一部分。
         * **不自己拼字符串**：``actor`` / ``role`` / ``via`` / ``ip`` 全部独立成字段，
           让前端与后续筛选能按维度处理，而不是回头拿正则去切一段人写的句子。
+        * **不落凭据**：令牌只记 ``id`` 与 ``name`` 两个标识，**前缀与明文一律不写**
+          （2026-10-26 指令）。名称是标签不是凭据，可以落 —— 它同时是一份快照：
+          令牌改名或删除之后，历史记录的「谁」仍然准确。
         """
         try:
-            self.cfg["audit"].append({
+            rec = {
                 "kind": kind,
                 "action": action,
                 "actor": actor or self._actor(request) or "",
@@ -2800,7 +3019,27 @@ class WebConsole:
                 "target": target,
                 "ok": bool(ok),
                 "detail": detail,
-            })
+            }
+            # 令牌标识（2026-10-28）：此前只有 ``via="token"``，界面上显示成
+            # 「admin（令牌）」—— 只说明走了令牌通道，说不出是**哪一枚**，
+            # 于是 WorkBuddy / Codex / Claude Code 在日志里全糊成一个人。
+            # ``id`` 是内部主键（不是凭据），``name`` 是标签；前端用 id 去
+            # /api/tokens 换前缀兜底，所以这里**不需要**存前缀。
+            if str(getattr(request.state, "auth_via", "") or "") == "token":
+                tok = getattr(request.state, "auth_token", None) or {}
+                rec["token_id"] = str(tok.get("id") or "")
+                rec["token_name"] = str(tok.get("name") or "")
+            # 耗时独立成数值字段（2026-10-28）：此前它被拼进 ``detail`` 变成
+            # "676.6ms · 地址栏"，前端只能拿正则去抠，既不能排序也不能单独
+            # 着色 —— 而「哪条调用了 2 秒」正是这份日志最常被问的问题。
+            if ms is not None:
+                rec["ms"] = round(float(ms), 1)
+            # 「动了哪一条」（2026-11-05）：工具调用此前只记工具名，日志里
+            # 看不出对象。标题属于「文件名」级别的标识，不是正文 —— 正文与
+            # 关键词仍然一律不入库（见 audit_note_title 的说明）。
+            if note:
+                rec["note"] = note
+            self.cfg["audit"].append(rec)
         except Exception:                                    # noqa: BLE001
             logger.warning("审计写入失败（%s/%s），已忽略", kind, action, exc_info=True)
 
@@ -3006,7 +3245,7 @@ class WebConsole:
             # Excel 打开时每行多一个空行。
             writer = csv.writer(buf, lineterminator="\r\n")
             writer.writerow(["时间", "类型", "动作", "操作人", "角色",
-                             "通道", "IP", "对象", "结果", "详情"])
+                             "通道", "令牌", "IP", "耗时(ms)", "对象", "结果", "详情"])
             labels = {k: v for k, v in web_audit.AUDIT_KINDS}
             for r in rows:
                 writer.writerow([
@@ -3017,7 +3256,9 @@ class WebConsole:
                     str(r.get("actor") or ""),
                     str(r.get("role") or ""),
                     str(r.get("via") or ""),
+                    str(r.get("token_name") or ""),
                     str(r.get("ip") or ""),
+                    ("" if r.get("ms") is None else r.get("ms")),
                     str(r.get("target") or ""),
                     "成功" if r.get("ok") is not False else "失败",
                     str(r.get("detail") or ""),
@@ -3031,6 +3272,151 @@ class WebConsole:
             headers={"Content-Disposition": f'attachment; filename="{name}"',
                      # 审计导出不该被任何中间层缓存：这份文件是「此刻的完整
                      # 清单」，缓存一份旧的就是在骗人。
+                     "Cache-Control": "no-store"})
+
+    async def logs_get(self, request: Request) -> Response:
+        """「日志」页的合并数据面（2026-11-05）：访问日志 + FNS 同步事件，一条时间轴。
+
+        为什么合并成一个端点而不是让前端各拉两路
+        ----------------------------------------
+        两路数据**必须按时间交错**：主人要的是「这一刻，谁读了库、同时同步了什么」。
+        分两次请求会让两条流各自截断（各取最近 N 条），拼起来后中间那段是空的 ——
+        看起来像「那段时间没发生任何事」，实际是两边都被 limit 砍掉了。
+        合并放在服务端，截断只发生一次、只发生在一个有序列表上。
+
+        权限与 ``/api/audit`` 同口径（admin 专属）：FNS 同步事件同样暴露
+        「哪些笔记在什么时候被同步」（等于一份数据流向图），没有理由对
+        operator 敞开。
+
+        契约：``{ok, events, counts, total, fns, filters, stats}``
+        —— ``events`` 按时间**倒序**（新→旧），每项带 ``source``（access/fns）
+        供前端分栏；``fns.available=false`` 表示「没有数据源」（不是错误）。
+        """
+        if (bad := self._need_admin(request)) is not None:
+            return bad
+        qp = request.query_params
+        since = None
+        raw_since = str(qp.get("since") or "").strip()
+        if raw_since:
+            try:
+                since = float(raw_since)
+            except ValueError:
+                return _err(400, "since 必须是 unix 秒（数字）。")
+        source = str(qp.get("source") or "all").strip().lower()
+        if source not in ("all", "access", "fns"):
+            return _err(400, "source 只能是 all / access / fns。")
+        akind = str(qp.get("akind") or "").strip()
+        faction = str(qp.get("faction") or "").strip()
+        limit = _bounded_int(qp.get("limit"), 160, 1, 1000)
+
+        rows: list[dict] = []
+        if source in ("all", "access"):
+            for rec in self.cfg["audit"].dump(kind=akind, since=since):
+                item = dict(rec)
+                item["source"] = "access"
+                rows.append(item)
+        if source in ("all", "fns"):
+            rows.extend(self.cfg["fns_log"].dump(action=faction, since=since))
+        rows.sort(key=lambda r: float(r.get("t") or 0))
+        total = len(rows)
+        page = rows[-limit:]
+        page.reverse()
+        return JSONResponse({
+            "ok": True,
+            "events": page,
+            "total": total,
+            "counts": {
+                "access": sum(1 for r in rows if r.get("source") == "access"),
+                "fns": sum(1 for r in rows if r.get("source") == "fns"),
+            },
+            "fns": self.cfg["fns_log"].status(),
+            "filters": {
+                "access_kinds": web_audit.kind_labels(),
+                "sync_actions": web_synclog.action_labels(),
+                "sync_kinds": web_synclog.kind_labels(),
+            },
+            "stats": {"access": self.cfg["audit"].stats(),
+                      "fns": self.cfg["fns_log"].stats()},
+        })
+
+    async def logs_export(self, request: Request) -> Response:
+        """导出合并日志（2026-11-05，主人：「导出功能是必备的」）。
+
+        与 ``audit_export`` 同一态度：**导出的是命中项全量**，不是当前那一屏。
+        两种格式沿用既有取舍（CSV 带 BOM 给 Excel、JSON 给脚本），列也重复
+        「时间 / 来源 / 动作 / 对象 / 人 / IP / 令牌 / 大小 / 结果 / 详情」。
+
+        ``action`` / ``kind`` 两列写**原始代码**（tool.call / upload …）而不是
+        中文：这是给脚本和 grep 用的文件，与 ``audit_export`` 同一口径；
+        界面上的中文文案在前端，两边各管一层。
+        """
+        if (bad := self._need_admin(request)) is not None:
+            return bad
+        qp = request.query_params
+        fmt = str(qp.get("format") or "csv").strip().lower()
+        if fmt not in ("csv", "json"):
+            return _err(400, "format 只能是 csv 或 json。")
+        source = str(qp.get("source") or "all").strip().lower()
+        if source not in ("all", "access", "fns"):
+            return _err(400, "source 只能是 all / access / fns。")
+        akind = str(qp.get("akind") or "").strip()
+        faction = str(qp.get("faction") or "").strip()
+        since = None
+        raw_since = str(qp.get("since") or "").strip()
+        if raw_since:
+            try:
+                since = float(raw_since)
+            except ValueError:
+                return _err(400, "since 必须是 unix 秒（数字）。")
+
+        rows: list[dict] = []
+        if source in ("all", "access"):
+            for rec in self.cfg["audit"].dump(kind=akind, since=since):
+                item = dict(rec)
+                item["source"] = "access"
+                rows.append(item)
+        if source in ("all", "fns"):
+            rows.extend(self.cfg["fns_log"].dump(action=faction, since=since))
+        rows.sort(key=lambda r: float(r.get("t") or 0))
+
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        name = f"ai-memory-logs-{stamp}.{fmt}"
+        self._audit(request, "config", "logs.export",
+                    target=f"{fmt} · {len(rows)} 条",
+                    detail=f"来源 {source}" + (f" · 类型 {akind}" if akind else "")
+                    + (f" · 动作 {faction}" if faction else ""))
+        if fmt == "json":
+            body = json.dumps({"ok": True, "count": len(rows),
+                               "exported_at": round(time.time(), 3),
+                               "source": source, "events": rows},
+                              ensure_ascii=False, indent=2)
+            media = "application/json; charset=utf-8"
+        else:
+            buf = io.StringIO()
+            writer = csv.writer(buf, lineterminator="\r\n")
+            writer.writerow(["时间", "来源", "类型", "动作", "对象",
+                             "操作人", "IP", "令牌", "大小", "结果", "详情"])
+            for r in rows:
+                fns = r.get("source") == "fns"
+                writer.writerow([
+                    web_synclog.fmt_ts(float(r.get("t") or 0)),
+                    "FNS 同步" if fns else "访问",
+                    str(r.get("kind") or ""),
+                    str(r.get("action") or ""),
+                    str(r.get("title") or r.get("target") or r.get("path") or ""),
+                    str(r.get("actor") or ""),
+                    str(r.get("ip") or ""),
+                    str(r.get("token_name") or ""),
+                    (int(r.get("size") or 0) or "") if fns else "",
+                    "",  # FNS 事件没有「成功/失败」：能写进事件文件的就是已发生的
+                    str(r.get("detail") or ""),
+                ])
+            body = "\ufeff" + buf.getvalue()
+            media = "text/csv; charset=utf-8"
+        return Response(
+            body,
+            media_type=media,
+            headers={"Content-Disposition": f'attachment; filename="{name}"',
                      "Cache-Control": "no-store"})
 
     async def tokens_post(self, request: Request) -> Response:
@@ -3291,7 +3677,8 @@ class WebConsole:
         elapsed = round((time.perf_counter() - t0) * 1000, 1)
         self._audit(request, "tool", "tool.call", target=tool,
                     ok=not res.get("isError"),
-                    detail=f"{elapsed}ms · 地址栏")
+                    detail="地址栏", ms=elapsed,
+                    note=audit_note_title(tool, arguments))
         if str(params.get("format") or "").strip().lower() in ("text", "plain", "txt"):
             return Response(text or "(空)", media_type="text/plain; charset=utf-8",
                             headers={"Cache-Control": "no-store"})
@@ -3328,8 +3715,13 @@ class WebConsole:
             if method == "tools/call":
                 name = str(params.get("name") or "")
                 if name:
+                    # note：MCP 反代这条路径此前只能记工具名，日志里分不清
+                    # 「读了哪篇」；标题是文件名级标识，与 /api/call 同口径
+                    # （2026-11-05，见 audit_note_title）。
                     self._audit(request, "tool", "tool.call", target=name,
-                                ok=ok, detail="MCP 反代")
+                                ok=ok, detail="MCP 反代",
+                                note=audit_note_title(
+                                    name, (params or {}).get("arguments")))
             elif method == "initialize":
                 client = ""
                 if isinstance(params, dict):
@@ -3660,6 +4052,10 @@ def create_app(cfg: dict | None = None) -> Starlette:
         Route("/api/tools", console.tools, methods=["GET"]),
         Route("/api/overview", console.overview, methods=["GET"]),
         Route("/api/activity", console.activity, methods=["GET"]),
+        # 记忆库分页面（2026-10-29）：后端切片，配合前端滚动续载。
+        # 存在理由见 Console.library 的 docstring —— memory_list 无 offset，
+        # 且整包 JSON 超 _THUMB 会在浏览器侧解析失败。
+        Route("/api/library", console.library, methods=["GET"]),
         Route("/api/call", console.call, methods=["POST"]),
         Route("/api/config", console.config_get, methods=["GET"]),
         Route("/api/config", console.config_post, methods=["POST"]),
@@ -3687,6 +4083,10 @@ def create_app(cfg: dict | None = None) -> Starlette:
         # `/api/audit/export` 多一段，两者互不遮蔽；但仍把它紧挨着写字，
         # 是为了让「谁会读这个文件」一眼看全。
         Route("/api/audit/export", console.audit_export, methods=["GET"]),
+        # 「日志」页（2026-11-05）：访问日志 + FNS 同步事件，一条合并时间轴。
+        # 与 /api/audit 同一权限口径（admin）——同步事件也是一张数据流向图。
+        Route("/api/logs", console.logs_get, methods=["GET"]),
+        Route("/api/logs/export", console.logs_export, methods=["GET"]),
         # OAuth 2.1 授权服务器（2026-10-26）。五个端点都在 AuthMiddleware.PUBLIC
         # 里放行 —— 它们服务的是「还没有凭据」的客户端。
         Route("/.well-known/oauth-protected-resource", console.oauth_prm,
