@@ -101,7 +101,10 @@ _ENV_KEYS = ["AI_MEMORY_WEB_HOST", "AI_MEMORY_WEB_PORT", "AI_MEMORY_WEB_MCP",
              "AI_MEMORY_WEB_PASSWORD_HASH",
              "AI_MEMORY_WEB_USERS", "AI_MEMORY_WEB_TOKENS",
              # 审计（2026-10-27）：不净化就会写进宿主机的 ~/.ai-memory-web。
-             "AI_MEMORY_WEB_AUDIT"]
+             "AI_MEMORY_WEB_AUDIT",
+             # FNS 同步事件（2026-11-05）：同理，指向宿主机上的路径会让
+             # 「无数据源」用例读到真实文件，测出来的结论是假的。
+             "AI_MEMORY_WEB_FNS_LOG"]
 _BASELINE = {k: os.environ.get(k) for k in _ENV_KEYS}
 
 
@@ -410,6 +413,76 @@ _r = asyncio.run(_req(_dead, "GET", "/mcp?tool=memory_search&keyword=x",
 check("D19 白名单内的只读工具 ⇒ 真转发上游（此处不可达 ⇒ 502）",
       _r.status_code == 502, f"status={_r.status_code} body={_r.text[:140]}")
 
+# D20~D28（2026-11-05）：**令牌生命周期 × /mcp 入口**。
+# D7~D9 只证明「有没有送凭据」。这条链上真正会出事的是另一半：**有凭据但已失效
+# 仍被放行到上游** —— 那等于令牌页上的「吊销」按钮只是个摆设。统一判别式：
+#   502 = 鉴权过了、只是屋里没人（被放行）；401 = 拦在转发之前（期望）。
+# 为什么全部打 _dead（上游不可达）：这样「被放行」会以 502 显形，不会因为上游
+# 恰好能连而伪装成「功能正常」。
+_ts = _cfg_auth["tokens"]
+
+# 吊销：先证明新令牌真的能用，再吊销，再打必须 401。
+_e_plain, _e_rec = _ts.create(name="e2e-revoke", owner="probe", role="viewer")
+_e_hdr = {"Authorization": f"Bearer {_e_plain}"}
+_r = asyncio.run(_req(_dead, "POST", "/mcp", _e_hdr))
+check("D20 新签令牌可用（鉴权通过 -> 上游 502，不是 401）",
+      _r.status_code == 502, f"status={_r.status_code} body={_r.text[:140]}")
+_ts.revoke(_e_rec["id"])
+_r = asyncio.run(_req(_dead, "POST", "/mcp", _e_hdr))
+check("D21 吊销后立即 401（不必重连、不靠缓存过期）",
+      _r.status_code == 401, f"status={_r.status_code} body={_r.text[:140]}")
+
+# 过期：直接把记录里的 expires_at 拨到过去。等 60 秒会把这条测试变慢，而慢测试
+# 迟早会被跳过 —— 那就等于没测。
+_p_exp, _r_exp = _ts.create(name="e2e-expire", owner="probe", role="viewer",
+                            expires_in=60)
+for _t in _ts._data["tokens"]:
+    if _t.get("id") == _r_exp["id"]:
+        _t["expires_at"] = time.time() - 1
+_r = asyncio.run(_req(_dead, "POST", "/mcp", {"Authorization": f"Bearer {_p_exp}"}))
+check("D22 过期令牌 -> 401（有效期不是只写在 UI 上）",
+      _r.status_code == 401, f"status={_r.status_code} body={_r.text[:140]}")
+
+# 停用：吊销之外还有「暂时关掉」，语义不同，同样必须立即生效。
+_p_off, _r_off = _ts.create(name="e2e-disabled", owner="probe", role="viewer")
+_ts.set_enabled(_r_off["id"], False)
+_r = asyncio.run(_req(_dead, "POST", "/mcp", {"Authorization": f"Bearer {_p_off}"}))
+check("D23 停用令牌 -> 401", _r.status_code == 401,
+      f"status={_r.status_code} body={_r.text[:140]}")
+
+# 次数耗尽：必须用 usage_window=0 的独立 Store —— 默认 30s 去重窗口内重复请求
+# **不重复计次**（那是给正常客户端突发请求的保护），拿默认值测这条路必然误判。
+import web_store as _ws  # noqa: E402
+_ts0 = _ws.TokenStore(str(_WEBCFG / "e2e-uses.json"), usage_window=0)
+_p_use, _r_use = _ts0.create(name="e2e-uses", owner="probe", role="viewer",
+                             max_uses=2)
+_cfg0 = dict(_dead, tokens=_ts0)
+_codes = []
+for _i in range(3):
+    _r = asyncio.run(_req(_cfg0, "POST", "/mcp", {"Authorization": f"Bearer {_p_use}"}))
+    _codes.append(_r.status_code)
+check("D24 次数耗尽 -> 前两次放行(502)、第三次 401", _codes == [502, 502, 401],
+      f"codes={_codes}")
+
+# ?token= 第三通道同样受生命周期约束：否则「换个参数位」就是绕过吊销的后门。
+_r = asyncio.run(_req(_dead, "POST", f"/mcp?token={_e_plain}"))
+check("D25 被吊销令牌走 ?token= 同样 401（不能换通道绕过）",
+      _r.status_code == 401, f"status={_r.status_code} body={_r.text[:140]}")
+
+# 视野 / 读写落点：令牌权限必须真的落到端点，而不是只存在控制台界面上。
+check("D26 owner + 只读令牌 -> /mcp/owner-ro",
+      web_console.resolve_mcp(_cfg_auth, level="owner",
+                              writable=False).endswith("/mcp/owner-ro"),
+      web_console.resolve_mcp(_cfg_auth, level="owner", writable=False))
+check("D27 reader 档不重复加 -ro（该档本身只读）",
+      web_console.resolve_mcp(_cfg_auth, level="reader",
+                              writable=False).endswith("/mcp/reader"),
+      web_console.resolve_mcp(_cfg_auth, level="reader", writable=False))
+check("D28 writable 缺省不清空写权（None 不等于 False）",
+      web_console.resolve_mcp(_cfg_auth, level="reader",
+                              writable=None).endswith("/mcp/reader"),
+      web_console.resolve_mcp(_cfg_auth, level="reader", writable=None))
+
 # =====================================================================
 section("T 访问日志（audit.jsonl + /api/audit）")
 import web_audit  # noqa: E402
@@ -437,6 +510,46 @@ _alog.append({"kind": "auth", "action": "login.ok", "actor": "x",
 _raw = _ap.read_text(encoding="utf-8")
 check("T5 令牌与口令字段不入库", "amt_LEAK" not in _raw and "pw-LEAK" not in _raw,
       "凭据写进了审计文件")
+
+# T5b（2026-10-28）：令牌**标识**必须活着穿过滤网。
+# 这条与 T5 是一对反向约束：T5 证明「凭据进不去」，T5b 证明「标签没被一起
+# 误杀」。危险点很具体 —— 若有人日后把 _SECRET_KEYS 的精确匹配改成前缀
+# 匹配（"token" 命中 "token_name"），审计里就再也看不到是哪枚令牌干的，
+# 而界面上只会安静地显示「旧记录」，没有任何报错。
+# 刻意用**独立实例**而不是复用 _alog：T6 拿 _alog 的条数做断言，往里多写
+# 一条会让「坏行被跳过」那条用例的计数失真。
+_ap_tok = _TMP / "unit-audit-tokenid.jsonl"
+_alog_tok = web_audit.AuditLog(_ap_tok)
+_alog_tok.append({"kind": "token", "action": "token.issue", "actor": "dpkg",
+                  "token_id": "t_probe", "token_name": "WorkBuddy"})
+_last = _alog_tok.tail(limit=1)[0]
+check("T5b token_id / token_name 不被凭据过滤误伤",
+      _last.get("token_name") == "WorkBuddy" and _last.get("token_id") == "t_probe",
+      f"row={_last}")
+
+# ---- U 审计字段端到端（2026-10-28）----------------------------------------
+# 为什么必须走「用令牌再签一枚令牌」：只有 via=token 才会写 token_id /
+# token_name，用总钥匙（s3cret 是 adopt 进来的 admin 令牌，但请求头里带的是
+# 明文、服务端照样判 via=token —— 所以这里刻意用**新签**的令牌，让期望值
+# 是一个我们自己写下的名字，而不是 adopt 那枚的默认名。
+_r = asyncio.run(_req(_cfg_auth, "POST", "/api/tokens",
+                      {"Authorization": "Bearer s3cret"},
+                      {"name": "Probe", "role": "operator"}))
+_probe_plain = ""
+if _r.status_code == 200:
+    _probe_plain = str(json.loads(_r.text).get("token") or "")
+_r = asyncio.run(_req(_cfg_auth, "POST", "/api/tokens",
+                      {"Authorization": f"Bearer {_probe_plain}"},
+                      {"name": "Probe2", "role": "viewer"}))
+_ok2 = _r.status_code == 200
+_r = asyncio.run(_req(_cfg_auth, "GET", "/api/audit?kind=token",
+                      {"Authorization": "Bearer s3cret"}))
+_ev = [e for e in (json.loads(_r.text).get("events") or [])
+       if e.get("via") == "token"]
+check("U1 令牌通道审计带 token_id + token_name（快照）",
+      _ok2 and bool(_ev) and _ev[0].get("token_name") == "Probe"
+      and bool(_ev[0].get("token_id")),
+      f"ok2={_ok2} ev={_ev[:1]}")
 
 # 坏行（半截 JSON）只能让**那条**消失，不能整段读取失败。
 with _ap.open("a", encoding="utf-8") as _fh:
@@ -531,6 +644,142 @@ _ev = _cfg_auth["audit"].tail(limit=40, action="audit.export")
 check("T18 导出动作被记入审计（audit.export）",
       any(e.get("action") == "audit.export" for e in _ev),
       f"actions={[e.get('action') for e in _ev][:8]}")
+
+# =====================================================================
+section("V 日志页（访问日志 + FNS 同步事件，2026-11-05）")
+import web_synclog  # noqa: E402
+
+# 独立的一套 cfg：日志页的用例会**往文件里写事件**，复用 _cfg_auth 会把
+# T 段的条目数搅乱（T6/T7 都拿条数做断言）。
+_vdir = _TMP / "logcfg"
+_vdir.mkdir(exist_ok=True)
+os.environ["AI_MEMORY_WEB_AUDIT"] = str(_vdir / "audit.jsonl")
+os.environ["AI_MEMORY_WEB_FNS_LOG"] = str(_vdir / "sync-events.jsonl")
+_cfg_logs = web_console.config()
+_vpath = Path(_cfg_logs["fns_log_path"])
+_now = time.time()
+# 事件模拟 Go 侧的产出：毫秒时间戳、title 可缺（由 path 现推）、中间夹一行坏行。
+_vpath.write_text(
+    json.dumps({"t": int((_now - 30) * 1000), "kind": "note", "action": "download",
+                "path": "工具/记忆库MCP.md", "size": 1234}, ensure_ascii=False) + "\n"
+    + "{半截坏行\n"
+    + json.dumps({"t": int((_now - 20) * 1000), "kind": "note", "action": "upload",
+                  "path": "偏好/口味.md", "size": 88}, ensure_ascii=False) + "\n",
+    encoding="utf-8")
+_cfg_logs["audit"].append({"t": _now - 25, "kind": "tool", "action": "tool.call",
+                           "actor": "dpkg", "target": "memory_read",
+                           "note": "记忆库MCP"})
+
+_sl = web_synclog.SyncEventLog(_vpath)
+_tail = _sl.tail(limit=10)
+check("V1 FNS 事件：毫秒归一成秒 + 标题由路径现推 + 坏行跳过",
+      len(_tail) == 2 and _tail[0]["title"] == "口味"
+      and abs(float(_tail[0]["t"]) - (_now - 20)) < 2
+      and _tail[1]["action"] == "download" and _tail[1]["title"] == "记忆库MCP",
+      f"tail={_tail}")
+check("V2 按动作过滤（upload 只有一条）",
+      [r["action"] for r in _sl.tail(action="upload")] == ["upload"], "")
+_st = _sl.status()
+check("V3 status 报告可用性与体积（界面据此区分「没数据源」与「真没有」）",
+      _st["available"] is True and _st["size"] > 0
+      and str(_st["path"]).endswith("sync-events.jsonl"), f"status={_st}")
+_missing = web_synclog.SyncEventLog(_TMP / "nope" / "sync-events.jsonl")
+check("V4 没有事件文件 ⇒ available=False（状态而非异常）",
+      _missing.available() is False and _missing.tail() == []
+      and _missing.status()["available"] is False, "")
+check("V5 path→title：去掉目录与 .md，其余原样",
+      web_synclog.path_to_title("a/b/笔记.md") == "笔记"
+      and web_synclog.path_to_title("无扩展名") == "无扩展名"
+      and web_synclog.path_to_title("") == "", "")
+
+# -- 接口：合并、排序、权限 ---------------------------------------------
+_r = asyncio.run(_req(_cfg_logs, "GET", "/api/logs"))
+check("V6 /api/logs 无凭据 ⇒ 401", _r.status_code == 401, f"status={_r.status_code}")
+
+_r = asyncio.run(_req(_cfg_logs, "GET", "/api/logs",
+                      {"Authorization": "Bearer s3cret"}))
+_j = json.loads(_r.text) if _r.text.startswith("{") else {}
+_evs = _j.get("events") or []
+_ts = [e.get("t") for e in _evs]
+check("V7 /api/logs 合并两类事件且按时间倒序",
+      _r.status_code == 200 and len(_evs) >= 3
+      and _ts == sorted(_ts, reverse=True)
+      and {e.get("source") for e in _evs} == {"access", "fns"},
+      f"status={_r.status_code} events={_evs[:3]}")
+check("V8 counts / fns 状态随数据下发",
+      _j.get("counts", {}).get("fns") == 2
+      and _j.get("counts", {}).get("access", 0) >= 1
+      and _j.get("fns", {}).get("available") is True,
+      f"counts={_j.get('counts')} fns={_j.get('fns')}")
+
+_r = asyncio.run(_req(_cfg_logs, "GET", "/api/logs?source=fns",
+                      {"Authorization": "Bearer s3cret"}))
+_j2 = json.loads(_r.text) if _r.text.startswith("{") else {}
+check("V9 source=fns ⇒ 只回同步事件",
+      all(e.get("source") == "fns" for e in (_j2.get("events") or []))
+      and len(_j2.get("events") or []) == 2, f"body={_r.text[:160]}")
+
+_r = asyncio.run(_req(_cfg_logs, "GET", "/api/logs",
+                      {"Authorization": f"Bearer {_viewer_plain}"}))
+check("V10 /api/logs 只读账号 ⇒ 403（同步事件也是数据流向图）",
+      _r.status_code == 403, f"status={_r.status_code}")
+
+# -- 导出：能下、能读、权限同口径 ---------------------------------------
+_r = asyncio.run(_req(_cfg_logs, "GET", "/api/logs/export?format=csv",
+                      {"Authorization": "Bearer s3cret"}))
+_txt = _r.text
+_lines = [ln for ln in _txt.splitlines() if ln.strip()]
+check("V11 导出 CSV ⇒ 200 + 附件头 + UTF-8 BOM + 表头含来源/大小",
+      _r.status_code == 200
+      and "attachment;" in _r.headers.get("content-disposition", "")
+      and _txt.startswith("\ufeff")
+      and "来源" in _lines[0] and "大小" in _lines[0]
+      and len(_lines) >= 4,
+      f"status={_r.status_code} head={_lines[:1]} rows={len(_lines)}")
+
+_ev = _cfg_logs["audit"].tail(limit=10)
+check("V12 导出行为本身被记入审计（logs.export）",
+      any(e.get("action") == "logs.export" for e in _ev),
+      f"actions={[e.get('action') for e in _ev][:6]}")
+
+_r = asyncio.run(_req(_cfg_logs, "GET", "/api/logs/export?format=csv",
+                      {"Authorization": f"Bearer {_viewer_plain}"}))
+check("V13 导出同样卡 admin（viewer ⇒ 403）", _r.status_code == 403,
+      f"status={_r.status_code}")
+
+# -- 记忆库排序 ---------------------------------------------------------
+_r = asyncio.run(_req(_cfg_logs, "GET", "/api/library?sort=bogus",
+                      {"Authorization": "Bearer s3cret"}))
+check("V14 /api/library 非法 sort ⇒ 400（不静默当默认序）",
+      _r.status_code == 400, f"status={_r.status_code} body={_r.text[:160]}")
+
+_entries = [
+    {"title": "b", "created": "2026-10-02", "tier": "cold", "reads": 1, "path": "b.md"},
+    {"title": "a", "created": "2026-10-05", "tier": "hot", "reads": 9, "path": "a.md"},
+    {"title": "c", "created": "2026-10-01", "tier": "warm", "reads": 5, "path": "c.md"},
+]
+_ordered = {
+    k: [e["title"] for e in web_console.sort_library_entries(_entries, k, "")]
+    for k in ("title", "created", "tier", "reads", "path")
+}
+check("V15 排序四口径（标题升 / 创建降 / 热度 hot 在前 / 读取多在前）",
+      _ordered["title"] == ["a", "b", "c"]
+      and _ordered["created"] == ["a", "b", "c"]
+      and _ordered["tier"] == ["a", "c", "b"]
+      and _ordered["reads"] == ["a", "c", "b"]
+      and _ordered["path"] == ["a", "b", "c"],
+      f"ordered={_ordered}")
+_asc = [e["title"] for e in web_console.sort_library_entries(_entries, "created", "asc")]
+check("V16 order=asc 覆盖默认方向（最老的在前）", _asc == ["c", "b", "a"], f"asc={_asc}")
+check("V17 sort 为空时保持服务端原序（不偷偷重排）",
+      [e["title"] for e in web_console.sort_library_entries(_entries, "", "")] == ["b", "a", "c"], "")
+
+# -- 审计的「对象」口径 -------------------------------------------------
+check("V18 审计记标题但不记关键词（memory_search 的 keyword 不入库）",
+      web_console.audit_note_title("memory_read", {"title": "记忆库MCP"}) == "记忆库MCP"
+      and web_console.audit_note_title("memory_search", {"keyword": "秘密"}) == ""
+      and web_console.audit_note_title("memory_list", {}) == "",
+      "")
 
 # =====================================================================
 section("E 写保护（AI_MEMORY_WEB_CONFIG_WRITE=0）")
@@ -841,6 +1090,43 @@ try:
           and st4 == 200 and j4.get("days") == 1,
           f"abc->{j2.get('days')} 99999->{j3.get('days')} 0->{j4.get('days')}")
 
+    # F3d~F3f /api/library —— 记忆库页「滚动续载」的分页数据面（2026-10-29 新增）。
+    #     存在理由：核心仓的 memory_list **没有 offset**，而整包 JSON（416 条约 10 万
+    #     字符）过 `_clip`（_THUMB = 40000）会被截断成非法 JSON ⇒ 切片只能落在服务端。
+    #     这里钉三件事：
+    #       ① 契约字段齐全，count 是**过滤后总数**（不随本页 limit 变）；
+    #       ② 相邻两页**不重叠** —— 证明 offset 真的生效，而不是把第一页再回一遍
+    #          （最早的实现若忽略 offset，这条会立刻红）；
+    #       ③ 越界 offset 回空页而非 500、非法参数被夹住 —— 前端「滚到底」
+    #          必然问到边界，这里不能靠运气。
+    st, txt = _http("/api/library?offset=0&limit=5")
+    p1 = json.loads(txt) if st == 200 else {}
+    st_b, txt_b = _http("/api/library?offset=5&limit=5")
+    p2 = json.loads(txt_b) if st_b == 200 else {}
+    k1 = [str(it.get("path") or it.get("title")) for it in (p1.get("items") or [])]
+    k2 = [str(it.get("path") or it.get("title")) for it in (p2.get("items") or [])]
+    total = p1.get("count") or 0
+    check("F3d /api/library 分页契约齐全且 count 为过滤后总数",
+          st == 200 and p1.get("ok") is True
+          and p1.get("offset") == 0 and p1.get("limit") == 5
+          and p1.get("shown") == len(k1) and len(k1) <= 5
+          and total >= len(k1),
+          f"status={st} count={total} shown={p1.get('shown')} got={len(k1)}")
+    check("F3e /api/library 相邻两页不重叠（offset 真的生效）",
+          st_b == 200 and set(k1).isdisjoint(k2),
+          f"p1={k1[:2]} p2={k2[:2]} 交集={sorted(set(k1) & set(k2))[:3]}")
+
+    st_c, txt_c = _http(f"/api/library?offset={total + 500}&limit=5")
+    p3 = json.loads(txt_c) if st_c == 200 else {}
+    st_d, txt_d = _http("/api/library?offset=abc&limit=99999")
+    p4 = json.loads(txt_d) if st_d == 200 else {}
+    check("F3f 越界 offset 回空页、参数越界被夹住（abc→0，99999→200）",
+          st_c == 200 and (p3.get("items") or []) == []
+          and p3.get("count") == total
+          and st_d == 200 and p4.get("offset") == 0 and p4.get("limit") == 200,
+          f"越界 status={st_c} items={(p3.get('items') or [])[:2]} "
+          f"abc→{p4.get('offset')} 99999→{p4.get('limit')}")
+
     st, txt = _http("/api/thresholds")
     j = json.loads(txt) if st == 200 else {}
     keys = set((j.get("keys") or {}).keys())
@@ -1030,6 +1316,40 @@ try:
           st_l2 == 200 and bool(_tool_ev)
           and bool(_tool_ev[0].get("actor")) and bool(_tool_ev[0].get("t")),
           f"status={st_l2} events={[e.get('action') for e in (jl2.get('events') or [])][:5]}")
+
+    # F13d（2026-10-28）：耗时必须是**数值字段**，并且 detail 里不再重复它。
+    # 前半句保「界面能排序/着色」，后半句防「两边都写」—— 那样耗时会出现两次，
+    # 而第二次是被拼进 detail 的字符串，正则一改就错位。
+    check("F13d tool.call 审计带数值 ms，detail 不再拼耗时",
+          bool(_tool_ev) and isinstance(_tool_ev[0].get("ms"), (int, float))
+          and _tool_ev[0]["ms"] > 0
+          and "ms" not in str(_tool_ev[0].get("detail") or ""),
+          f"ms={(_tool_ev[0] if _tool_ev else {}).get('ms')!r} "
+          f"detail={(_tool_ev[0] if _tool_ev else {}).get('detail')!r}")
+
+    # F13e（2026-10-29）：记忆库改走 /api/library 后，审计**不能静默断掉**。
+    #      换端点的风险不是报错，而是「读取行为从访问日志里消失」—— 改之前浏览
+    #      记忆库每次都是 /api/call ⇒ 一条 tool.call(target=memory_list)，改完若不补
+    #      就一条都没有，而界面照常工作，没人会发现。
+    #      这里同时钉住取舍：**首页记一条、翻页零增量**（545 条要翻 14 页，
+    #      每页一条会把日志刷满）。用「增量」而不是「绝对条数」断言，是为了不受
+    #      本文件前面 F3d/F3f 已经打过几次首页请求影响。
+    def _lib_audit_n() -> int:
+        _st, _tx = _http("/api/audit?limit=100&kind=tool")
+        _j = json.loads(_tx) if _st == 200 else {}
+        return len([e for e in (_j.get("events") or [])
+                    if e.get("target") == "memory_list"
+                    and "分页读取" in str(e.get("detail") or "")])
+
+    _n0 = _lib_audit_n()
+    _http("/api/library?offset=5&limit=5")
+    _http("/api/library?offset=10&limit=5")
+    _n1 = _lib_audit_n()
+    _http("/api/library?offset=0&limit=5")
+    _n2 = _lib_audit_n()
+    check("F13e 记忆库分页审计：首页记一条、翻页零增量",
+          _n1 == _n0 and _n2 == _n0 + 1,
+          f"翻页前={_n0} 两次翻页后={_n1} 再来一次首页={_n2}")
 
     # 契约：阈值是**整状态写**（前端 saveThresholds 也把 draft 的全部键一起提交）。
     # 因此「只给一个键」必须被明确拒绝，而不是静默写半份配置。
