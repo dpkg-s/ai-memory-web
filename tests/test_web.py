@@ -11,7 +11,7 @@
   D  鉴权中间件（httpx ASGI transport，无需端口）：无 token 401 / Bearer /
      X-Auth-Token / 静态资源不校验 / OPTIONS 204
   E  写保护：AI_MEMORY_WEB_CONFIG_WRITE=0 ⇒ POST /api/thresholds 被拒（400）
-  F  端到端（真起 serve_http + serve_web）：health / tools(26) / overview /
+  F  端到端（真起 serve_http + serve_web）：health / tools(27) / overview /
      thresholds(8 键) / index 回落 / assets 可达 / /api/call 真往返 / 阈值写读往返
   H  更新面（2026-10-15 建立；2026-10-16 扩为 web + core 双目标）：白名单安全边界 /
      行首状态位回归 / 三点 diff 语义 / restarter 与 AI_MEMORY_CORE_DIR 的显式失败
@@ -711,6 +711,12 @@ check("V8 counts / fns 状态随数据下发",
       and _j.get("counts", {}).get("access", 0) >= 1
       and _j.get("fns", {}).get("available") is True,
       f"counts={_j.get('counts')} fns={_j.get('fns')}")
+check("V8b /api/logs 带访问日志落点（in_vault / writable / path）",
+      isinstance(_j.get("access"), dict)
+      and _j["access"].get("writable") is True
+      and _j["access"].get("in_vault") is False
+      and str(_j["access"].get("path") or "").endswith("audit.jsonl"),
+      f"access={_j.get('access')}")
 
 _r = asyncio.run(_req(_cfg_logs, "GET", "/api/logs?source=fns",
                       {"Authorization": "Bearer s3cret"}))
@@ -1022,9 +1028,10 @@ try:
     st, txt = _http("/api/tools")
     j = json.loads(txt) if st == 200 else {}
     names = {t.get("name") for t in j.get("tools", [])} if j else set()
-    check("F2 /api/tools 返回 26 个工具且含关键项",
-          st == 200 and j.get("count") == 26 and {"memory_batch_tag",
+    check("F2 /api/tools 返回 27 个工具且含关键项",
+          st == 200 and j.get("count") == 27 and {"memory_batch_tag",
                                                   "memory_config",
+                                                  "memory_access_suggest",
                                                   "memory_orphans"} <= names,
           f"status={st} count={j.get('count')}")
 
@@ -1036,8 +1043,8 @@ try:
     check("F2b /api/tools 下发 6 个功能组且首组为 content",
           st == 200 and len(_gkeys) == 6 and _gkeys[0] == "content",
           f"groups={_gkeys}")
-    check("F2c 26 项工具全部带 group，且值都在组定义内",
-          st == 200 and len(_gtools) == 26
+    check("F2c 27 项工具全部带 group，且值都在组定义内",
+          st == 200 and len(_gtools) == 27
           and all(t.get("group") in _gkeys for t in _gtools),
           ", ".join(sorted({str(t.get("group")) for t in _gtools} - set(_gkeys))))
     check("F2d 没有工具落入 other 兜底组（映射表无遗漏）",
@@ -1388,6 +1395,48 @@ finally:
         lf.close(); lf2.close()
     except Exception:
         pass
+
+# =====================================================================
+section("W 访问日志落点（放进记忆库当附件，2026-11-08）")
+
+# 绝对路径：与老行为完全一致，老部署零影响。
+_abs_audit = _TMP / "abs-audit" / "audit.jsonl"
+os.environ["AI_MEMORY_WEB_AUDIT"] = str(_abs_audit)
+check("W1 绝对路径原样使用（老部署零影响）",
+      web_console.resolve_audit_path(_vdir) == _abs_audit,
+      repr(web_console.resolve_audit_path(_vdir)))
+
+# 相对路径：按 vault 解析 —— 这一行就是「日志进记忆库、随 FNS 同步」。
+os.environ["AI_MEMORY_DIR"] = str(_VAULT)
+os.environ["AI_MEMORY_WEB_AUDIT"] = "附件/日志/audit.jsonl"
+_rel_audit = _VAULT / "附件" / "日志" / "audit.jsonl"
+check("W2 相对路径按 AI_MEMORY_DIR（vault）解析",
+      web_console.resolve_audit_path(_vdir) == _rel_audit,
+      repr(web_console.resolve_audit_path(_vdir)))
+
+_meta_rel = web_console.audit_path_report(_rel_audit)
+check("W3 落点预检：识别「在记忆库内」且可写",
+      _meta_rel["in_vault"] is True and _meta_rel["writable"] is True
+      and "fns-sync" in _meta_rel["note"], f"meta={_meta_rel}")
+
+# 相对路径但 vault 未配置：退回配置目录，并且必须在日志里说清楚 ——
+# 静默改落点比直接报错更难查。
+os.environ.pop("AI_MEMORY_DIR", None)
+check("W4 相对路径但无 vault ⇒ 退回配置目录",
+      web_console.resolve_audit_path(_vdir) == _vdir / "audit.jsonl",
+      repr(web_console.resolve_audit_path(_vdir)))
+
+# 父路径是普通文件 ⇒ 往上探到的祖先不是目录，预检必须判不可写。
+_blocked = _TMP / "blocked-audit"
+_blocked.write_text("x", encoding="utf-8")
+_meta_bad = web_console.audit_path_report(_blocked / "audit.jsonl")
+check("W5 父路径是普通文件 ⇒ 预检判为不可写且给出原因",
+      _meta_bad["writable"] is False and "丢弃" in _meta_bad["note"],
+      f"meta={_meta_bad}")
+
+# 恢复：后续用例与收尾还原都依赖这两个变量回到 V 段的口径。
+os.environ["AI_MEMORY_DIR"] = str(_VAULT)
+os.environ["AI_MEMORY_WEB_AUDIT"] = str(_vdir / "audit.jsonl")
 
 # =====================================================================
 for k, v in _BASELINE.items():

@@ -95,6 +95,7 @@
 ``AI_MEMORY_WEB_STATIC``                  ``<本文件同级>/web``    前端静态资源目录
 ``AI_MEMORY_CORE_DIR``                    （空）                 核心仓目录；**仅** ``--with-mcp`` 拉起 MCP 端点时需要（不再用于 import）
 ``AI_MEMORY_DIR``                         （空）                 vault 位置（仅用于界面显示；阈值走服务端自己的 vault）
+``AI_MEMORY_WEB_AUDIT``                   ``<配置目录>/audit.jsonl``  访问审计流落点；**相对路径按 vault 解析**（放进记忆库当附件，随 FNS 同步）
 ``AI_MEMORY_RESTARTER``                   （空）                 重启助手路径；默认探测桌面 launcher
 ========================================  =====================  ========================
 """
@@ -352,6 +353,83 @@ def static_dir() -> Path:
 def config_path() -> Path:
     raw = _env_str("AI_MEMORY_WEB_CONFIG")
     return Path(raw).expanduser() if raw else DEFAULT_CONFIG_PATH
+
+def resolve_audit_path(cfg_dir: Path) -> Path:
+    """访问审计流的落点（2026-11-08）。
+
+    优先级：``AI_MEMORY_WEB_AUDIT`` > ``<配置目录>/audit.jsonl``。
+
+    显式值支持**相对路径**，按 vault（``AI_MEMORY_DIR``）解析 —— 这是「把访问
+    日志放进记忆库当附件、交给 FNS 同步」所需的全部配置，一行即可：
+
+        AI_MEMORY_WEB_AUDIT=附件/日志/audit.jsonl
+
+    为什么不要求写绝对路径：部署方只能在 compose / quadlet 里硬编码
+    ``/vault/...``，换个挂载点（本地开发跑 8890、容器里是 /vault）就得改两处，
+    改错时**不报错**、只会静默落到容器层（容器一重建就没了）—— 这是最难查的
+    一类失效。绝对路径行为不变，老部署零影响；相对路径但 vault 未配置时退回
+    配置目录并由 :func:`audit_path_precheck` 告警，同样不留静默坑。
+    """
+    raw = _env_str("AI_MEMORY_WEB_AUDIT")
+    if not raw:
+        return Path(cfg_dir) / "audit.jsonl"
+    p = Path(raw).expanduser()
+    if p.is_absolute():
+        return p
+    vault = resolve_vault()
+    if vault is None:
+        logger.warning(
+            "AI_MEMORY_WEB_AUDIT=%r 是相对路径，但 vault（AI_MEMORY_DIR）没有配置 ——"
+            " 退回配置目录 / %s。访问日志不会进入记忆库，也就不会被 FNS 同步。",
+            raw, p.name)
+        return Path(cfg_dir) / p.name
+    return vault / p
+
+
+def audit_path_precheck(path: Path) -> dict:
+    """启动时给审计落点做一次体检，返回 ``{in_vault, writable, note}``。
+
+    为什么值得在启动时算一遍：``web_audit.append`` 的失败是**刻意被吞掉**的
+    （日志写不进去不该把业务请求带崩，见 ``_audit``），于是「卷挂错 / 目录只读」
+    的唯一症状是日志页永远为空 —— 没有异常、没有堆栈，只有一片空白。这里把
+    能确定的结论一次性说清，让 ``podman logs`` 一眼看出是配置问题而不是「没人用过」。
+    """
+    vault = resolve_vault()
+    in_vault = False
+    if vault is not None:
+        try:
+            in_vault = path.is_relative_to(vault)
+        except (ValueError, OSError):
+            in_vault = False
+    # 目录可能还不存在（首次启动）：向上找最近一个已存在的祖先判断可写，
+    # 因为 append() 会 mkdir(parents=True) —— 真正决定成败的是那个祖先。
+    probe = path.parent
+    writable = False
+    for _ in range(16):
+        try:
+            if probe.exists():
+                writable = probe.is_dir() and os.access(probe, os.W_OK)
+                break
+        except OSError:
+            break
+        if probe.parent == probe:
+            break
+        probe = probe.parent
+    if not writable:
+        note = "不可写：审计事件将被丢弃（服务照常可用，日志页保持空白）"
+    elif in_vault:
+        note = "位于记忆库内，fns-sync 会把它当附件同步到各端"
+    else:
+        note = "在记忆库之外，不会被 FNS 同步"
+    return {"in_vault": bool(in_vault), "writable": bool(writable),
+            "note": note}
+
+
+def audit_path_report(path: Path) -> dict:
+    """给接口用的落点快照（预检结论 + 落点本身），前端「日志」页直接显示。"""
+    meta = audit_path_precheck(path)
+    meta["path"] = str(path)
+    return meta
 
 
 #: 用户表 / 令牌表的进程内单例，按用户表路径做键。
@@ -625,8 +703,13 @@ def config() -> dict:
     # 审计流（2026-10-27）：访问控制页「访问日志」卡的数据面。
     # 默认落在配置目录旁边，与 users/tokens 同级 —— 它是**同一份运维事实**的一部分，
     # 不该跟日志文件混在 logs/ 里（那里的东西可被清、可被外部轮转）。
-    audit_path = Path(_env_str("AI_MEMORY_WEB_AUDIT") or (cfg_dir / "audit.jsonl"))
+    # 落点解析见 resolve_audit_path（2026-11-08）：显式值支持相对路径并按
+    # vault 解析，于是「把访问日志放进记忆库当附件、交给 FNS 同步」只需一行
+    # 环境变量，不必在 quadlet / compose 里硬编码 /vault 前缀。
+    audit_path = resolve_audit_path(cfg_dir)
     audit = _get_audit(audit_path)
+    audit_meta = audit_path_report(audit_path)
+    logger.info("访问日志落点 %s —— %s", audit_path, audit_meta["note"])
 
     # FNS 同步事件（2026-11-05，「日志」页右栏的数据面）。
     # **只读**：写者是 fns-sync 容器（同一条事件文件在它的 /state 卷里），
@@ -702,6 +785,9 @@ def config() -> dict:
         "tokens": tokens,
         "audit_path": str(audit_path),
         "audit": audit,
+        # 落点体检快照（启动时算一次）：界面「日志」页据此说明
+        # 「这条日志会不会随 FNS 同步」。
+        "audit_meta": audit_meta,
         "fns_log": fns_log,
         "fns_log_path": str(fns_log.path),
         "multi_user": multi_user,
@@ -3333,6 +3419,10 @@ class WebConsole:
                 "fns": sum(1 for r in rows if r.get("source") == "fns"),
             },
             "fns": self.cfg["fns_log"].status(),
+            # 访问日志落点（2026-11-08）：日志进了记忆库当附件之后，
+            # 「日志页有数据、别的端看不到」就只剩两种可能 —— 落点不在
+            # vault，或者 FNS 没在同步它。界面得能直接把这件事说出来。
+            "access": dict(self.cfg.get("audit_meta") or {}),
             "filters": {
                 "access_kinds": web_audit.kind_labels(),
                 "sync_actions": web_synclog.action_labels(),

@@ -38,6 +38,9 @@ function loadLogs(opts) {
       L.counts = data.counts || { access: 0, fns: 0 };
       L.total = typeof data.total === "number" ? data.total : L.events.length;
       L.fns = data.fns || { available: false, path: "", error: "" };
+      /* 访问日志落点（2026-11-08）：日志进了记忆库当附件，界面要能看出
+         「在哪、会不会跟着 FNS 同步」—— 否则「别的端看不到日志」无从小查。 */
+      L.access = data.access || { path: "", in_vault: false, writable: true, note: "" };
       if (data.filters) L.filters = data.filters;
       if (data.stats) L.stats = data.stats;
       L.loading = false;

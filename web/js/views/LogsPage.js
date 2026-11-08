@@ -209,6 +209,10 @@ var LogsPage = {
     '      <span v-if="!L.fns.available" class="lg-src-off" :title="L.fns.path">' +
     "        · FNS 事件源未接入</span>" +
     '      <span v-else class="lg-src-on" :title="L.fns.path">· FNS 事件源已接入</span>' +
+    '      <span v-if="L.access && L.access.in_vault" class="lg-src-on" :title="L.access.path">' +
+    "        · 访问日志在记忆库内（随 FNS 同步）</span>" +
+    '      <span v-else-if="L.access && !L.access.writable" class="lg-src-off" :title="L.access.path">' +
+    "        · 访问日志不可写，事件会被丢弃</span>" +
     "    </div>" +
     "  </x-card>" +
     /* ---- 主体：一条时间轴，左右两栏 ---- */
