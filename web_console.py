@@ -1405,6 +1405,8 @@ _TOOL_GROUP_OF = {
     "memory_index_draft": "maintain",
     "memory_rebuild_links": "maintain",
     "memory_heat_suggest": "maintain",
+    # 2026-11-08：访问档位审计（默认只报、apply 才落盘），与 heat_suggest 同类
+    "memory_access_suggest": "maintain",
     "memory_batch_tier": "maintain",
     "memory_batch_tag": "maintain",
     # 2026-10-16：运行时阈值（memory.toml）纳入 MCP。归「库维护」而非「体检诊断」
@@ -1434,6 +1436,7 @@ WRITE_TOOLS = frozenset({
     "memory_write", "memory_commit", "memory_update_metadata",
     "memory_delete", "memory_archive", "memory_restore", "memory_archive_old",
     "memory_batch_tag", "memory_batch_tier", "memory_heat_suggest",
+    "memory_access_suggest",
     "memory_config", "memory_restart",
 })
 

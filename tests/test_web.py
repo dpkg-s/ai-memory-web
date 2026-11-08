@@ -862,8 +862,8 @@ _mapped = set(web_console._TOOL_GROUP_OF)
 _group_keys = {g["key"] for g in web_console.TOOL_GROUPS}
 _used_keys = set(web_console._TOOL_GROUP_OF.values())
 
-check("G1 server.py 注册了 26 个 @mcp.tool 工具",
-      len(_registered) == 26, f"实际 {len(_registered)} 个")
+check("G1 server.py 注册了 27 个 @mcp.tool 工具",
+      len(_registered) == 27, f"实际 {len(_registered)} 个")
 check("G2 分组表无遗漏（每个已注册工具都有归属）",
       not (_registered - _mapped), ", ".join(sorted(_registered - _mapped)))
 check("G3 分组表无陈旧键（没有已不存在的工具）",
