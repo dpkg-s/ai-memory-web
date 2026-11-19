@@ -290,6 +290,9 @@ var AccessPage = {
       auditLoaded: false,
       /* 导出独立的忙标志：与「刷新」共用会让刷新按钮在导出时也转圈。 */
       auditExporting: false,
+      /* 卡片是否在视野内（2026-11-12 访问日志懒加载的唯一判据）。
+         false 时不取数、不轮询；已在视野则进入瞬间就会被观察器翻成 true。 */
+      auditInView: false,
     };
   },
   computed: {
@@ -472,7 +475,16 @@ var AccessPage = {
      修法就是盯住权限翻转补一次拉取（2026-10-22 探针实测抓到）。 */
   watch: {
     isAdmin: function (v) {
-      if (v) this.refresh();
+      if (v) {
+        this.refresh();
+        /* 访问日志卡是 v-if="isAdmin" 渲染的 ⇒ 权限落定那一帧才存在可观察的
+           DOM。首帧身份还是 false（见 mounted 的注释），观察器必须在这里补装
+           一次，否则懒加载永远等不到「进视野」这个信号。 */
+        var self = this;
+        this.$nextTick(function () {
+          self.setupAuditObserver();
+        });
+      }
       /* 权限一旦落定为否，把停留过的「账号」分段收回「令牌」—— 否则用户
          会停在一条已经没有按钮指向它的分段上（该页内容也不再渲染）。 */
       if (!v && this.tab === "users") this.tab = "tokens";
@@ -498,6 +510,85 @@ var AccessPage = {
     },
   },
   methods: {
+    /* ------------------------------------------------------------------
+     * 访问日志懒加载（2026-11-12 主人：「还有访问日志的懒加载」）
+     *
+     * 为什么值得懒：这张卡是**次要信息**（审计面），进这一页真正要看的是
+     * 令牌与账号。原来 mounted 里三件事同时发出去（/api/tokens、/api/users、
+     * /api/audit），而审计那条要读整份 audit.jsonl —— 最容易把首屏拖慢的
+     * 恰好是最不急着看的那一份。
+     *
+     * 判据只有一条：**卡片在不在视野里**。
+     *   · 进视野 → 让首屏那两个请求先飞完（空闲一拍）再取审计，随后开轮询；
+     *   · 离开视野 → 立刻停轮询（不是只在回调里 return —— 定时器留着还在耗）；
+     *   · 取过的数据不因离开视野而清空，切页回来靠轮询补，不重来一遍。
+     * ------------------------------------------------------------------ */
+    setupAuditObserver: function () {
+      var self = this;
+      self.teardownAuditObserver();
+      /* 卡片还没渲染（身份未到位）就先不装：按 basename 冒出来的伪判据会让
+         观察器观察到一个不存在的节点，整个懒加载静默失效。 */
+      if (!self.isAdmin) return;
+      var el =
+        self.$el && self.$el.querySelector
+          ? self.$el.querySelector(".ac-audit-card")
+          : null;
+      /* 没有 IntersectionObserver（老 WebView）或 DOM 还没就绪时**退化成原行为**：
+         宁可多取一次，也不能让日志永远不出来。 */
+      if (!el || typeof IntersectionObserver !== "function") {
+        self.auditInView = true;
+        self.scheduleFirstAudit();
+        self.startAuditWatch();
+        return;
+      }
+      self._auditObs = new IntersectionObserver(
+        function (entries) {
+          var hit = false;
+          for (var i = 0; i < entries.length; i++) {
+            if (entries[i].isIntersecting) {
+              hit = true;
+              break;
+            }
+          }
+          /* 只在状态**翻转**时做事：观察器在滚动中会连续回调，
+             每次回调都重取一遍就把懒加载做成了「更密的轮询」。 */
+          if (hit === self.auditInView) return;
+          self.auditInView = hit;
+          if (hit) {
+            self.scheduleFirstAudit();
+            self.startAuditWatch();
+          } else {
+            self.stopAuditWatch();
+          }
+        },
+        /* 提前 160px 触发：等到卡片严丝合缝进视口才取，滑到那儿时正好一片空。 */
+        { root: null, rootMargin: "160px 0px", threshold: 0 },
+      );
+      self._auditObs.observe(el);
+    },
+    teardownAuditObserver: function () {
+      if (this._auditObs) {
+        this._auditObs.disconnect();
+        this._auditObs = null;
+      }
+    },
+    /* 首屏那一发：放到浏览器空闲时，别和 /api/tokens、/api/users 抢带宽。
+       已经成功取过就不再打（切页回来由轮询补）。 */
+    scheduleFirstAudit: function () {
+      var self = this;
+      if (self.auditLoaded || self.auditBusy || self._auditFirst) return;
+      self._auditFirst = true;
+      var run = function () {
+        self._auditFirst = false;
+        if (!self.isAdmin || !self.auditInView || self.auditLoaded) return;
+        self.loadAudit();
+      };
+      if (typeof requestIdleCallback === "function") {
+        requestIdleCallback(run, { timeout: 1200 });
+      } else {
+        setTimeout(run, 240);
+      }
+    },
     /* 读访问日志。筛选切换也走这里 —— 服务端已支持 kind 过滤，
        前端不再自己 filter 一遍（两处过滤迟早会不一致）。
 
@@ -554,14 +645,19 @@ var AccessPage = {
     startAuditWatch: function () {
       var self = this;
       self.stopAuditWatch();
+      /* 不在视野里就不起定时器 —— 这是懒加载里「停」的那一半：
+         观察器判定离开视野时会来叫 stopAuditWatch。 */
+      if (!self.auditInView) return;
       self._auditTimer = setInterval(function () {
         if (document.hidden) return;
         if (!self.isAdmin) return;
+        if (!self.auditInView) return;
         self.loadAudit({ silent: true });
       }, 8000);
       /* 记在实例上而非 data：定时器 id 参与响应式毫无意义，只会让 Vue 追它。 */
       self._auditVis = function () {
         if (document.hidden || !self.isAdmin) return;
+        if (!self.auditInView) return;
         self.loadAudit({ silent: true });
       };
       document.addEventListener("visibilitychange", self._auditVis);
@@ -952,15 +1048,17 @@ var AccessPage = {
   mounted: function () {
     this.baseUrl = location.origin;
     this.refresh();
-    this.loadAudit();
-    /* 轮询无条件启动，回调里再守 isAdmin —— 身份是异步到位的（见下方 watch
-       的注释），在这里判角色会永久判成 false。 */
-    this.startAuditWatch();
+    /* 访问日志改为**懒加载**（2026-11-12 主人：「还有访问日志的懒加载」）：
+       不再在 mounted 里直接 loadAudit() + startAuditWatch()，而是等卡片进入
+       视野再取数、离开视野就停轮询（判据与实现见 setupAuditObserver）。
+       身份是异步到位的，所以观察器还要在 isAdmin 翻转时补装一次（见 watch）。 */
+    this.setupAuditObserver();
   },
   /* 切走本页必须拆定时器与 visibility 监听：hash 路由切页会销毁组件，
      但 setInterval 不会自己停，留着就是「离开这一页还在后台打接口」。 */
   beforeUnmount: function () {
     this.stopAuditWatch();
+    this.teardownAuditObserver();
   },
   template:
     '<div class="page">' +
@@ -1171,7 +1269,9 @@ var AccessPage = {
        数据面是 audit.jsonl（append-only），接口 /api/audit 也只给 admin ——
        与「账号」分段同一取向：权限不足时这一块**根本不存在**，而不是给一句
        「你没权限」。 */
-    '      <x-card v-if="isAdmin" title="访问日志" :sub="auditSub">' +
+    /* ac-audit-card：懒加载的观察锚点（setupAuditObserver 按这个类找卡片）。
+       不能用 .ac-side 当锚：那是整条右栏，里面还有别的卡。 */
+    '      <x-card v-if="isAdmin" class="ac-audit-card" title="访问日志" :sub="auditSub">' +
     "        <template #actions>" +
     /* 导出与刷新并排：导出的是**当前筛选下的全量**，不是这一屏 40 条。
        按钮用 CSV 作默认（绝大多数人要的是「丢进 Excel 看一眼」）；
@@ -1245,7 +1345,8 @@ var AccessPage = {
        这里，别把「没记录」当成「没发生」。 */
     '        <div class="audit-foot">只统计经过本控制台的调用' +
     "          （<code>/mcp</code> 反代与 <code>/api/*</code>）；客户端直连 MCP 端口" +
-    "          （默认 8700）的请求不在此列。每 8 秒静默同步一次。</div>" +
+    "          （默认 8700）的请求不在此列。卡片在视野内时每 8 秒静默同步一次，" +
+    "          滑出视野即暂停。</div>" +
     "      </x-card>" +
     /* ===== 我的账号（仅非管理员，2026-10-22 主人选型 A 保留）===== */
     '      <x-card v-if="!isAdmin" title="我的账号" :sub="myRoleZh">' +

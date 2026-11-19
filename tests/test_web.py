@@ -788,6 +788,134 @@ check("V18 审计记标题但不记关键词（memory_search 的 keyword 不入�
       "")
 
 # =====================================================================
+section("Vb 日志自身的同步事件（hide_self）与 before 翻页（2026-11-09）")
+
+# 为什么另起一套**独立 vault**：自事件判据依赖「日志落点是否在库内」（只有
+# 落在库里才会被 FNS 同步），把日志真正扔进一个库里的附件目录是最贴近现场的
+# 形态；同时避免污染主测试库（别的段落拿条数做断言）。
+_SV = _TMP / "selfvault"
+(_SV / "附件" / "日志").mkdir(parents=True, exist_ok=True)
+_SFNS = _SV / "附件" / "日志" / "sync-events.jsonl"
+_ENV_BAK = {k: os.environ.get(k) for k in
+            ("AI_MEMORY_DIR", "AI_MEMORY_WEB_AUDIT", "AI_MEMORY_WEB_FNS_LOG")}
+os.environ["AI_MEMORY_DIR"] = str(_SV)
+os.environ["AI_MEMORY_WEB_AUDIT"] = str(_SV / "附件" / "日志" / "audit.jsonl")
+os.environ["AI_MEMORY_WEB_FNS_LOG"] = str(_SFNS)
+_cfg_self = web_console.config()
+_t0 = time.time()
+# 事件里报的是 **vault 相对**路径（FNS 的 Go 侧只知道库内路径）；
+# 落点配置给的是绝对路径 —— 两种形态都要能认出来，这正是判据最容易漏的地方。
+_SELF_REL = "附件/日志/audit.jsonl"
+_SELF_ABS = str(_SV / "附件" / "日志" / "audit.jsonl").replace("\\", "/")
+
+
+def _sync_ev(dt, path, action="upload", kind="file"):
+    return json.dumps({"t": int((_t0 - dt) * 1000), "kind": kind,
+                       "action": action, "path": path, "size": 215900},
+                      ensure_ascii=False)
+
+
+_SFNS.write_text("\n".join([
+    _sync_ev(50, _SELF_REL),                       # 访问日志自己（相对形态）
+    _sync_ev(45, _SELF_ABS),                       # 同一文件的绝对形态
+    _sync_ev(40, "偏好/口味.md", kind="note"),      # 普通笔记
+    _sync_ev(30, "其它/audit.jsonl"),              # 同名不同路径：**不能**当自事件
+    _sync_ev(20, "工具/记忆库MCP.md", kind="note", action="download"),
+]) + "\n", encoding="utf-8")
+_cfg_self["audit"].append({"t": _t0 - 5, "kind": "tool", "action": "tool.call",
+                           "actor": "dpkg", "target": "memory_read"})
+_h_admin = {"Authorization": "Bearer s3cret"}
+
+# -- 判据本体（helper 层）：错杀比漏杀难发现，故逐条钉住 ------------------
+check("V19 _is_self_sync_event 认得两种路径形态（相对 / 绝对 / 反斜杠 / ./）",
+      web_console._is_self_sync_event(_SELF_REL, _SELF_REL, _SELF_ABS)
+      and web_console._is_self_sync_event(_SELF_ABS, _SELF_REL, _SELF_ABS)
+      and web_console._is_self_sync_event("\\附件\\日志\\audit.jsonl",
+                                          _SELF_REL, _SELF_ABS)
+      and web_console._is_self_sync_event("./附件/日志/audit.jsonl  ",
+                                          _SELF_REL, _SELF_ABS), "")
+check("V20 _is_self_sync_event 不误伤：同名不同路径 / 根目录同名 / 普通笔记 / 空",
+      not web_console._is_self_sync_event("其它/audit.jsonl", _SELF_REL, _SELF_ABS)
+      and not web_console._is_self_sync_event("audit.jsonl", _SELF_REL, _SELF_ABS)
+      and not web_console._is_self_sync_event("偏好/口味.md", _SELF_REL, _SELF_ABS)
+      and not web_console._is_self_sync_event("", _SELF_REL, _SELF_ABS), "")
+check("V21 落点未知时才退化为按文件名判（不是无条件认文件名）",
+      web_console._is_self_sync_event("附件/日志/audit.jsonl", "", "")
+      and web_console._is_self_sync_event("x/sync-events.jsonl", "", "")
+      and not web_console._is_self_sync_event("x/其它.md", "", ""), "")
+
+# -- 接口：默认隐藏、计数如实、全量口径另报 ------------------------------
+_r = asyncio.run(_req(_cfg_self, "GET", "/api/logs", _h_admin))
+_j = json.loads(_r.text) if _r.text.startswith("{") else {}
+_paths = [e.get("path") for e in (_j.get("events") or [])]
+check("V22 默认 hide_self=1：自事件被藏掉，但 counts.self 如实上报",
+      _r.status_code == 200
+      and _SELF_REL not in _paths and _SELF_ABS not in _paths
+      and "其它/audit.jsonl" in _paths
+      and _j.get("self_hidden") is True
+      and _j.get("counts", {}).get("self") == 2
+      and _j.get("counts", {}).get("fns") == 3
+      and _j.get("total") == 4 and len(_paths) == 4,
+      f"status={_r.status_code} counts={_j.get('counts')} paths={_paths}")
+check("V23 total/counts 是过滤后可口径，stats.fns 仍是全量 + stats.fns_self",
+      _j.get("counts", {}).get("access") == 1
+      and _j.get("stats", {}).get("fns", {}).get("total") == 5
+      and _j.get("stats", {}).get("fns_self") == 2,
+      f"counts={_j.get('counts')} stats={_j.get('stats')}")
+
+_r = asyncio.run(_req(_cfg_self, "GET", "/api/logs?hide_self=0", _h_admin))
+_j = json.loads(_r.text) if _r.text.startswith("{") else {}
+_paths = [e.get("path") for e in (_j.get("events") or [])]
+check("V24 hide_self=0 ⇒ 自事件回来，self_hidden=False，counts.self 不变",
+      len(_paths) == 6 and _j.get("self_hidden") is False
+      and _j.get("counts", {}).get("self") == 2
+      and _j.get("counts", {}).get("fns") == 5
+      and _j.get("total") == 6,
+      f"counts={_j.get('counts')} n={len(_paths)}")
+
+_r = asyncio.run(_req(_cfg_self, "GET", "/api/logs?limit=1", _h_admin))
+_j = json.loads(_r.text) if _r.text.startswith("{") else {}
+check("V25 has_more：还有更早的命中项 ⇒ True（按过滤后口径算）",
+      _j.get("has_more") is True and _j.get("total") == 4
+      and len(_j.get("events") or []) == 1,
+      f"body={_r.text[:160]}")
+
+# -- before 翻页：开区间，与 hide_self / since 叠加 ----------------------
+_cursor = _t0 - 25
+_r = asyncio.run(_req(_cfg_self, "GET", f"/api/logs?before={_cursor}", _h_admin))
+_j = json.loads(_r.text) if _r.text.startswith("{") else {}
+_ts = [e.get("t") for e in (_j.get("events") or [])]
+check("V26 before 只回更早的事件（开区间，不含游标本身）",
+      _r.status_code == 200 and len(_ts) == 2 and all(t < _cursor for t in _ts)
+      and _j.get("counts", {}).get("fns") == 2 and _j.get("total") == 2,
+      f"status={_r.status_code} ts={_ts} counts={_j.get('counts')}")
+_r = asyncio.run(_req(_cfg_self, "GET", "/api/logs?before=abc", _h_admin))
+check("V27 before 非数字 ⇒ 400（不静默当没传）", _r.status_code == 400,
+      f"status={_r.status_code} body={_r.text[:120]}")
+
+# -- 导出：同一把尺子，且仍是「命中项全量」------------------------------
+_r1 = asyncio.run(_req(_cfg_self, "GET", "/api/logs/export?format=json", _h_admin))
+_r2 = asyncio.run(_req(_cfg_self,
+                       "GET", "/api/logs/export?format=json&hide_self=0", _h_admin))
+_j1 = json.loads(_r1.text) if _r1.text.startswith("{") else {}
+_j2 = json.loads(_r2.text) if _r2.text.startswith("{") else {}
+_p1 = [e.get("path") for e in (_j1.get("events") or [])]
+_p2 = [e.get("path") for e in (_j2.get("events") or [])]
+check("V28 导出默认同样隐藏自事件；hide_self=0 时它们回到导出里",
+      _r1.status_code == 200 and _r2.status_code == 200
+      and _SELF_REL not in _p1 and "其它/audit.jsonl" in _p1
+      and _p2.count(_SELF_REL) == 1 and _SELF_ABS in _p2
+      and _j1.get("count") == 4 and _j2.get("count") >= 6,
+      f"n1={_j1.get('count')} n2={_j2.get('count')} p1={_p1}")
+
+# 环境复原：后续段落仍按「日志落点在临时目录、不在库里」的形态跑。
+for _k, _v in _ENV_BAK.items():
+    if _v is None:
+        os.environ.pop(_k, None)
+    else:
+        os.environ[_k] = _v
+
+# =====================================================================
 section("E 写保护（AI_MEMORY_WEB_CONFIG_WRITE=0）")
 _cfg_ro = web_console.config()
 _cfg_ro = dict(_cfg_ro, config_write=False)

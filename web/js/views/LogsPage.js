@@ -3,8 +3,10 @@ import { AUDIT_ACTION_ZH, SYNC_ACTION_ZH, SYNC_KIND_ZH, fmtBytes } from "../core
 import {
   exportLogs,
   loadLogs,
+  loadMore,
   openNoteAt,
   setAccessKind,
+  setHideSelf,
   setSource,
   setSyncAction,
   startLogsWatch,
@@ -64,12 +66,21 @@ var LogsPage = {
   data: function () {
     return { S: S };
   },
+  /* 续载哨兵（2026-11-12 主人：「添加全局懒加载，还有访问日志的懒加载」）：
+     · mounted 装 IntersectionObserver，unmounted 拆掉；
+     · ⚠️ 这里**哨兵是常驻元素**（不带 v-if），所以 $refs 一定取得到 ——
+       LibraryPage 当初放弃 IO 的坑是「`v-if` 哨兵取不到 ref」，不是 IO 本身不好；
+     · 本页也没有内滚容器（`.lg-card` 是 overflow:hidden、`.lg-body` 不滚，
+       真正滚动的是文档），祖先不会把哨兵裁在自己的可视区外 ⇒ 默认 root（视口）正确。
+       真要换成卡内滚动，只要把 root 指过去即可，判据不用改。 */
   mounted: function () {
     if (!this.L.loaded) loadLogs();
     startLogsWatch();
+    this.setupMoreWatch();
   },
   unmounted: function () {
     stopLogsWatch();
+    this.teardownMoreWatch();
   },
   computed: {
     L: function () {
@@ -129,9 +140,46 @@ var LogsPage = {
     setSource: setSource,
     setAccessKind: setAccessKind,
     setSyncAction: setSyncAction,
+    setHideSelf: setHideSelf,
     exportLogs: exportLogs,
     refresh: function () {
       return loadLogs();
+    },
+    /* 主动续载一页更早的。滚到底自动续载也走这里 —— 两条入口共用同一个防重入闸
+       （features/logs.js 的 loadingMore），所以手点与自动撞在一起也只会发一个请求。 */
+    loadMore: function () {
+      return loadMore();
+    },
+    /* 哨兵进了视口就续载；三个前置判据缺一不可：
+       ① 还有更早的（hasMore）—— 否则哨兵一直在视口里，滚一下就发一次空请求；
+       ② 没有正在续载 —— 不然一次滚动会连发好几页；
+       ③ 页面可见 —— 切到后台标签页时 IO 仍会因布局变化触发，
+          在后台刷日志既没用又白烧服务端 CPU。 */
+    setupMoreWatch: function () {
+      var vm = this;
+      var el = this.$refs.moreSentinel;
+      if (!el || typeof IntersectionObserver === "undefined") return;
+      this._moreIO = new IntersectionObserver(
+        function (entries) {
+          for (var i = 0; i < entries.length; i++) {
+            if (!entries[i].isIntersecting) continue;
+            if (document.visibilityState !== "visible") return;
+            if (!vm.L.hasMore || vm.L.loadingMore || vm.L.loading) return;
+            vm.loadMore();
+            return;
+          }
+        },
+        /* 提前 200px 触发：等真滚到最底才请求，用户会看到半秒空白，
+           那一瞬间很容易被当成「到底了」。 */
+        { rootMargin: "0px 0px 200px 0px" }
+      );
+      this._moreIO.observe(el);
+    },
+    teardownMoreWatch: function () {
+      if (this._moreIO) {
+        this._moreIO.disconnect();
+        this._moreIO = null;
+      }
     },
     openAt: openNoteAt,
     fmtBytes: fmtBytes,
@@ -204,8 +252,28 @@ var LogsPage = {
     '      <button class="ac-chip" v-for="a in L.filters.sync_actions" :key="a.key"' +
     '              :class="{on:L.faction===a.key}" @click="setSyncAction(a.key)">{{ a.label }}</button>' +
     "    </div>" +
+    /* 「隐藏日志自身同步」（2026-11-12 主人：「这个能不能隐藏，默认是同步的了，
+       老显示看起来东西不直观」）：访问日志落在记忆库附件里，跟着 FNS 同步，
+       写一行就镜像一条 —— 不隐藏的话右栏全是 audit.jsonl，真正的同步看不见。
+       单独占一行而不是塞进上面「同步」那排：那排是按 sync_actions 动态生成的，
+       只筛到「访问日志」视图时整排不渲染，开关会跟着一起消失。 */
+    '    <div class="lg-chips">' +
+    '      <span class="lg-chip-label">过滤</span>' +
+    '      <button class="ac-chip" :class="{on:L.hideSelf}"' +
+    '              @click="setHideSelf(!L.hideSelf)"' +
+    '              title="访问日志落在记忆库附件里（附件/日志/audit.jsonl），会被 FNS 同步；默认不显示这些镜像事件">' +
+    "        隐藏日志自身同步</button>" +
+    "    </div>" +
     '    <div class="lg-status small faint">' +
     "      <span>共 {{ L.total }} 条 · 访问 {{ L.counts.access }} · 同步 {{ L.counts.fns }}</span>" +
+    /* 被隐去多少要说出来（而不是默默少一截）：日志页是排查用的，
+       「少掉的那些去哪了」必须能一句话答上，否则开关就变成了「数据不见了」的嫌疑。 */
+    '      <span class="lg-src-on" v-if="L.selfCount > 0 && L.hideSelf"' +
+    '            title="这些是访问日志自身被 FNS 同步时产生的镜像事件，可用上面的开关显示">' +
+    "        · 已隐去自身同步 {{ L.selfCount }} 条</span>" +
+    '      <span class="lg-src-on" v-else-if="L.selfCount > 0"' +
+    '            title="访问日志自身被 FNS 同步时产生的镜像事件（当前已显示）">' +
+    "        · 含自身同步 {{ L.selfCount }} 条</span>" +
     '      <span v-if="!L.fns.available" class="lg-src-off" :title="L.fns.path">' +
     "        · FNS 事件源未接入</span>" +
     '      <span v-else class="lg-src-on" :title="L.fns.path">· FNS 事件源已接入</span>' +
@@ -299,10 +367,27 @@ var LogsPage = {
     "          <code>/fns-state</code>。没有这个文件时右栏为空，访问日志不受影响。" +
     "        </div>" +
     "      </div>" +
+    /* ---- 时间轴尾部：续载更早（2026-11-12） -------------------------------
+       时间轴是新→旧，所以「加载更早」只能挂在最底下 —— 挂在顶部既违反直觉
+       （顶部是新的），也会让人误以为点它会刷新。
+       按钮与哨兵都在这里：主通道是滚动自动续载，按钮同时服务「内核没有
+       IntersectionObserver」「想手动催一页」和「无障碍键盘操作」三种情形
+       （与记忆库 .lib-more 同一取向：故意压到文字级对比度，不抢注意力）。 */
+    '      <div class="lib-tail" v-if="L.hasMore">' +
+    '        <button class="lib-more" @click="loadMore" :disabled="L.loadingMore">' +
+    "          {{ L.loadingMore ? '加载更早…' : '加载更早' }}</button>" +
+    "      </div>" +
+    /* 哨兵：常驻（不 v-if）—— 见 mounted 上方注释；高度 1px 而不是 0：
+       零面积元素的交集判定在部分内核里永远报「不相交」，给它 1px 才是稳的
+       （这点也不占布局，肉眼看不见）。 */
+    '      <div class="lg-sentinel" ref="moreSentinel" aria-hidden="true" style="height:1px"></div>' +
     "    </div>" +
-    /* 采集面边界（与访问控制页同一句口径）：直连 MCP 端口的调用不在此列。 */
+    /* 采集面边界（与访问控制页同一句口径）：直连 MCP 端口的调用不在此列。
+       顺带把「首屏只取 60 条 + 滚到底续载」写在这里：用户看到列表到底时，
+       得知道「这是分页的底，不是日志的底」。 */
     '    <div class="lg-foot">只统计经过本控制台的调用（<code>/mcp</code> 反代与' +
-    "      <code>/api/*</code>）；每 12 秒静默刷新一次。左栏点条目可打开对应笔记。</div>" +
+    "      <code>/api/*</code>）；首屏 60 条，滚到底（或点「加载更早」）续载更早的事件；" +
+    "      每 12 秒静默刷新最近一页。左栏点条目可打开对应笔记。</div>" +
     "  </x-card>" +
     "</div>",
 };

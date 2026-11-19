@@ -91,8 +91,14 @@
          GSAP 与 Flip 同为 UMD，由 core/anim.js 通过 window.gsap 取用。
 
       ② 入口模块（type=module，默认 defer）：js/main.js。
-         Vue 由 ESM 具名导入（vue.esm-browser.prod.js 比 global 版小 126 KB），
-         import 图覆盖 core / features / components / views 共 31 个模块。
+         Vue 由 ESM 具名导入（vue.esm-browser.prod.js 比 global 版小 126 KB）。
+         import 图自 2026-11-05 起分两层：
+           · 同步：core / features / components（外加 Root 壳层）—— 首帧就要用，
+             壳必须先出来，否则这 4 秒兜底会把「还没渲染」误判成「前端没启动」；
+           · 按需：views/ 下 6 个视图改走 defineAsyncComponent + 动态 import()，
+             各是一条独立请求，渲染到哪页才拉哪页，mount 之后空闲时再逐个预取。
+         ⚠️ 视图**已不在** main.js 的静态 import 图里 —— 想数首屏请求数请
+            看 main.js 的 VIEWS 表，别再去 grep 顶层的 import 列表。
 
       ③ 模块在 ① 之后执行，故模块顶层读 window.marked 一定拿到值。
     -->

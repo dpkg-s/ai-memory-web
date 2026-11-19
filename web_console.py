@@ -189,7 +189,7 @@ def _ensure_app_logging() -> None:
     logger.propagate = False
 
 
-WEB_VERSION = "1.13.0"
+WEB_VERSION = "1.13.1"
 # ⚠️ 2026-10-22：此常量是控制台**唯一**的机器可读版本源，release.yml 会校验
 #   `tag == WEB_VERSION == CHANGELOG 首条`。历史上一度停在 1.11.1 而 tag 已到
 #   v1.11.3（漂了两个版本），界面「关于」显示的是旧号 —— 改版本时必须同改三处。
@@ -430,6 +430,107 @@ def audit_path_report(path: Path) -> dict:
     meta = audit_path_precheck(path)
     meta["path"] = str(path)
     return meta
+
+
+# ---------------------------------------------------------------------------
+# 「日志自身」的同步事件识别（2026-11-09）
+#
+# 为什么需要：访问日志被放进 vault 当附件之后（``附件/日志/audit.jsonl``），
+# FNS 每追加一行日志就会同步一次，于是日志页右栏被「上传 audit.jsonl ·
+# 附件 215.9 KB」刷屏 —— 越用越吵，真正想看的同步事件反被挤到后面。
+# 默认隐藏、留一个 ``hide_self=0`` 的开关，是主人给的取舍。
+#
+# 判据为什么写得这么小心：**错杀比漏杀难发现**。漏杀的代价只是界面吵一点；
+# 错杀（把普通笔记附件当成日志本身吞掉）表现为「界面上凭空少了一条同步记录」，
+# 没人会去查。所以一律按**路径**判，且只有在连落点都拿不到时才退回文件名
+# 这一条线索。
+# ---------------------------------------------------------------------------
+
+#: 退化判据用的文件名（仅在对应落点未知时生效）：访问日志与 FNS 事件文件。
+_SELF_LOG_NAMES = frozenset({"audit.jsonl", "sync-events.jsonl"})
+
+
+def _norm_self_path(raw: Any) -> str:
+    """把路径整成可比的形状：反斜杠→斜杠、去 ``./`` 前缀与首尾空白。
+
+    为什么不用 ``Path.resolve()``：这里比的一侧是「FNS 从 Go 侧报上来的字符串」，
+    另一侧是「本进程算出来的路径」，两边可能一个在容器里、一个在宿主机上。
+    真做文件系统解析，会把「形状不同、其实是同一个文件」判成两个，比字符串的
+    形状更容易失效。
+    """
+    p = str(raw or "").replace("\\", "/").strip()
+    while p.startswith("./"):
+        p = p[2:]
+    return p.rstrip("/")
+
+
+def _self_path_forms(raw: Any) -> tuple[str, str]:
+    """一个落盘文件的两种可比形态：``(vault 相对, 绝对)``。
+
+    为什么两种都要备着：FNS 事件里的 ``path`` 是 **vault 相对**的（写它的 Go
+    侧只认识库内路径），而配置与落点预检给的是宿主机 / 容器内的绝对路径。
+    只比其中一种，另一侧永远不相等 —— 功能在真实部署里静默失效，而本机单测
+    （两侧都在临时目录里）看着全绿。
+    """
+    p = _norm_self_path(raw)
+    if not p:
+        return "", ""
+    if not (p.startswith("/") or re.match(r"^[A-Za-z]:/", p)):
+        # 本来就是库内相对路径：它自己就是 FNS 会报的那种形态。
+        return p, ""
+    try:
+        vault = resolve_vault()
+    except Exception:                                     # noqa: BLE001
+        vault = None
+    if vault is None:
+        return "", p
+    try:
+        return _norm_self_path(Path(p).relative_to(vault).as_posix()), p
+    except (ValueError, OSError):
+        # 日志落在 vault 之外（老部署的默认形态）：没有相对形态可比，
+        # 但它也不会被 FNS 同步 —— 这里「比不到」正好是对的。
+        return "", p
+
+
+def _is_self_sync_event(path: Any, audit_rel: str = "", audit_abs: str = "",
+                        also: tuple[str, ...] = ()) -> bool:
+    """这条同步事件是不是「日志自己在同步」造成的。
+
+    参数是**参照物**而不是文件名清单：``audit_rel`` / ``audit_abs`` 是访问日志
+    的库内相对形态与绝对形态，``also`` 放 FNS 事件文件自己的两种形态（它躺在
+    vault 里时同样会被同步，一起藏掉，否则刷屏只减一半）。
+
+    判定顺序（严 → 宽），只有前一档拿不到时才放宽：
+      1. 某一侧落点**未知** ⇒ 用该文件名兜底（``audit.jsonl`` /
+         ``sync-events.jsonl``）—— 对应契约里的「audit_meta 缺失」退化态；
+      2. 与任一参照物**精确相等**（忽略大小写：Windows 路径本就大小写不敏感，
+         而容器里报上来的路径大小写也不保证与配置一致）；
+      3. 路径边界对齐的**尾段**匹配，用来跨「容器内 /vault/… ↔ 库内相对路径」
+         这两种前缀：``附件/日志/audit.jsonl`` 是
+         ``/vault/附件/日志/audit.jsonl`` 的尾段，而根目录的 ``audit.jsonl``、
+         ``其它/audit.jsonl`` 都不是。这里**要求较短的一侧带目录分隔符**，
+         绝不对裸文件名做后缀匹配 —— 那正是「按 basename 判自事件会误伤真实
+         附件」的坑。
+    """
+    p = _norm_self_path(path)
+    if not p:
+        return False
+    pk = p.lower()
+    base = pk.rsplit("/", 1)[-1]
+    if not (audit_rel or audit_abs) and base == "audit.jsonl":
+        return True
+    if not also and base == "sync-events.jsonl":
+        return True
+    targets = [t.lower() for t in (audit_rel, audit_abs, *also) if t]
+    if not targets:
+        return False
+    if pk in targets:
+        return True
+    for tk in targets:
+        short, long_ = (pk, tk) if len(pk) <= len(tk) else (tk, pk)
+        if "/" in short and long_.endswith("/" + short):
+            return True
+    return False
 
 
 #: 用户表 / 令牌表的进程内单例，按用户表路径做键。
@@ -3363,6 +3464,24 @@ class WebConsole:
                      # 清单」，缓存一份旧的就是在骗人。
                      "Cache-Control": "no-store"})
 
+    def _self_log_refs(self) -> tuple[str, str, tuple[str, ...]]:
+        """「日志自身」的参照路径，供 :func:`_is_self_sync_event` 用。
+
+        两处落点都要算：访问日志 ``audit.jsonl`` 与 FNS 事件文件
+        ``sync-events.jsonl``。后者躺在 vault 里时同样会被同步、同样会刷屏，
+        只藏前一个等于只治一半。
+
+        每次请求现算而不是启动时缓存：落点来自环境变量 / 配置，而
+        ``resolve_vault()`` 本身也是现读的 —— 缓存一份可能在运行期被改掉的
+        路径，出问题时表现为「配置改了、日志页还是旧落点」。
+        """
+        cfg = self.cfg
+        meta = cfg.get("audit_meta") or {}
+        audit_rel, audit_abs = _self_path_forms(
+            meta.get("path") or cfg.get("audit_path") or "")
+        also = tuple(t for t in _self_path_forms(cfg.get("fns_log_path") or "") if t)
+        return audit_rel, audit_abs, also
+
     async def logs_get(self, request: Request) -> Response:
         """「日志」页的合并数据面（2026-11-05）：访问日志 + FNS 同步事件，一条时间轴。
 
@@ -3380,6 +3499,13 @@ class WebConsole:
         契约：``{ok, events, counts, total, fns, filters, stats}``
         —— ``events`` 按时间**倒序**（新→旧），每项带 ``source``（access/fns）
         供前端分栏；``fns.available=false`` 表示「没有数据源」（不是错误）。
+
+        2026-11-09 增补：``hide_self``（默认 "1"）隐藏「日志自身的同步事件」，
+        ``before``（unix 秒）给「加载更早」当上界；响应随之多出
+        ``counts.self`` / ``self_hidden`` / ``has_more`` / ``stats.fns_self``。
+        ``total`` 与 ``counts.access|fns`` 一律是**过滤后可见**的口径，
+        而 ``stats.fns`` 仍是全量 —— 前者回答「这次看到几条」，后者回答
+        「事件文件里一共有什么」，两个问题不该混成一个数字。
         """
         if (bad := self._need_admin(request)) is not None:
             return bad
@@ -3397,6 +3523,21 @@ class WebConsole:
         akind = str(qp.get("akind") or "").strip()
         faction = str(qp.get("faction") or "").strip()
         limit = _bounded_int(qp.get("limit"), 160, 1, 1000)
+        # before（2026-11-09）：前端「加载更早」用的上界，与 since 一起构成区间。
+        # 为什么在服务端做而不是前端切一刀：截断只能发生在一个有序列表上，
+        # 否则「翻到第 3 页」看到的是三段各自被 limit 砍过的流拼出的假时间轴。
+        before = None
+        raw_before = str(qp.get("before") or "").strip()
+        if raw_before:
+            try:
+                before = float(raw_before)
+            except ValueError:
+                return _err(400, "before 必须是 unix 秒（数字）。")
+        # hide_self 默认 "1"（隐藏日志自身的同步事件，见 _is_self_sync_event）。
+        # 判据写成「只有明确说要关才关」：空串、拼错的开关值都保持默认的隐藏，
+        # 因为刷屏是主要矛盾，翻转默认值必须是有意为之。
+        hide_self = str(qp.get("hide_self") or "1").strip().lower() \
+            not in ("0", "false", "no", "off")
 
         rows: list[dict] = []
         if source in ("all", "access"):
@@ -3406,7 +3547,31 @@ class WebConsole:
                 rows.append(item)
         if source in ("all", "fns"):
             rows.extend(self.cfg["fns_log"].dump(action=faction, since=since))
+        if before is not None:
+            # 开区间：翻页游标就是上一页最旧那条的 t，用闭区间会让每翻一页都
+            # 重复看到那一条，越翻越离谱。
+            rows = [r for r in rows if float(r.get("t") or 0) < before]
         rows.sort(key=lambda r: float(r.get("t") or 0))
+
+        # 自事件先**数**再**藏**：counts.self 在 hide_self=0 时也要如实上报，
+        # 界面靠它决定「这里本来藏了几条，要不要给个提示」。
+        audit_rel, audit_abs, also = self._self_log_refs()
+        self_rows = [r for r in rows
+                     if r.get("source") == "fns"
+                     and _is_self_sync_event(r.get("path"), audit_rel,
+                                             audit_abs, also)]
+        self_n = len(self_rows)
+        # 全量口径的自事件条数（stats.fns_self）：不带筛选参数的 dump() 就是
+        # 「事件文件里的一整份」。多读一次文件换一个稳定的体检数字 —— 窗口值
+        # 会被 since/before 改小，拿它当总量报会让人以为「自事件变少了」。
+        fns_self_total = sum(1 for r in self.cfg["fns_log"].dump()
+                             if _is_self_sync_event(r.get("path"), audit_rel,
+                                                    audit_abs, also))
+        if hide_self and self_rows:
+            # 按 id 移除而不是按值比较：事件字典内容可能重复（同一文件同一秒），
+            # 按值删会把无辜的一条也带走。
+            hidden = {id(r) for r in self_rows}
+            rows = [r for r in rows if id(r) not in hidden]
         total = len(rows)
         page = rows[-limit:]
         page.reverse()
@@ -3417,7 +3582,13 @@ class WebConsole:
             "counts": {
                 "access": sum(1 for r in rows if r.get("source") == "access"),
                 "fns": sum(1 for r in rows if r.get("source") == "fns"),
+                "self": self_n,
             },
+            # has_more 说明「这一屏之外还有更早的命中项」：前端据此决定要不要
+            # 显示「加载更早」。判据必须是**过滤后**的条数和 limit 比 —— 用
+            # 过滤前的 total 会在刚藏掉一批自事件时谎报「还有更多」。
+            "has_more": total > len(page),
+            "self_hidden": bool(hide_self and self_n),
             "fns": self.cfg["fns_log"].status(),
             # 访问日志落点（2026-11-08）：日志进了记忆库当附件之后，
             # 「日志页有数据、别的端看不到」就只剩两种可能 —— 落点不在
@@ -3429,7 +3600,12 @@ class WebConsole:
                 "sync_kinds": web_synclog.kind_labels(),
             },
             "stats": {"access": self.cfg["audit"].stats(),
-                      "fns": self.cfg["fns_log"].stats()},
+                      # stats.fns 保持**全量**口径（事件文件里有什么就是什么），
+                      # fns_self 是其中的自事件条数 —— 两者同为「体检数字」，
+                      # 不随 source / since / before 这些窗口参数变化；当前窗口
+                      # 里藏了几条看 counts.self，别把两个数字混用。
+                      "fns": self.cfg["fns_log"].stats(),
+                      "fns_self": fns_self_total},
         })
 
     async def logs_export(self, request: Request) -> Response:
@@ -3462,6 +3638,20 @@ class WebConsole:
             except ValueError:
                 return _err(400, "since 必须是 unix 秒（数字）。")
 
+        # before / hide_self（2026-11-09）：与 /api/logs 同一把尺子，判定与
+        # 默认值都不在这里另立一套（见 logs_get 的注释）。导出**刻意不接受
+        # limit**：导出的意义是「命中项全量」，多一个页码参数只会让人以为
+        # 手里是完整清单，其实只是一屏。
+        before = None
+        raw_before = str(qp.get("before") or "").strip()
+        if raw_before:
+            try:
+                before = float(raw_before)
+            except ValueError:
+                return _err(400, "before 必须是 unix 秒（数字）。")
+        hide_self = str(qp.get("hide_self") or "1").strip().lower() \
+            not in ("0", "false", "no", "off")
+
         rows: list[dict] = []
         if source in ("all", "access"):
             for rec in self.cfg["audit"].dump(kind=akind, since=since):
@@ -3470,14 +3660,29 @@ class WebConsole:
                 rows.append(item)
         if source in ("all", "fns"):
             rows.extend(self.cfg["fns_log"].dump(action=faction, since=since))
+        if before is not None:
+            rows = [r for r in rows if float(r.get("t") or 0) < before]
         rows.sort(key=lambda r: float(r.get("t") or 0))
+        audit_rel, audit_abs, also = self._self_log_refs()
+        self_rows = [r for r in rows
+                     if r.get("source") == "fns"
+                     and _is_self_sync_event(r.get("path"), audit_rel,
+                                             audit_abs, also)]
+        if hide_self and self_rows:
+            hidden = {id(r) for r in self_rows}
+            rows = [r for r in rows if id(r) not in hidden]
 
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         name = f"ai-memory-logs-{stamp}.{fmt}"
         self._audit(request, "config", "logs.export",
                     target=f"{fmt} · {len(rows)} 条",
                     detail=f"来源 {source}" + (f" · 类型 {akind}" if akind else "")
-                    + (f" · 动作 {faction}" if faction else ""))
+                    + (f" · 动作 {faction}" if faction else "")
+                    # 「谁把整份清单带走过」是这份日志里最该被记住的动作，
+                    # 那么「这次带走的是不是被裁过的清单」也必须一起记 ——
+                    # 否则日后核对时无法解释条数为什么比对方看到的多。
+                    + (f" · 已隐藏日志自身同步事件 {len(self_rows)} 条"
+                       if hide_self and self_rows else ""))
         if fmt == "json":
             body = json.dumps({"ok": True, "count": len(rows),
                                "exported_at": round(time.time(), 3),
